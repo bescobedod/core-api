@@ -1,0 +1,85 @@
+const { Model, DataTypes } = require("sequelize");
+
+class DetalleEmpleadoCootragua extends Model {}
+
+function initDetalleEmpleadoCootragua(sequelizeInstance) {
+    DetalleEmpleadoCootragua.init({
+        codEmpleado: { type: DataTypes.INTEGER, primaryKey: true, allowNull: false },
+        nombreEmpleado: { type: DataTypes.STRING, allowNull: true },
+        apellidoEmpleado: { type: DataTypes.STRING, allowNull: true },
+        segundoNombre: { type: DataTypes.STRING, allowNull: true },
+        segundoApellido: { type: DataTypes.STRING, allowNull: true },
+        apellidoCasada: { type: DataTypes.STRING, allowNull: true },
+        sexo: { type: DataTypes.STRING, allowNull: true },
+        direccion: { type: DataTypes.STRING, allowNull: true },
+        paisOrigen: { type: DataTypes.STRING, allowNull: true },
+        discapacidad: { type: DataTypes.STRING, allowNull: true },
+        estadoCivil: { type: DataTypes.STRING, allowNull: true },
+        raza: { type: DataTypes.STRING, allowNull: true },
+        tipoDoc: { type: DataTypes.STRING, allowNull: true },
+        noDoc: { type: DataTypes.STRING, allowNull: true },
+        departNac: { type: DataTypes.STRING, allowNull: true },
+        muniNac: { type: DataTypes.STRING, allowNull: true },
+        departVec: { type: DataTypes.STRING, allowNull: true },
+        muniVec: { type: DataTypes.STRING, allowNull: true },
+        fechaNac: { type: DataTypes.STRING, allowNull: true },
+        fechaNac_2: { type: DataTypes.STRING, allowNull: true },
+        conyugue: { type: DataTypes.STRING, allowNull: true },
+        noIGGS: { type: DataTypes.STRING, allowNull: true },
+        numeroHijos: { type: DataTypes.INTEGER, allowNull: true },
+        NIT: { type: DataTypes.STRING, allowNull: true },
+        fechaVecIRTRA: { type: DataTypes.STRING, allowNull: true },
+        email: { type: DataTypes.STRING, allowNull: true },
+        noTel: { type: DataTypes.STRING, allowNull: true },
+        noTelEmerg: { type: DataTypes.STRING, allowNull: true },
+        noTelNoti: { type: DataTypes.STRING, allowNull: true },
+        nomBeneficiario: { type: DataTypes.STRING, allowNull: true },
+        celBeneficiario: { type: DataTypes.STRING, allowNull: true },
+        banco: { type: DataTypes.STRING, allowNull: true },
+        noCuenta: { type: DataTypes.STRING, allowNull: true },
+        noLicen: { type: DataTypes.STRING, allowNull: true },
+        tipoLicen: { type: DataTypes.STRING, allowNull: true },
+        fechaVecLicen: { type: DataTypes.STRING, allowNull: true },
+        noLicenGun: { type: DataTypes.STRING, allowNull: true },
+        fechaVecLicenGun: { type: DataTypes.STRING, allowNull: true },
+        noContract: { type: DataTypes.STRING, allowNull: true },
+        venciTarjSal: { type: DataTypes.STRING, allowNull: true },
+        venciTarjPul: { type: DataTypes.STRING, allowNull: true },
+        venciTarjMan: { type: DataTypes.STRING, allowNull: true },
+        codEmpleadoJefe: { type: DataTypes.INTEGER, allowNull: true },
+        jefeInmediato: { type: DataTypes.STRING, allowNull: true },
+        nombreEmpleadoCompleto: { type: DataTypes.STRING, allowNull: true },
+        codEmpresa: { type: DataTypes.STRING, allowNull: true },
+        nombreDepto: { type: DataTypes.STRING, allowNull: true },
+        nombreEmpresa: { type: DataTypes.STRING, allowNull: true },
+        password: { type: DataTypes.STRING, allowNull: true },
+        codJefeDepto: { type: DataTypes.STRING, allowNull: true },
+        activoContrato: { type: DataTypes.BOOLEAN, allowNull: true },
+        profesion: { type: DataTypes.STRING, allowNull: true },
+        activoEmpleado: { type: DataTypes.BOOLEAN, allowNull: true },
+        aliasCodigo: { type: DataTypes.STRING, allowNull: true },
+        nomContactEmerg: { type: DataTypes.STRING, allowNull: true },
+        numContactEmerg: { type: DataTypes.STRING, allowNull: true },
+        parenContactEmerg: { type: DataTypes.STRING, allowNull: true },
+        tipoSangre: { type: DataTypes.STRING, allowNull: true },
+        empleadoTrato: { type: DataTypes.STRING, allowNull: true },
+        empresaTrato: { type: DataTypes.STRING, allowNull: true },
+        fechaIngreso: { type: DataTypes.DATE, allowNull: true },
+        finContract: { type: DataTypes.DATE, allowNull: true },
+        baja: { type: DataTypes.INTEGER, allowNull: true },
+        fecha_ingreso_str: { type: DataTypes.STRING, allowNull: true },
+        codDepto: { type: DataTypes.STRING, allowNull: true },
+        nomPuesto: { type: DataTypes.STRING, allowNull: true },
+        idRol: { type: DataTypes.INTEGER, allowNull: true }
+        }, {
+            sequelize: sequelizeInstance,
+            tableName: "vwDetalleEmpleadoCootragua",
+            schema: "dbo",
+            timestamps: false
+        }
+    );
+
+    return DetalleEmpleadoCootragua;
+}
+
+module.exports = initDetalleEmpleadoCootragua;
