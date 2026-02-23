@@ -33,7 +33,8 @@ router.get('/pedido/validarYObtenerPedido', pedidos.validarYObtenerPedido)
 router.post('/pedido/createPedido', pedidos.createPedido)
 
 //LOGIN
-router.post('/login', login);
+router.post('/login', login.login);
+router.post('/validateLogin/:email', login.validateLogin);
 
 //SAP
 // router.post('/loginSAP', sap.loginSAP);

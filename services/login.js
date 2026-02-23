@@ -78,4 +78,49 @@ async function login(req, res) {
     }
 }
 
-module.exports = login;
+async function validateLogin(req, res) {
+    const { email } = req.params;
+
+    try {
+        const sequelizeCore = await sequelizeInit('CORE');
+        const Usuario = userModel(sequelizeCore);
+
+        const user = await Usuario.findOne({
+            where: {
+                email: email
+            }
+        })
+
+        if(user){
+            const payload = {
+                id_user: user.id_user,
+                nombre: user.nombre + ' ' + user.apellido,
+                rol: user.id_rol,
+                email: user.email
+            }
+
+            const token = jwt.sign(payload, SECRET, { expiresIn: "48h" });
+
+            return res.json({
+                message: "Login Exitoso",
+                token,
+                user: payload
+            })
+        } else {
+            return res.status(404).json({
+                message: 'Usuario no encontrado'
+            });
+        }
+
+    } catch (error) {
+        return res.status(500).json({
+            error: "Error al validar usuario",
+            details: error.message
+        });
+    }
+}
+
+module.exports = {
+    login,
+    validateLogin
+};
