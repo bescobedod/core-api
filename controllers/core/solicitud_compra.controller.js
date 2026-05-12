@@ -52,7 +52,7 @@ async function enviarNotificacionPush(idUsuario, titulo, mensaje, id_solicitud, 
         }, {
             headers: {
                 'Content-Type': 'application/json',
-                'x-api-key': '3b0d0dc323531f4e87196737b9e6f529d27b5c15becc0938cfb1e0283666c9f4'
+                'x-api-key': process.env.API_KEY_NOTIFICACIONES
             }
         });
     } catch (error) {
