@@ -114,7 +114,8 @@ async function createPedido(req, res) {
 }
 
 async function validarYObtenerPedido(req, res) {
-    const { id_tienda, fecha_requerida, id_tipo } = req.query;
+    const { fecha_requerida, id_tipo } = req.query;
+    let { id_tienda } = req.query;
 
     try {
         const sequelizeCore = await sequelizeInit.sequelizeInit('CORE');

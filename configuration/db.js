@@ -1,14 +1,22 @@
 const Sequelize = require('sequelize');
-const { configDatabase, DEFAULT_CONNECTION } = require('./configDatabase');
+const { configDatabase, DEFAULT_CONNECTION, PIOAPP_CONNECTION } = require('./configDatabase');
 const { config } = require('dotenv');
 
 const connections = {};
 const defaultConfig = configDatabase[DEFAULT_CONNECTION];
+const pioappConfig = configDatabase[PIOAPP_CONNECTION];
 const sequelize = new Sequelize(
     defaultConfig.database,
     defaultConfig.username,
     defaultConfig.password,
     defaultConfig.options
+);
+
+const sequelizePioApp = new Sequelize(
+    pioappConfig.database,
+    pioappConfig.username,
+    pioappConfig.password,
+    pioappConfig.options
 );
 
 async function sequelizeInit(instancia = DEFAULT_CONNECTION) {
@@ -42,6 +50,7 @@ const connectionDb = async () => {
 
 module.exports = {
     sequelize,
+    sequelizePioApp,
     sequelizeInit,
     connectionDb
 };

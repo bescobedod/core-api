@@ -4,23 +4,16 @@ const cors = require('cors');
 const routes = require('./routes/routes')
 const { connectionDb } = require('./configuration/db');
 const SapServiceLayerClient = require('./integrations/sap/sapClient');
-
-// const sapClient = new SapServiceLayerClient({
-//     baseUrl: process.env.SAP_SL_URL
-// });
-
-// await sapClient.login({
-//     companyDB: process.env.SAP_COMPANY_DB,
-//     username: process.env.SAP_USERNAME,
-//     password: process.env.SAP_PASSWORD
-// });
+const helmet = require('helmet');
 
 const app = express();
 const PORT = process.env.PORT || 8001;
 
 // app.set('sapClient', sapClient);
+app.use(helmet());
 app.use(cors());
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }))
 app.use('/core', routes);
 
 app.listen(PORT, () => {
