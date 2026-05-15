@@ -8,6 +8,7 @@ const VwAprobadoresSolicitudCompraModel = require('../../models/core/views/vw_ap
 const UsersModel = require('../../models/pioapp/users.model');
 const EstrategiaAdquisicionModel = require('../../models/core/tbl_estrategia_adquisicion.model');
 const DepartamentoModel = require('../../models/pioapp/tbl_departamento.model');
+const EmpresaModel = require('../../models/core/tbl_empresa.model');
 const { Op } = require('sequelize');
 const { sequelize } = require('../../configuration/db');
 const { buildS3Key, uploadBufferToS3 } = require('../../integrations/aws/s3');
@@ -35,6 +36,16 @@ SolicitudCompraModel.belongsTo(UsersModel, {
     foreignKey: 'solicitado_por',
     targetKey: 'id_users',
     as: 'usuario'
+});
+
+SolicitudCompraModel.belongsTo(EmpresaModel, {
+    foreignKey: 'id_empresa',
+    as: 'empresa'
+});
+
+EmpresaModel.hasMany(SolicitudCompraModel, {
+    foreignKey: 'id_empresa',
+    as: 'solicitudes'
 });
 
 async function enviarNotificacionPush(idUsuario, titulo, mensaje, id_solicitud, numero_requisicion) {
@@ -127,24 +138,24 @@ async function createSolicitudCompra(req, res) {
                 const file = req.files?.find(f => f.fieldname === `imagen_${index}`);
 
                 if (file) {
-    const key = buildS3Key({
-        id_solicitud: encabezado.id,
-        originalName: file.originalname,
-        mimeType: file.mimetype
-    });
+                    const key = buildS3Key({
+                        id_solicitud: encabezado.id,
+                        originalName: file.originalname,
+                        mimeType: file.mimetype
+                    });
 
-    await uploadBufferToS3({
-        bucket: process.env.AWS_BUCKET_NAME,
-        key,
-        buffer: file.buffer,
-        contentType: file.mimetype
-    });
+                    await uploadBufferToS3({
+                        bucket: process.env.AWS_BUCKET_NAME,
+                        key,
+                        buffer: file.buffer,
+                        contentType: file.mimetype
+                    });
 
-    const url_archivo = `https://${S3_BUCKET}.s3.${REGION}.amazonaws.com/${key}`;
+                    const url_archivo = `https://${S3_BUCKET}.s3.${REGION}.amazonaws.com/${key}`;
 
-    imagen_s3_key = url_archivo; // 👈 AQUÍ guardas la URL
-    imagen_nombre = file.originalname;
-}
+                    imagen_s3_key = url_archivo;
+                    imagen_nombre = file.originalname;
+                }
 
                 return {
                     ...item,
@@ -217,6 +228,11 @@ async function getSolicitudCompraAF(req, res) {
                     model: LineaSolicitudCompraModel,
                     as: 'items',
                     required: true
+                },
+                {
+                    model: EmpresaModel,
+                    as: 'empresa',
+                    attributes: ['id', 'nombre']
                 }
             ],
             order: [
@@ -245,21 +261,33 @@ async function getSolicitudCompraAF(req, res) {
 
             return {
                 ...s.toJSON(),
+
                 solicitado_por_id: s.solicitado_por,
+
                 solicitado_por: usuario
                     ? `${usuario.first_name} ${usuario.first_last_name}`
                     : null,
+
                 usuario: usuario
                     ? {
                         id: usuario.id_users,
                         nombre: `${usuario.first_name} ${usuario.first_last_name}`
+                    }
+                    : null,
+
+                empresa: s.empresa
+                    ? {
+                        id: s.empresa.id,
+                        nombre: s.empresa.nombre
                     }
                     : null
             };
         });
 
         if (solicitudes.length === 0) {
-            return res.status(404).json({ error: 'No se encuentran solicitudes aprobadas' });
+            return res.status(404).json({
+                error: 'No se encuentran solicitudes aprobadas'
+            });
         }
 
         return res.json(resultado);
@@ -298,44 +326,97 @@ async function updateArticulosCodes(req, res) {
             return res.status(400).json({ error: 'Se requiere un arreglo de ítems para actualizar' });
         }
 
-        const firstItem = await LineaSolicitudCompraModel.findByPk(items[0].id);
+        // 1. Obtener requisición base
+        const firstItem = await LineaSolicitudCompraModel.findByPk(items[0].id, {
+            transaction: t
+        });
+
         if (!firstItem) throw new Error("No se encontró la línea de solicitud");
+
         const requisicionId = firstItem.requisicion_id;
 
-        for (const item of items) {
-            await LineaSolicitudCompraModel.update(
-                {
-                    codigo_articulo: item.codigo_articulo,
-                    nombre_articulo: item.nombre_articulo,
-                    descripcion: item.nombre_articulo
-                },
-                { where: { id: item.id }, transaction: t }
-            );
+        // 2. Validación de misma requisición
+        const invalidItem = items.find(
+            item => item.requisicion_id && item.requisicion_id !== requisicionId
+        );
+
+        if (invalidItem) {
+            throw new Error('Se detectaron líneas de otra requisición');
         }
 
+        // 3. Update DB líneas
+        await Promise.all(
+            items.map(item =>
+                LineaSolicitudCompraModel.update(
+                    {
+                        codigo_articulo: item.codigo_articulo,
+                        nombre_articulo: item.nombre_articulo,
+                        descripcion: item.nombre_articulo
+                    },
+                    {
+                        where: { id: item.id },
+                        transaction: t
+                    }
+                )
+            )
+        );
+
+        // 4. Recargar solicitud completa
         const solicitudParaSAP = await SolicitudCompraModel.findByPk(requisicionId, {
             include: [{ model: LineaSolicitudCompraModel, as: 'items' }],
             transaction: t
         });
 
+        if (!solicitudParaSAP) throw new Error('No se encontró la solicitud de compra');
+        if (!solicitudParaSAP.items?.length) throw new Error('La solicitud no tiene líneas');
+
+        // 5. Empresa
+        const empresaRaw = await EmpresaModel.findByPk(
+            solicitudParaSAP.id_empresa,
+            { transaction: t }
+        );
+
+        if (!empresaRaw) throw new Error('No se encontró la empresa SAP');
+
+        const empresa = {
+            id: empresaRaw.id,
+            CompanyDB: empresaRaw.sap_database,
+            UserName: empresaRaw.sap_user,
+            Password: empresaRaw.sap_password
+        };
+
+        // 6. SAP CALL
         let sapResponse;
 
         try {
-            sapResponse = await sap.sendSolicitudCompra(solicitudParaSAP);
+            sapResponse = await sap.sendSolicitudCompra(
+                solicitudParaSAP,
+                empresa
+            );
+
+            console.log("===== RESPUESTA SAP =====");
+            console.log(sapResponse);
+
         } catch (sapError) {
+            console.error("===== ERROR SAP =====");
+            console.error(sapError);
+
             throw new Error(`SAP rechaza solicitud: ${sapError.message}`);
         }
 
+        // 7. Update cabecera
         await SolicitudCompraModel.update(
             {
                 DocEntry: sapResponse.DocEntry,
-                DocNum: sapResponse.DocNum
+                DocNum: sapResponse.DocNum,
+                estado: 'APROBADO_COMPRAS'
             },
             { where: { id: requisicionId }, transaction: t }
         );
 
         await t.commit();
-        return res.json({ 
+
+        return res.json({
             message: 'Códigos actualizados y enviado a SAP correctamente',
             DocNum: sapResponse.DocNum,
             DocEntry: sapResponse.DocEntry,
@@ -343,7 +424,7 @@ async function updateArticulosCodes(req, res) {
         });
 
     } catch (err) {
-        if (t) await t.rollback();
+        await t.rollback();
         return res.status(500).json({ error: err.message });
     }
 }
@@ -361,7 +442,6 @@ async function getSolicitudesCompraByUser(req, res) {
     const finValido = fin && fin !== 'null';
 
     try {
-
         const where = {
             solicitado_por: req.user.id_usuario
         };
@@ -399,6 +479,18 @@ async function getSolicitudesCompraByUser(req, res) {
 
         const solicitudes = await SolicitudCompraModel.findAll({
             where,
+            include: [
+                {
+                    model: LineaSolicitudCompraModel,
+                    as: 'items',
+                    required: true
+                },
+                {
+                    model: EmpresaModel,
+                    as: 'empresa',
+                    attributes: ['id', 'nombre']
+                }
+            ],
             order: [
                 ['fecha_creacion', 'DESC']
             ],
