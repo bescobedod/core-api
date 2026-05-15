@@ -5,7 +5,7 @@ class EmpresaModel extends Model {}
 
 EmpresaModel.init({
     id: { type: DataTypes.UUID, primaryKey: true, defaultValue: DataTypes.UUIDV4, allowNull: false },
-    nombre: { type: DataTypes.DATE },
+    nombre: { type: DataTypes.STRING },
     sap_database: { type: DataTypes.STRING(100) },
     sap_user: { type: DataTypes.STRING(100) },
     sap_password: { type: DataTypes.STRING(100) },
