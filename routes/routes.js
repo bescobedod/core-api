@@ -30,7 +30,7 @@ router.get('/cootragua/getAllEmpleadosCootragua', cootragua.getAllEmpleadosCootr
 
 //MENUS
 router.get('/menus/getAllMenus', auth, menus.getAllMenus);
-router.get('/menus/getPermiso/:id_rol', auth, menus.getPermiso);
+router.get('/menus/getPermiso', auth, menus.getPermiso);
 
 //PEDIDOS-ENVIOS
 router.get('/pedido/getAllTipoPedidoEnvio', tiposPedidoEnvio.getAllTipoPedidoEnvio);
@@ -47,9 +47,9 @@ router.post('/validateLogin/:email', login.validateLogin);
 
 //SAP
 // router.post('/loginSAP', sap.loginSAP);
-router.get('/sap/productosAgrupados', sap.productosAgrupados);
-router.get('/sap/obtenerGruposArticulos', sap.obtenerGruposArticulos);
-router.get('/sap/obtenerProductosPorGrupo', sap.obtenerProductosPorGrupo);
+// router.get('/sap/productosAgrupados', sap.productosAgrupados);
+// router.get('/sap/obtenerGruposArticulos', sap.obtenerGruposArticulos);
+// router.get('/sap/obtenerProductosPorGrupo', sap.obtenerProductosPorGrupo);
 router.post('/sap/verificarArticulosSAP', auth, sap.verificarArticulosSAP);
 router.get('/sap/buscarProductosPorNombre', auth, sap.buscarProductosPorNombre);
 

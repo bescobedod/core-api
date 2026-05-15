@@ -20,7 +20,8 @@ SolicitudCompraModel.init({
     es_activo_fijo: { type: DataTypes.BOOLEAN, allowNull: true },
     DocEntry: { type: DataTypes.INTEGER, allowNull: true },
     DocNum: { type: DataTypes.INTEGER, allowNull: true },
-    codigo_departamento: { type: DataTypes.TEXT, allowNull: true }
+    codigo_departamento: { type: DataTypes.TEXT, allowNull: true },
+    id_empresa: { type: DataTypes.UUID, allowNull: true }
 }, {
     sequelize: sequelize,
     tableName: 'tbl_solicitud_compra',
