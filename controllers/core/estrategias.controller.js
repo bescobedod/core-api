@@ -1,8 +1,10 @@
 const EstrategiaAdquisicionModel = require('../../models/core/tbl_estrategia_adquisicion.model');
 const MatrizAprobacionSolicitudModel = require('../../models/core/tbl_matriz_aprobacion_solicitud_compra.model');
+const MatrizAprobacionOrdenModel = require('../../models/core/tbl_matriz_aprobacion_orden_compra.model');
 const VwNivelMatrizAprovacionSolicitudCompra = require('../../models/core/views/vw_nivel_matriz_aprobacion_solicitud_compra');
 const VwAreasModel = require('../../models/pioapp/views/vw_areas');
 const NivelMatrizAprobacionSolicitudModel = require('../../models/core/tbl_nivel_matriz_aprobacion_solicitud_compra.model');
+const NivelMatrizAprobacionOrdenModel = require('../../models/core/tbl_nivel_matriz_aprobacion_orden_compra.model');
 const UserModel = require('../../models/core/tbl_usuario.model');
 const UsersModel = require('../../models/pioapp/users.model');
 const sap = require('../../integrations/sap/sapClient');
@@ -34,61 +36,84 @@ async function getMatrizAprobacion(req, res) {
     const { id_estrategia } = req.params;
     
     try {
-        const matriz = await MatrizAprobacionSolicitudModel.findOne({
-            where: {
-                estrategia_adquisicion_id: id_estrategia
-            }
+        // ── Matriz de Solicitud ──────────────────────────────────────────────
+        const matrizSolicitud = await MatrizAprobacionSolicitudModel.findOne({
+            where: { estrategia_adquisicion_id: id_estrategia }
         });
 
-        if(!matriz) {
-            return res.status(404).json({ error: "No se encontraron matrices de aprobación" })
+        let matricesSolicitudCargada = null;
+
+        if (matrizSolicitud) {
+            const nivelesSolicitud = await NivelMatrizAprobacionSolicitudModel.findAll({
+                where: { matriz_id: matrizSolicitud.id },
+                order: [['nivel', 'ASC']]
+            });
+
+            const nivelesSolicitudCargados = await cargarUsuariosEnNiveles(nivelesSolicitud);
+
+            matricesSolicitudCargada = {
+                ...matrizSolicitud.toJSON(),
+                niveles: nivelesSolicitudCargados
+            };
         }
 
-        const niveles = await NivelMatrizAprobacionSolicitudModel.findAll({
-            where: {
-                matriz_id: matriz.id
-            },
-            order: [['nivel', 'ASC']]
+        // ── Matrices de Orden ────────────────────────────────────────────────
+        const matricesOrden = await MatrizAprobacionOrdenModel.findAll({
+            where: { estrategia_adquisicion_id: id_estrategia },
+            order: [['prioridad', 'ASC']]
         });
 
-        const usersId = niveles.map(n => n.usuario_aprobador_id);
+        const matricesOrdenCargadas = await Promise.all(
+            matricesOrden.map(async (matriz) => {
+                const nivelesOrden = await NivelMatrizAprobacionOrdenModel.findAll({
+                    where: { matriz_id: matriz.id },
+                    order: [['nivel', 'ASC']]
+                });
 
-        const usuarios = await UsersModel.findAll({
-            where: {
-                id_users: {
-                    [Op.in]: usersId
-                }
-            }
-        });
+                const nivelesOrdenCargados = await cargarUsuariosEnNiveles(nivelesOrden);
 
-        const usuariosMap = {};
-        usuarios.forEach(u => {
-            usuariosMap[u.id_users] = u;
-        });
-
-        const nivelesCargados = niveles.map(n => {
-            const nivel = n.toJSON();
-            const usuario = usuariosMap[nivel.usuario_aprobador_id];
-
-            return {
-                ...nivel,
-                aprobador: usuario
-                ? `${usuario.first_name || ''} ${usuario.second_name || ''} ${usuario.first_last_name || ''} ${usuario.second_last_name || ''}`.trim()
-                : null,
-                puesto_aprobador: usuario ? usuario.puesto_trabajo : null
-            }
-        })
+                return {
+                    ...matriz.toJSON(),
+                    niveles: nivelesOrdenCargados
+                };
+            })
+        );
 
         return res.json({
-            matrices_solicitud: {
-                ...matriz.toJSON(),
-                niveles: nivelesCargados
-            }
+            matrices_solicitud: matricesSolicitudCargada,
+            matrices_orden: matricesOrdenCargadas
         });
+
     } catch (err) {
         console.error("Error al obtener matrices de aprobacion", err);
         return res.status(500).json({ error: err.message });
     }
+}
+
+async function cargarUsuariosEnNiveles(niveles) {
+    if (!niveles.length) return [];
+
+    const usersId = niveles.map(n => n.usuario_aprobador_id);
+
+    const usuarios = await UsersModel.findAll({
+        where: { id_users: { [Op.in]: usersId } }
+    });
+
+    const usuariosMap = {};
+    usuarios.forEach(u => { usuariosMap[u.id_users] = u; });
+
+    return niveles.map(n => {
+        const nivel = n.toJSON();
+        const usuario = usuariosMap[nivel.usuario_aprobador_id];
+
+        return {
+            ...nivel,
+            aprobador: usuario
+                ? `${usuario.first_name || ''} ${usuario.second_name || ''} ${usuario.first_last_name || ''} ${usuario.second_last_name || ''}`.trim()
+                : null,
+            puesto_aprobador: usuario ? usuario.puesto_trabajo : null
+        };
+    });
 }
 
 async function deleteNivelMatrizSolicitud(req, res) {
@@ -136,7 +161,7 @@ async function deleteNivelMatrizSolicitud(req, res) {
 }
 
 async function updateEstrategiaAdquisicion(req, res) {
-    const { estrategia, matriz_solicitud } = req.body;
+    const { estrategia, matriz_solicitud, matrices_orden } = req.body;
 
     try {
         if (!estrategia?.id) {
@@ -147,6 +172,12 @@ async function updateEstrategiaAdquisicion(req, res) {
 
         if (!matriz_solicitud?.id) {
             const error = new Error("ID de matriz requerido");
+            error.status = 400;
+            throw error;
+        }
+
+        if (matrices_orden && !Array.isArray(matrices_orden)) {
+            const error = new Error("matrices_orden debe ser un arreglo");
             error.status = 400;
             throw error;
         }
@@ -234,13 +265,126 @@ async function updateEstrategiaAdquisicion(req, res) {
                 usuario_aprobador_id: nivel.usuario_aprobador_id
             }, { transaction: t });
 
+            if (matrices_orden?.length > 0) {
+                const matricesIds = matrices_orden.map(m => m.id).filter(Boolean);
+                const matricesDB = await MatrizAprobacionOrdenModel.findAll({
+                    where: {
+                        id: matricesIds,
+                        estrategia_adquisicion_id: estrategia.id
+                    },
+                    transaction: t
+                });
+                const matricesMap = new Map(
+                    matricesDB.map(m => [m.id, m])
+                );
+                const usuariosIds = [
+                    ...new Set(
+                        matrices_orden.flatMap(m =>
+                            (m.niveles || [])
+                                .map(n => Number(n.usuario_aprobador_id))
+                        )
+                    )
+                ];
+
+                const usuariosDB = await UsersModel.findAll({
+                    where: {
+                        id_users: usuariosIds
+                    }
+                });
+                const usuariosSet = new Set(
+                    usuariosDB.map(u => Number(u.id_users))
+                );
+
+                for (const matrizOrden of matrices_orden) {
+                    if (!matrizOrden.id) {
+                        continue;
+                    }
+
+                    if (!matricesMap.has(matrizOrden.id)) {
+                        continue;
+                    }
+
+                    const usuariosRecibidos = (matrizOrden.niveles || [])
+                        .map(n => Number(n.usuario_aprobador_id));
+
+                    for (const usuarioId of usuariosRecibidos) {
+                        if (!usuariosSet.has(usuarioId)) {
+                            throw new Error(
+                                `Usuario aprobador ${usuarioId} no existe`
+                            );
+                        }
+                    }
+
+                    await NivelMatrizAprobacionOrdenModel.destroy({
+                        where: {
+                            matriz_id: matrizOrden.id
+                        },
+                        transaction: t
+                    });
+
+                    await NivelMatrizAprobacionOrdenModel.bulkCreate(
+                        usuariosRecibidos.map((usuarioId, index) => ({
+                            matriz_id: matrizOrden.id,
+                            nivel: index + 1,
+                            usuario_aprobador_id: usuarioId,
+                            es_requerido: true,
+                            puede_delegar: false
+                        })),
+                        {
+                            transaction: t
+                        }
+                    );
+
+                    const nivelesActuales = await NivelMatrizAprobacionOrdenModel.findAll({
+                        where: {
+                            matriz_id: matrizOrden.id
+                        },
+                        transaction: t
+                    });
+
+                    const nivelesMap = new Map(
+                        nivelesActuales.map(n => [
+                            Number(n.usuario_aprobador_id),
+                            n
+                        ])
+                    );
+
+                    for (let i = 0; i < usuariosRecibidos.length; i++) {
+                        const usuarioId = usuariosRecibidos[i];
+                        const nivelExistente = nivelesMap.get(usuarioId);
+
+                        if (nivelExistente) {
+                            await nivelExistente.update(
+                                {
+                                    nivel: i + 1
+                                },
+                                {
+                                    transaction: t
+                                }
+                            );
+                        } else {
+                            await NivelMatrizAprobacionOrdenModel.create(
+                                {
+                                    matriz_id: matrizOrden.id,
+                                    nivel: i + 1,
+                                    usuario_aprobador_id: usuarioId,
+                                    es_requerido: true,
+                                    puede_delegar: false
+                                },
+                                {
+                                    transaction: t
+                                }
+                            );
+                        }
+                    }
+                }
+            }
         });
 
         return res.json({ message: "Estrategia actualizada correctamente" });
 
     } catch (err) {
         console.error(err);
-
         return res.status(err.status || 500).json({
             error: err.message
         });
@@ -370,6 +514,133 @@ async function createMatrizAprobacionSolicitud(req, res) {
     }
 }
 
+async function createMatrizAprobacionOrden(req, res) {
+    const { id_estrategia, nombre, monto_minimo, monto_maximo, moneda } = req.body;
+
+    try {
+        if (!id_estrategia) {
+            const error = new Error("id_estrategia es requerido");
+            error.status = 400;
+            throw error;
+        }
+
+        if (monto_minimo === undefined || monto_minimo === null) {
+            const error = new Error("monto_minimo es requerido");
+            error.status = 400;
+            throw error;
+        }
+
+        if (monto_maximo === undefined || monto_maximo === null) {
+            const error = new Error("monto_maximo es requerido");
+            error.status = 400;
+            throw error;
+        }
+
+        if (!moneda) {
+            const error = new Error("moneda es requerida");
+            error.status = 400;
+            throw error;
+        }
+
+        if (Number(monto_minimo) >= Number(monto_maximo)) {
+            const error = new Error("El monto mínimo debe ser menor al monto máximo");
+            error.status = 400;
+            throw error;
+        }
+
+        const estrategia = await EstrategiaAdquisicionModel.findByPk(id_estrategia);
+        if (!estrategia) {
+            const error = new Error("Estrategia no encontrada");
+            error.status = 404;
+            throw error;
+        }
+
+        const matrizConTraslape = await MatrizAprobacionOrdenModel.findOne({
+            where: {
+                estrategia_adquisicion_id: id_estrategia,
+                esta_activo: true,
+                [Op.and]: [
+                    { monto_minimo: { [Op.lte]: Number(monto_maximo) } },
+                    { monto_maximo: { [Op.gte]: Number(monto_minimo) } }
+                ]
+            }
+        });
+
+        if (matrizConTraslape) {
+            const error = new Error(
+                `El rango [${monto_minimo} - ${monto_maximo}] se traslapa con una matriz existente ` +
+                `[${matrizConTraslape.monto_minimo} - ${matrizConTraslape.monto_maximo}]`
+            );
+            error.status = 409;
+            throw error;
+        }
+
+        const area = await AreaModel.findByPk(estrategia.area_id);
+        if (!area) {
+            const error = new Error("Área no encontrada");
+            error.status = 404;
+            throw error;
+        }
+
+        if (!area.jefe_inmediato) {
+            const error = new Error("El área no tiene un jefe inmediato asignado");
+            error.status = 400;
+            throw error;
+        }
+
+        const jefe = await UsersModel.findByPk(area.jefe_inmediato);
+        if (!jefe) {
+            const error = new Error("El jefe inmediato no existe en el sistema");
+            error.status = 404;
+            throw error;
+        }
+
+        const prioridadMaxima = await MatrizAprobacionOrdenModel.max('prioridad', {
+            where: {
+                estrategia_adquisicion_id: id_estrategia,
+                esta_activo: true
+            }
+        });
+        const nuevaPrioridad = (prioridadMaxima || 0) + 1;
+
+        const matriz = await sequelize.transaction(async (t) => {
+            const nuevaMatriz = await MatrizAprobacionOrdenModel.create({
+                departamento_id: estrategia.departamento_id,
+                estrategia_adquisicion_id: estrategia.id,
+                monto_minimo: Number(monto_minimo),
+                monto_maximo: Number(monto_maximo),
+                moneda,
+                prioridad: nuevaPrioridad,
+                nombre: nombre || "Matriz de aprobación de orden de compra",
+                esta_activo: true
+            }, { transaction: t });
+
+            await NivelMatrizAprobacionOrdenModel.create({
+                matriz_id: nuevaMatriz.id,
+                nivel: 1,
+                usuario_aprobador_id: area.jefe_inmediato
+            }, { transaction: t });
+
+            return nuevaMatriz;
+        });
+
+        return res.status(201).json({ matriz });
+
+    } catch (err) {
+        console.error(err);
+
+        if (err.name === 'SequelizeUniqueConstraintError') {
+            return res.status(409).json({
+                error: "Ya existe una configuración idéntica para esta estrategia"
+            });
+        }
+
+        return res.status(err.status || 500).json({
+            error: err.message
+        });
+    }
+}
+
 async function getJefeInmediatoByEstrategia(req, res) {
     const { id_estrategia } = req.params;
 
@@ -423,5 +694,6 @@ module.exports = {
     updateEstrategiaAdquisicion,
     createEstrategiaByArea,
     createMatrizAprobacionSolicitud,
+    createMatrizAprobacionOrden,
     getJefeInmediatoByEstrategia
 }

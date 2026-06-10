@@ -4,7 +4,7 @@ const { sequelize } = require('../../configuration/db');
 class LineaSolicitudCompraModel extends Model {}
 
 LineaSolicitudCompraModel.init({
-    id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true, allowNull: false },
+    id: { type: DataTypes.UUID, primaryKey: true, defaultValue: DataTypes.UUIDV4, allowNull: false },
     requisicion_id: { type: DataTypes.STRING(50), allowNull: false },
     numero_linea: { type: DataTypes.STRING(20), allowNull: false },
     codigo_articulo: { type: DataTypes.STRING(50), allowNull: false },

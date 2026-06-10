@@ -20,6 +20,7 @@ UsersModel.init({
     userCreatedAt: { type: DataTypes.BIGINT, allowNull: true },
     userUpdatedAt: { type: DataTypes.BIGINT, allowNull: true },
     division: { type: DataTypes.INTEGER, allowNull: true },
+    email_office: { type: DataTypes.STRING(200), allowNull: true },
     id_departamento: { type: DataTypes.INTEGER, allowNull: true },
     id_area: { type: DataTypes.INTEGER, allowNull: true },
     id_rol_core: { type: DataTypes.INTEGER, allowNull: true }
