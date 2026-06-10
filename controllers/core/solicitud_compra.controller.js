@@ -50,7 +50,7 @@ EmpresaModel.hasMany(SolicitudCompraModel, {
 
 async function enviarNotificacionPush(idUsuario, titulo, mensaje, id_solicitud, numero_requisicion) {
     try {
-        await axios.post('https://kevin-unrelegated-ramon.ngrok-free.dev/api/notificaciones/send', {
+        await axios.post('https://services.sistemaspinulito.com/coreapi/notificaciones/send', {
             id_usuario: [idUsuario],
             title: titulo,
             body: mensaje,
@@ -350,8 +350,7 @@ async function updateArticulosCodes(req, res) {
                 LineaSolicitudCompraModel.update(
                     {
                         codigo_articulo: item.codigo_articulo,
-                        nombre_articulo: item.nombre_articulo,
-                        descripcion: item.nombre_articulo
+                        nombre_articulo: item.nombre_articulo
                     },
                     {
                         where: { id: item.id },
@@ -538,26 +537,27 @@ async function getSolicitudesCompraByUser(req, res) {
         });
 
         const resultado = solicitudes.map(s => {
-
             const usuario = usuariosMap[s.solicitado_por];
 
             return {
                 ...s.toJSON(),
-
                 items: itemsMap[s.id] || [],
-
                 solicitado_por_id: s.solicitado_por,
-
                 solicitado_por: usuario
-                    ? `${usuario.first_name} ${usuario.first_last_name}`
-                    : null,
-
+                ? `${usuario.first_name} ${usuario.first_last_name}`
+                : null,
                 usuario: usuario
-                    ? {
-                        id: usuario.id_users,
-                        nombre: `${usuario.first_name} ${usuario.first_last_name}`
-                    }
-                    : null
+                ? {
+                    id: usuario.id_users,
+                    nombre: `${usuario.first_name} ${usuario.first_last_name}`
+                }
+                : null,
+                empresa: s.empresa
+                ? {
+                    id: s.empresa.id,
+                    nombre: s.empresa.nombre
+                }
+                : null
             };
         });
 
@@ -641,6 +641,13 @@ async function getSolicitudesCompra(req, res) {
 
         const solicitudes = await SolicitudCompraModel.findAll({
             where,
+            include: [
+                {
+                    model: EmpresaModel,
+                    as: 'empresa',
+                    attributes: ['id', 'nombre']
+                }
+            ],
             order: [
                 ['fecha_creacion', 'DESC']
             ],
@@ -688,24 +695,25 @@ async function getSolicitudesCompra(req, res) {
         });
 
         const resultado = solicitudes.map(s => {
-
             const usuario = usuariosMap[s.solicitado_por];
 
             return {
                 ...s.toJSON(),
-
                 items: itemsMap[s.id] || [],
-
                 solicitado_por_id: s.solicitado_por,
-
                 solicitado_por: usuario
                     ? `${usuario.first_name} ${usuario.first_last_name}`
                     : null,
-
                 usuario: usuario
                     ? {
                         id: usuario.id_users,
                         nombre: `${usuario.first_name} ${usuario.first_last_name}`
+                    }
+                    : null,
+                empresa: s.empresa
+                    ? {
+                        id: s.empresa.id,
+                        nombre: s.empresa.nombre
                     }
                     : null
             };
@@ -801,6 +809,23 @@ async function getAprobacionSolicitud(req, res) {
     }
 }
 
+async function getSolicitudCompra(req, res) {
+    const { id_solicitud } = req.params;
+
+    try {
+        const solicitud = await SolicitudCompraModel.findByPk(id_solicitud);
+
+        if(!solicitud) {
+            return res.status(404).json({ error: "No se encontró la solicitud de compra" });
+        }
+
+        return res.json(solicitud);
+    } catch (err) {
+        console.error("Error al obtener aprobaciones de solicitud de compra", err);
+        return res.status(500).json({ error: err.message });
+    }
+}
+
 module.exports = {
     createSolicitudCompra,
     getSolicitudCompraAF,
@@ -808,5 +833,7 @@ module.exports = {
     updateArticulosCodes,
     getSolicitudesCompraByUser,
     getSolicitudesCompra,
-    getAprobacionSolicitud
+    getAprobacionSolicitud,
+    getSolicitudCompra,
+    enviarNotificacionPush
 }

@@ -117,7 +117,7 @@ async function searchUsers(req, res) {
 
         const usuarios = await UsersModel.findAll({
             where: whereCondition,
-            attributes: ['id_users', 'first_name', 'first_last_name', 'codigo_user', 'email']
+            attributes: ['id_users', 'first_name', 'second_name', 'first_last_name', 'second_last_name', 'codigo_user', 'email']
         });
 
         return res.json(usuarios);

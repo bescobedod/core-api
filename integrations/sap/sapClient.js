@@ -185,31 +185,38 @@ async function sendSolicitudCompra(solicitud, empresa) {
     try {
         return await execute();
     } catch (error) {
-        const code = error.response?.data?.error?.code;
-        const status = error.response?.status;
 
-        const isAuthError =
-            code === "301" ||
-            code === "302" ||
-            code === "206" ||
-            status === 401;
+    console.log("===== SAP ERROR =====");
+    console.log("STATUS:", error.response?.status);
 
-        if (isAuthError) {
-            console.log("===== SAP SESSION EXPIRED → RELOGIN =====");
+    console.log(
+        JSON.stringify(
+            error.response?.data,
+            null,
+            2
+        )
+    );
 
-            delete sapSessions[empresa.id];
+    const code = error.response?.data?.error?.code;
+    const status = error.response?.status;
 
-            const newSession = await loginSAP(empresa);
-            sapSessions[empresa.id] = newSession;
+    const isAuthError =
+        code === "301" ||
+        code === "302" ||
+        code === "206" ||
+        status === 401;
 
-            return await execute();
-        }
+    if (isAuthError) {
+        delete sapSessions[empresa.id];
 
-        throw new Error(
-            error.response?.data?.error?.message?.value ||
-            error.message
-        );
+        const newSession = await loginSAP(empresa);
+        sapSessions[empresa.id] = newSession;
+
+        return await execute();
     }
+
+    throw error;
+}
 }
 
 async function buscarProductosPorNombre(req, res) {
@@ -265,11 +272,63 @@ async function buscarProductosPorNombre(req, res) {
     }
 }
 
+async function getProveedores(req, res) {
+    const { query, empresa_id } = req.query;
+
+    if (!empresa_id) {
+        return res.status(400).json({ error: "Debe enviar empresa_id" });
+    }
+
+    try {
+        const empresa = await obtenerEmpresaSAP(empresa_id);
+        let session = sapSessions.byEmpresa[empresa.id];
+
+        if (!session || !session.sessionId) {
+            session = await loginSAP(empresa);
+            sapSessions.byEmpresa[empresa.id] = session;
+        }
+
+        const headers = {
+            Cookie: `B1SESSION=${session.sessionId}; ROUTEID=${session.routeId}`
+        };
+
+        let filterQuery = "CardType eq 'cSupplier' and Valid eq 'tYES'";
+
+        if (query && query.trim().length > 0) {
+            const safeQuery = query.replace(/'/g, "''");
+            filterQuery += ` and contains(CardName, '${safeQuery}')`;
+        }
+
+        const url = `${process.env.SAP_URL.replace(/\/$/, '')}/BusinessPartners?` +
+            `$select=CardCode,CardName&` +
+            `$filter=${filterQuery}&` +
+            `$top=20`;
+
+        const response = await axios.get(url, { headers, httpsAgent: agent });
+
+        return res.json({
+            status: "success",
+            proveedores: response.data.value || []
+        });
+
+    } catch (error) {
+        if (error.response?.status === 401) {
+            delete sapSessions.byEmpresa[empresa_id];
+        }
+
+        return res.status(500).json({
+            error: "Error SAP al obtener proveedores",
+            details: error.response?.data?.error?.message?.value || error.message
+        });
+    }
+}
+
 module.exports = {
     loginSAP,
     loginSAPGlobal,
     obtenerEmpresaSAP,
     verificarArticulosSAP,
     sendSolicitudCompra,
-    buscarProductosPorNombre
+    buscarProductosPorNombre,
+    getProveedores
 };

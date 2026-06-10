@@ -81,7 +81,7 @@ async function validateLogin(req, res) {
     try {
         const user = await UsersModel.findOne({
             where: {
-                email: email
+                email_office: email
             }
         })
         if(user){
@@ -96,7 +96,7 @@ async function validateLogin(req, res) {
         } else {
             return res.json({
                 details: 'Usuario no encontrado',
-                email: email,
+                email_office: email_office,
                 ok: false
             });
         }
@@ -164,7 +164,7 @@ function generateToken(user, SECRET) {
         id_usuario: user.id_users,
         nombre: user.first_name + ' ' + user.first_last_name,
         rol: user.id_rol_core,
-        email: user.email,
+        email_office: user.email_office,
         puesto: user.puesto_trabajo,
         id_departamento: user.id_departamento,
         id_area: user.id_area
