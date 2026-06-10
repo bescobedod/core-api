@@ -9,6 +9,7 @@ const tiposPedidoEnvio = require('../controllers/core/pedido_envio.controller');
 const cootragua = require('../controllers/nomina/empleadoCootragua.controller');
 const pedidos = require('../controllers/core/pedido.controller');
 const solicitudes = require('../controllers/core/solicitud_compra.controller.js');
+const ordenes = require('../controllers/core/orden_compra.controller.js');
 const estrategias = require('../controllers/core/estrategias.controller.js');
 const usuarios = require('../controllers/core/usuario.controller.js');
 const areas = require('../controllers/core/area.controller.js');
@@ -52,11 +53,12 @@ router.post('/validateLogin/:email', login.validateLogin);
 // router.get('/sap/obtenerProductosPorGrupo', sap.obtenerProductosPorGrupo);
 router.post('/sap/verificarArticulosSAP', auth, sap.verificarArticulosSAP);
 router.get('/sap/buscarProductosPorNombre', auth, sap.buscarProductosPorNombre);
+router.get('/sap/getProveedores', auth, sap.getProveedores);
 
 //SOLICITUDES COMPRA
 router.post('/solicitud/createSolicitudCompra',
     auth,
-    upload.any(),
+    upload.upload.any(),
     solicitudes.createSolicitudCompra);
 router.get('/solicitud/getSolicitudCompraAF', auth, solicitudes.getSolicitudCompraAF);
 router.get('/solicitud/getArticulosBySolicitud/:id_solicitud', auth, solicitudes.getArticulosBySolicitud);
@@ -64,6 +66,16 @@ router.post('/solicitud/updateArticulosCodes', auth, solicitudes.updateArticulos
 router.get('/solicitud/getSolicitudesCompraByUser', auth, solicitudes.getSolicitudesCompraByUser);
 router.get('/solicitud/getSolicitudesCompra', auth, solicitudes.getSolicitudesCompra);
 router.get('/solicitud/getAprobacionSolicitud/:id_solicitud', auth, solicitudes.getAprobacionSolicitud);
+router.get('/solicitud/getSolicitudCompra/:id_solicitud', auth, solicitudes.getSolicitudCompra);
+
+//ORDENES COMPRA
+router.post('/orden/createOrdenCompra',
+    auth,
+    upload.uploadDocumentos.single('cotizacion'),
+    ordenes.createOrdenCompra);
+router.get('/orden/getOrdenesCompraByUser', auth, ordenes.getOrdenesCompraByUser);
+router.get('/orden/getOrdenesCompra', auth, ordenes.getOrdenesCompra);
+router.get('/orden/getAprobacionOrden/:id_orden', auth, ordenes.getAprobacionOrden);
 
 //ESTRATEGIAS
 router.get('/estrategia/getEstrategias', auth, estrategias.getEstrategias);
@@ -72,6 +84,7 @@ router.put('/estrategia/deleteNivelMatrizSolicitud', auth, estrategias.deleteNiv
 router.put('/estrategia/updateEstrategiaAdquisicion', auth, estrategias.updateEstrategiaAdquisicion);
 router.post('/estrategia/createEstrategiaByArea/:area', auth, estrategias.createEstrategiaByArea);
 router.post('/estrategia/createMatrizAprobacionSolicitud', auth, estrategias.createMatrizAprobacionSolicitud);
+router.post('/estrategia/createMatrizAprobacionOrden', auth, estrategias.createMatrizAprobacionOrden);
 router.get('/estrategia/getJefeInmediatoByEstrategia/:id_estrategia', auth, estrategias.getJefeInmediatoByEstrategia);
 
 //USUARIOS

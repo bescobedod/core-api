@@ -67,4 +67,18 @@ async function getPresignedUrl({ bucket, key, expiresInSec = 3600 }) {
   return getSignedUrl(s3Client, new GetObjectCommand({ Bucket: bucket, Key: key }), { expiresIn: expiresInSec });
 }
 
-module.exports = { buildS3Key, uploadBufferToS3, deleteFromS3, getPresignedUrl };
+function buildOrdenCompraS3Key({ ordenId, originalName, mimeType }) {
+  const prefix = 'compras/orden/documento_cotizacion/';
+
+  const extByName =
+    (originalName && path.extname(originalName).toLowerCase()) || '';
+
+  const ext = extByName || mimeExt(mimeType) || '.xlsx';
+
+  const ts = Date.now();
+  const rand = crypto.randomBytes(8).toString('hex');
+
+  return `${prefix}/${ordenId}/${ts}-${rand}${ext}`;
+}
+
+module.exports = { buildS3Key, uploadBufferToS3, deleteFromS3, getPresignedUrl, buildOrdenCompraS3Key };
