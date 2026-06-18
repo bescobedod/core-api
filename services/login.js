@@ -28,7 +28,7 @@ async function login(req, res) {
             const empleado = await findEmployeeInNomina(EmpleadoModel, identifier);
 
             if (!empleado) {
-                return res.status(404).json({ error: "Usuario no encontrado" });
+                return res.status(404).json({ error: "Credenciales inválidas" });
             }
 
             const isPasswordCorrect = validatePassword(
@@ -38,7 +38,7 @@ async function login(req, res) {
             );
 
             if (!isPasswordCorrect) {
-                return res.status(401).json({ error: "Contraseña incorrecta" });
+                return res.status(401).json({ error: "Credenciales inválidas" });
             }
 
             user = await createUserFromEmployee(UsersModel, empleado);
