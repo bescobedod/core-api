@@ -127,8 +127,36 @@ async function searchUsers(req, res) {
     }
 }
 
+async function updateUser(req, res) {
+    const { email_office } = req.body;
+    try {
+        const user = await UsersModel.findByPk(req.user.id_ususario);
+        
+        if(user) {
+            await user.update({
+                email_office
+            })
+
+            return res.json({
+                message: 'Datos de usuario actualizados',
+                user
+            })
+        } else {
+            return res.status(404).json({
+                message: 'Usuario no encontrado'
+            })
+        }
+    } catch (err) {
+        return res.status(500).json({
+            error: 'Error al intentar actualizar datos del usuario',
+            details: err.message
+        })
+    }
+}
+
 module.exports = {
     getUsersByDepartamento,
     getUsersByDepartamento2,
-    searchUsers
+    searchUsers,
+    updateUser
 }

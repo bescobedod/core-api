@@ -15,6 +15,8 @@ const usuarios = require('../controllers/core/usuario.controller.js');
 const areas = require('../controllers/core/area.controller.js');
 const departamentos = require('../controllers/core/departamento.controller.js');
 const empresas = require('../controllers/core/empresa.controller.js');
+const camiones = require('../controllers/core/camion.controller.js');
+const vales = require('../controllers/core/vales_combustible.controller.js');
 const auth = require('../middlewares/auth.js');
 const upload = require('../middlewares/upload.js');
 
@@ -91,6 +93,7 @@ router.get('/estrategia/getJefeInmediatoByEstrategia/:id_estrategia', auth, estr
 router.get('/usuario/getUsersByDepartamento/:id_matriz', auth, usuarios.getUsersByDepartamento);
 router.get('/usuario/getUsersByDepartamento2/:departamento_id', auth, usuarios.getUsersByDepartamento2);
 router.get('/usuario/searchUsers', auth, usuarios.searchUsers);
+router.put('/usuario/updateUser', auth, usuarios.updateUser);
 
 //DEPARTAMENTO
 router.get('/departamento/getDepartamentos', auth, departamentos.getDepartamentos);
@@ -102,5 +105,11 @@ router.get('/area/getAreasYEmpleadosByDepartamento/:departamento_id', auth, area
 
 //EMPRESA
 router.get('/empresa/getEmpresasActivas', auth, empresas.getEmpresasActivas);
+
+//CAMION
+router.get('/camion/getInspecciones', auth, camiones.getInspecciones);
+
+//VALES DE COMBUSTIBLE
+router.get('/vale/getValesCombustible', auth, vales.getValesCombustible)
 
 module.exports = router
