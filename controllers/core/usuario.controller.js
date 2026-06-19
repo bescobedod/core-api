@@ -130,7 +130,7 @@ async function searchUsers(req, res) {
 async function updateUser(req, res) {
     const { email_office } = req.body;
     try {
-        const user = await UsersModel.findByPk(req.user.id_ususario);
+        const user = await UsersModel.findByPk(req.user.id_usuario);
         
         if(user) {
             await user.update({
