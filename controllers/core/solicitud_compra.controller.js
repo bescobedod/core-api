@@ -639,6 +639,10 @@ async function getSolicitudesCompra(req, res) {
             where
         });
 
+        if(total === 0) {
+            return res.status(404).json({ error: 'No se encontraron solicitudes de compra con los parámetros seleccionados' });
+        }
+
         const solicitudes = await SolicitudCompraModel.findAll({
             where,
             include: [

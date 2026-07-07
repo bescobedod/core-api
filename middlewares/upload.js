@@ -25,8 +25,11 @@ const fileFilter = (req, file, cb) => {
 
 const fileFilterDocs = (req, file, cb) => {
   const ext = file.originalname.split('.').pop().toLowerCase();
-  if (!ALLOWED_MIME_DOCS.has(file.mimetype) && !['xlsx', 'xls'].includes(ext)) {
-    return cb(new Error('Solo se permiten archivos Excel (.xlsx o .xls)'), false);
+  const esExcel = ALLOWED_MIME_DOCS.has(file.mimetype) || ['xlsx', 'xls'].includes(ext);
+  const esImagen = ALLOWED_MIME.has(file.mimetype) || ['jpg', 'jpeg', 'png'].includes(ext);
+
+  if (!esExcel && !esImagen) {
+    return cb(new Error('Solo se permiten archivos Excel (.xlsx, .xls) o imágenes (.jpg, .png)'), false);
   }
   cb(null, true);
 };

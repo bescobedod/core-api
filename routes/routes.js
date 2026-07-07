@@ -71,13 +71,15 @@ router.get('/solicitud/getAprobacionSolicitud/:id_solicitud', auth, solicitudes.
 router.get('/solicitud/getSolicitudCompra/:id_solicitud', auth, solicitudes.getSolicitudCompra);
 
 //ORDENES COMPRA
+// Cambia esto en tu archivo de rutas:
 router.post('/orden/createOrdenCompra',
     auth,
-    upload.uploadDocumentos.single('cotizacion'),
+    upload.uploadDocumentos.any(),
     ordenes.createOrdenCompra);
 router.get('/orden/getOrdenesCompraByUser', auth, ordenes.getOrdenesCompraByUser);
 router.get('/orden/getOrdenesCompra', auth, ordenes.getOrdenesCompra);
 router.get('/orden/getAprobacionOrden/:id_orden', auth, ordenes.getAprobacionOrden);
+router.get('/orden/getOrdenCompraDetalle/:id_orden', auth, ordenes.getOrdenCompraDetalle);
 
 //ESTRATEGIAS
 router.get('/estrategia/getEstrategias', auth, estrategias.getEstrategias);

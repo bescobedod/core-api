@@ -29,21 +29,29 @@ function buildS3Key({ id_solicitud, originalName, mimeType }) {
   return `${prefix}/${id_solicitud}/${ts}-${rand}${ext}`;
 }
 
-async function uploadBufferToS3({ bucket, key, buffer, contentType }) {
+async function uploadBufferToS3({ bucket, key, buffer, contentType, originalName }) {
   try {
-    // Validar parámetros
     if (!bucket || !key || !buffer) {
       throw new Error(`Parámetros inválidos: bucket=${bucket}, key=${key}, buffer=${buffer ? 'presente' : 'ausente'}`);
     }
 
     console.log(`[S3] Subiendo a s3://${bucket}/${key}, tamaño: ${buffer.length} bytes, ContentType: ${contentType}`);
 
-    const out = await s3Client.send(new PutObjectCommand({
+    const params = {
       Bucket: bucket,
       Key: key,
       Body: buffer,
       ContentType: contentType
-    }));
+    };
+
+    if (originalName) {
+      // Reemplaza la línea problemática por una cabecera más estándar y segura para firmas de S3:
+      // Quitamos las comillas internas complejas y el formato filename*=UTF-8'' que a veces confunde al firmador v4 de AWS
+      const safeName = encodeURIComponent(originalName);
+      params.ContentDisposition = `inline; filename="${safeName}"`;
+    }
+
+    const out = await s3Client.send(new PutObjectCommand(params));
 
     const code = out?.$metadata?.httpStatusCode;
     console.log(`[S3] Respuesta del servidor: HTTP ${code}`);
@@ -81,4 +89,20 @@ function buildOrdenCompraS3Key({ ordenId, originalName, mimeType }) {
   return `${prefix}/${ordenId}/${ts}-${rand}${ext}`;
 }
 
-module.exports = { buildS3Key, uploadBufferToS3, deleteFromS3, getPresignedUrl, buildOrdenCompraS3Key };
+function buildImagenProveedorS3Key({ ordenId, originalName, mimeType }) {
+    const prefix = 'compras/orden/imagen_cotizacion_proveedor';
+    const extByName = (originalName && path.extname(originalName).toLowerCase()) || '';
+    const ext = extByName || (mimeType === 'image/png' ? '.png' : '.jpg');
+    const ts = Date.now();
+    const rand = crypto.randomBytes(8).toString('hex');
+    return `${prefix}/${ordenId}/${ts}-${rand}${ext}`;
+}
+
+module.exports = {
+  buildS3Key,
+  uploadBufferToS3,
+  deleteFromS3,
+  getPresignedUrl,
+  buildOrdenCompraS3Key,
+  buildImagenProveedorS3Key
+};

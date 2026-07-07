@@ -1,4 +1,4 @@
-const CamionInspeccionModel = require('../../models/core/tbl_camion_inspeccion.model');;
+const CamionInspeccionModel = require('../../models/core/tbl_camion_inspeccion.model');
 const UsersModel = require('../../models/pioapp/users.model');
 const ValesCombustibleModel = require('../../models/core/tbl_vales_combustible.model');
 const { Op } = require('sequelize');
@@ -62,16 +62,8 @@ async function getInspecciones(req, res) {
         });
 
         if (inspecciones.length === 0) {
-            return res.json({
-                data: [],
-                pagination: {
-                    total,
-                    totalPages: Math.ceil(total / pageSize),
-                    currentPage: pageNumber,
-                    pageSize,
-                    hasNextPage: false,
-                    hasPrevPage: pageNumber > 1
-                }
+            return res.status(404).json({
+                error: 'No se encuentran inspecciones con los parámetros seleccionados'
             });
         }
 
@@ -93,7 +85,7 @@ async function getInspecciones(req, res) {
         const usuariosMap = new Map();
         usuarios.forEach(u => usuariosMap.set(Number(u.id_users), u));
 
-        // Obtener todas las fechas de inspecciones para buscar vales
+        // 1. Obtener todas las fechas de inspecciones para buscar vales
         const fechasInspecciones = inspecciones.map(i => {
             const fecha = new Date(i.fecha_inspeccion);
             return {
@@ -102,7 +94,7 @@ async function getInspecciones(req, res) {
             };
         });
 
-        // Crear un conjunto de fechas únicas para la búsqueda
+        // Crear un conjunto de fechas únicas para el rango de la consulta masiva
         const fechasUnicas = [];
         const fechasVistas = new Set();
         fechasInspecciones.forEach(f => {
@@ -113,30 +105,46 @@ async function getInspecciones(req, res) {
             }
         });
 
-        // Buscar vales para todas las fechas
+        // 2. Extraer todas las placas de las inspecciones actuales para optimizar la query de vales
+        const placasEnInspecciones = [...new Set(inspecciones.map(i => i.placa_vehiculo))];
+
+        // 3. Buscar vales filtrando por rango de fechas Y por el listado de placas obtenidas
         const valesExistentes = await ValesCombustibleModel.findAll({
             where: {
                 createdAt: {
                     [Op.gte]: Math.min(...fechasUnicas.map(f => f.inicio)),
                     [Op.lte]: Math.max(...fechasUnicas.map(f => f.fin))
+                },
+                placa_vehiculo: {
+                    [Op.in]: placasEnInspecciones // <-- Nueva restricción para no traer vales de otros camiones
                 }
             }
         });
 
-        // Crear un mapa de fechas con vales encontrados
-        const mapValesPorFecha = new Map();
+        // 4. Crear un mapa utilizando una clave compuesta: "FECHA_PLACA"
+        const mapValesPorFechaYPlaca = new Map();
         valesExistentes.forEach(vale => {
             const fecha = vale.createdAt.toISOString().split('T')[0];
-            if (!mapValesPorFecha.has(fecha)) {
-                mapValesPorFecha.set(fecha, []);
+            // Normalizamos la placa a mayúsculas para evitar fallos por minúsculas/mayúsculas
+            const placaNormalizada = vale.placa_vehiculo.trim().toUpperCase(); 
+            
+            const compositeKey = `${fecha}_${placaNormalizada}`;
+            
+            if (!mapValesPorFechaYPlaca.has(compositeKey)) {
+                mapValesPorFechaYPlaca.set(compositeKey, []);
             }
-            mapValesPorFecha.get(fecha).push(vale);
+            mapValesPorFechaYPlaca.get(compositeKey).push(vale);
         });
 
         const data = inspecciones.map(inspeccion => {
             const u = usuariosMap.get(Number(inspeccion.id_usuario));
+            
+            // 5. Verificar usando la clave compuesta correspondiente a esta inspección
             const fechaInspeccion = new Date(inspeccion.fecha_inspeccion).toISOString().split('T')[0];
-            const tieneVale = mapValesPorFecha.has(fechaInspeccion);
+            const placaInspeccionNormalizada = inspeccion.placa_vehiculo.trim().toUpperCase();
+            
+            const compositeKeyBusqueda = `${fechaInspeccion}_${placaInspeccionNormalizada}`;
+            const tieneVale = mapValesPorFechaYPlaca.has(compositeKeyBusqueda);
 
             const nombre_completo = u
                 ? [u.first_name, u.second_name, u.first_last_name, u.second_last_name]

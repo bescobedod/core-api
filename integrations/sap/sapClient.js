@@ -186,37 +186,40 @@ async function sendSolicitudCompra(solicitud, empresa) {
         return await execute();
     } catch (error) {
 
-    console.log("===== SAP ERROR =====");
-    console.log("STATUS:", error.response?.status);
+        console.log("===== SAP ERROR =====");
+        console.log("STATUS:", error.response?.status);
+        console.log(JSON.stringify(error.response?.data, null, 2));
 
-    console.log(
-        JSON.stringify(
-            error.response?.data,
-            null,
-            2
-        )
-    );
+        const sapErrorData = error.response?.data?.error;
+        const code = sapErrorData?.code;
+        const status = error.response?.status;
 
-    const code = error.response?.data?.error?.code;
-    const status = error.response?.status;
+        const isAuthError =
+            code === "301" ||
+            code === "302" ||
+            code === "206" ||
+            status === 401;
 
-    const isAuthError =
-        code === "301" ||
-        code === "302" ||
-        code === "206" ||
-        status === 401;
+        if (isAuthError) {
+            delete sapSessions[empresa.id];
+            const newSession = await loginSAP(empresa);
+            sapSessions[empresa.id] = newSession;
+            return await execute();
+        }
 
-    if (isAuthError) {
-        delete sapSessions[empresa.id];
+        // SAP a veces manda el mensaje como string plano,
+        // a veces como { lang, value } — cubrimos ambos casos.
+        const sapMessage =
+            typeof sapErrorData?.message === 'string'
+                ? sapErrorData.message
+                : sapErrorData?.message?.value;
 
-        const newSession = await loginSAP(empresa);
-        sapSessions[empresa.id] = newSession;
+        const finalError = new Error(sapMessage || error.message);
+        finalError.sapCode = code;
+        finalError.sapStatus = status;
 
-        return await execute();
+        throw finalError;
     }
-
-    throw error;
-}
 }
 
 async function buscarProductosPorNombre(req, res) {

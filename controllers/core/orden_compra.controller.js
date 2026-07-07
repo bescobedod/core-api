@@ -2,17 +2,18 @@ const OrdenCompraModel = require('../../models/core/tbl_orden_compra.model');
 const SolicitudCompraModel = require('../../models/core/tbl_solicitud_compra.model');
 const LineaSolicitudCompraModel = require('../../models/core/tbl_linea_solicitud_compra.model');
 const LineaOrdenCompraModel = require('../../models/core/tbl_linea_orden_compra.model');
+const LineaOrdenProveedorModel = require('../../models/core/tbl_linea_orden_proveedor.model')
 const EmpresaModel = require('../../models/core/tbl_empresa.model');
 const UsersModel = require('../../models/pioapp/users.model');
-const NivelOrdenCompraModel = require('../../models/core/tbl_nivel_matriz_aprobacion_orden_compra.model');
 const AprobacionOrdenCompraModel = require('../../models/core/tbl_aprobacion_orden_compra.model');
 const NivelMatrizAprobacionOrdenModel = require('../../models/core/tbl_nivel_matriz_aprobacion_orden_compra.model');
 const EstrategiaAdquisicionModel = require('../../models/core/tbl_estrategia_adquisicion.model');
 const MatrizAprobacionOrdenModel = require('../../models/core/tbl_matriz_aprobacion_orden_compra.model');
 const { sequelize } = require('../../configuration/db');
-const { buildOrdenCompraS3Key, uploadBufferToS3 } = require('../../integrations/aws/s3');
+const { buildOrdenCompraS3Key, uploadBufferToS3, buildImagenProveedorS3Key } = require('../../integrations/aws/s3');
 const { Op } = require('sequelize');
 const { enviarNotificacionPush } = require('../../controllers/core/solicitud_compra.controller');
+const path = require('path');
 
 const S3_BUCKET = process.env.AWS_BUCKET_NAME;
 const REGION = process.env.AWS_BUCKET_REGION;
@@ -37,13 +38,48 @@ SolicitudCompraModel.hasMany(OrdenCompraModel, {
     as: 'ordenes_compra'
 });
 
+OrdenCompraModel.hasMany(LineaOrdenCompraModel, {
+    foreignKey: 'orden_id',
+    as: 'lineas'
+});
+
+LineaOrdenCompraModel.belongsTo(OrdenCompraModel, {
+    foreignKey: 'orden_id',
+    as: 'orden'
+});
+
+LineaOrdenCompraModel.hasMany(LineaOrdenProveedorModel, {
+    foreignKey: 'linea_orden_id',
+    as: 'proveedores'
+});
+
+LineaOrdenProveedorModel.belongsTo(LineaOrdenCompraModel, {
+    foreignKey: 'linea_orden_id',
+    as: 'lineaOrden'
+});
+
 async function createOrdenCompra(req, res) {
     const t = await sequelize.transaction();
 
+    // Creamos un arreglo temporal para guardar las operaciones de S3 que haremos SOLO si el commit es exitoso
+    const pendientesS3 = [];
+
     try {
         const header = JSON.parse(req.body.header);
-        const items = JSON.parse(req.body.items);
+        const items = JSON.parse(req.body.items); 
         const { solicitud_id, notas, moneda = 'GTQ' } = header;
+
+        console.log('Archivos recibidos:', req.files?.map(f => ({
+          fieldname: f.fieldname,
+          originalname: f.originalname,
+          mimetype: f.mimetype,
+          size: f.size
+        })));
+
+        console.log('Items recibidos:', JSON.stringify(items.map(i => ({
+  linea_solicitud_id: i.linea_solicitud_id,
+  proveedores: i.proveedores?.map(p => p.proveedor_id)
+})), null, 2));
 
         if (!solicitud_id) {
             await t.rollback();
@@ -84,53 +120,65 @@ async function createOrdenCompra(req, res) {
             });
         }
 
-        const monto_total = items.reduce((acc, item) => {
-            const cantidad = Number(item.cantidad)       || 0;
-            const precio_unitario = Number(item.precio_unitario) || 0;
-            return acc + cantidad * precio_unitario;
-        }, 0);
+        let monto_total = 0;
+        const itemsProcesados = items.map(item => {
+            const proveedores = item.proveedores || [];
+            let seleccionado = proveedores.find(p => p.es_seleccionado === true || p.es_seleccionado === 'true');
+            
+            if (!seleccionado && proveedores.length > 0) {
+                seleccionado = proveedores[0];
+                seleccionado.es_seleccionado = true;
+            }
 
+            const precioUnitarioSeleccionado = seleccionado ? Number(seleccionado.precio_unitario) : 0;
+            const cantidad = Number(item.cantidad) || 0;
+            const totalLinea = cantidad * precioUnitarioSeleccionado;
+
+            monto_total += totalLinea;
+
+            return {
+                ...item,
+                precio_unitario: precioUnitarioSeleccionado,
+                total_linea: totalLinea,
+                proveedorSeleccionado: seleccionado
+            };
+        });
+
+        // --- PRE-PREPARAR ARCHIVO DE COTIZACIÓN PRINCIPAL ---
         let cotizacion_s3_key = null;
         let cotizacion_nombre = null;
         let cotizacion_url = null;
 
-        const cotizacionFile = req.file;
+        const cotizacionFile = req.files?.find(f => f.fieldname === 'cotizacionFile');
 
         if (cotizacionFile) {
             const ext = cotizacionFile.originalname.split('.').pop().toLowerCase();
-
             if (!['xlsx', 'xls'].includes(ext)) {
                 await t.rollback();
                 return res.status(400).json({ error: 'Solo se permiten archivos Excel (.xlsx o .xls)' });
             }
 
             cotizacion_s3_key = buildOrdenCompraS3Key({
-                id_solicitud: solicitud_id,
+                ordenId: solicitud_id, 
                 originalName: cotizacionFile.originalname,
                 mimeType: cotizacionFile.mimetype
             });
 
-            await uploadBufferToS3({
-                bucket: S3_BUCKET,
+            cotizacion_url = `https://${process.env.AWS_BUCKET_NAME}.s3.${process.env.AWS_BUCKET_REGION}.amazonaws.com/${cotizacion_s3_key}`;
+            cotizacion_nombre = cotizacionFile.originalname;
+
+            // En lugar de subirlo ya, guardamos las instrucciones en nuestra lista de pendientes
+            pendientesS3.push({
+                bucket: process.env.AWS_BUCKET_NAME,
                 key: cotizacion_s3_key,
                 buffer: cotizacionFile.buffer,
-                contentType: cotizacionFile.mimetype
+                contentType: getXlsxContentType(cotizacionFile.originalname),
+                originalName: cotizacionFile.originalname
             });
-
-            cotizacion_url = `https://${S3_BUCKET}.s3.${REGION}.amazonaws.com/${cotizacion_s3_key}`;
-            cotizacion_nombre = cotizacionFile.originalname;
         }
 
-        const estrategia = await EstrategiaAdquisicionModel.findByPk(
-            solicitud.estrategia_adquisicion_id,
-            {
-                transaction: t
-            }
-        );
-
-        if (!estrategia) {
-            throw new Error('No se encontró la estrategia de adquisición asociada a la solicitud');
-        }
+        const estrategia = await EstrategiaAdquisicionModel.findByPk(solicitud.estrategia_adquisicion_id, { transaction: t });
+        if (!estrategia) throw new Error('No se encontró la estrategia de adquisición asociada a la solicitud');
 
         const matriz = await MatrizAprobacionOrdenModel.findOne({
             where: {
@@ -139,20 +187,22 @@ async function createOrdenCompra(req, res) {
                 monto_maximo: { [Op.gte]: monto_total },
                 moneda,
                 esta_activo: true
-            }
+            },
+            transaction: t
         });
 
         if (!matriz) {
-            throw new Error(
-                `No existe una matriz de aprobación activa para el monto ${monto_total} ${moneda}`
-            );
+            throw new Error(`No existe una matriz de aprobación activa para el monto ${monto_total} ${moneda}`);
         }
 
+        const primerProvSeleccionado = itemsProcesados[0]?.proveedorSeleccionado;
+
+        // 1. Crear Orden de Compra (Cabecera)
         const orden = await OrdenCompraModel.create({
             numero_orden: '',
             solicitud_id,
-            proveedor_id: items[0].proveedor_id,
-            proveedor: items[0].proveedor,
+            proveedor_id: primerProvSeleccionado ? primerProvSeleccionado.proveedor_id : '',
+            proveedor: primerProvSeleccionado ? primerProvSeleccionado.nombre_proveedor : '',
             fecha_orden: new Date(),
             estado: 'PENDIENTE',
             monto_total: parseFloat(monto_total.toFixed(2)),
@@ -170,22 +220,74 @@ async function createOrdenCompra(req, res) {
             fecha_requerida: solicitud.fecha_requerida
         }, { transaction: t });
 
-        await LineaOrdenCompraModel.bulkCreate(
-            items.map((item, index) => ({
+        // 2. Iterar e Insertar las Líneas de la Orden
+        const lineasDeProveedoresABulkear = [];
+
+        for (let index = 0; index < itemsProcesados.length; index++) {
+            const item = itemsProcesados[index];
+            console.log(item)
+            const nuevaLinea = await LineaOrdenCompraModel.create({
                 orden_id: orden.id,
                 linea_solicitud_id: item.linea_solicitud_id,
                 numero_linea: index + 1,
                 codigo_articulo: item.codigo_articulo,
                 nombre_articulo: item.nombre_articulo,
-                descripcion: item.nombre_articulo,
+                descripcion: item.descripcion,
                 cantidad: item.cantidad,
-                precio_unitario: item.precio_unitario,
-                total_linea: Number(item.cantidad) * Number(item.precio_unitario),
+                precio_unitario: item.precio_unitario, 
+                total_linea: item.total_linea,        
                 centro_costo: item.centro_costo,
-                cuenta_contable: item.cuenta_contable
-            })),
-            { transaction: t }
-        );
+                cuenta_contable: item.cuenta_contable,
+                fecha_creacion: new Date()
+            }, { transaction: t });
+
+            if (item.proveedores && Array.isArray(item.proveedores)) {
+                for (const prov of item.proveedores) {
+                    let imagen_s3_key = prov.imagen_s3_key || null;
+                    let imagen_url = prov.imagen_url || null;
+                    let imagen_nombre = prov.imagen_nombre || null;
+
+                    const provFile = req.files?.find(f => f.fieldname === `img_prov_${index}_${prov.proveedor_id}`);
+                    
+                    if (provFile) {
+                        imagen_s3_key = buildImagenProveedorS3Key({
+                            ordenId: orden.id,
+                            originalName: provFile.originalname,
+                            mimeType: provFile.mimetype
+                        });
+
+                        imagen_url = `https://${process.env.AWS_BUCKET_NAME}.s3.${process.env.AWS_BUCKET_REGION}.amazonaws.com/${imagen_s3_key}`;
+                        imagen_nombre = provFile.originalname;
+
+                        // En lugar de subirlo ya, guardamos las instrucciones en nuestra lista de pendientes
+                        pendientesS3.push({
+                            bucket: process.env.AWS_BUCKET_NAME,
+                            key: imagen_s3_key,
+                            buffer: provFile.buffer,
+                            contentType: provFile.mimetype,
+                            originalName: provFile.originalname
+                        });
+                    }
+
+                    lineasDeProveedoresABulkear.push({
+                        linea_orden_id: nuevaLinea.id, 
+                        proveedor_id: prov.proveedor_id,
+                        nombre_proveedor: prov.nombre_proveedor,
+                        precio_unitario: Number(prov.precio_unitario) || 0,
+                        imagen_s3_key,
+                        imagen_nombre,
+                        imagen_url,
+                        descripcion: prov.descripcion || null,
+                        es_seleccionado: prov.es_seleccionado === true || prov.es_seleccionado === 'true',
+                        fecha_creacion: new Date()
+                    });
+                }
+            }
+        }
+
+        if (lineasDeProveedoresABulkear.length > 0) {
+            await LineaOrdenProveedorModel.bulkCreate(lineasDeProveedoresABulkear, { transaction: t });
+        }
 
         const niveles = await NivelMatrizAprobacionOrdenModel.findAll({
             where: { matriz_id: matriz.id },
@@ -193,9 +295,7 @@ async function createOrdenCompra(req, res) {
         });
 
         if (!niveles.length) {
-            throw new Error(
-                `La matriz ${matriz.nombre} no tiene niveles configurados`
-            );
+            throw new Error(`La matriz ${matriz.nombre} no tiene niveles configurados`);
         }
 
         await AprobacionOrdenCompraModel.bulkCreate(
@@ -209,41 +309,30 @@ async function createOrdenCompra(req, res) {
             { transaction: t }
         );
 
-        const usuario = await UsersModel.findByPk(solicitud.solicitado_por, {
-            attributes: ['id_users', 'first_name', 'first_last_name'],
-        });
+        await solicitud.update({ estado: 'PROCESO_ORDEN' }, { transaction: t });
 
-        await solicitud.update(
-            {
-                estado: 'PROCESO_ORDEN'
-            },
-            {
-                transaction: t
-            }
-        );
-
+        // --- 3. SI TODO SALIÓ BIEN HASTA AQUÍ, HACEMOS COMMIT ---
         await t.commit();
 
+        // --- 4. AHORA SÍ SUBIMOS A S3 (La base de datos ya está segura) ---
+        if (pendientesS3.length > 0) {
+            console.log(`[S3] Procesando ${pendientesS3.length} archivos pendientes de subir tras commit exitoso.`);
+            // Usamos Promise.all para subirlos en paralelo de manera eficiente
+            await Promise.all(pendientesS3.map(archivo => uploadBufferToS3(archivo)));
+        }
+
+        // Envío de notificaciones Push (Asíncrono)
         try {
-            // Como 'niveles' viene ordenado por ['nivel', 'ASC'], el índice 0 es el más bajo.
             const primerNivel = niveles[0]; 
             const idPrimerAprobador = primerNivel.usuario_aprobador_id;
-
-            const tituloNotificacion = 'Nueva Orden de Compra Pendiente';
-            const mensajeNotificacion = `Tienes una nueva orden de compra por aprobar para la requisición N° ${solicitud.numero_requisicion || ''}`;
-
-            // Llamamos a tu función pasando los datos requeridos
             await enviarNotificacionPush(
                 idPrimerAprobador,
-                tituloNotificacion,
-                mensajeNotificacion,
-                solicitud_id, // id_solicitud
-                solicitud.numero_requisicion // numero_requisicion
+                'Nueva Orden de Compra Pendiente',
+                `Tienes una nueva orden de compra por aprobar para la requisición N° ${solicitud.numero_requisicion || ''}`,
+                solicitud_id,
+                solicitud.numero_requisicion
             );
-
-            console.log(`Notificación Push enviada con éxito al aprobador ID: ${idPrimerAprobador}`);
         } catch (errorPush) {
-            // Un error en la notificación externa no debe tumbar la respuesta HTTP exitosa
             console.error('Error al procesar el envío de la notificación push:', errorPush.message);
         }
 
@@ -256,25 +345,14 @@ async function createOrdenCompra(req, res) {
                 monto_total: orden.monto_total,
                 moneda: orden.moneda,
                 fecha_orden: orden.fecha_orden,
-                cotizacion_url,
-                cotizacion_nombre,
-                solicitud: {
-                    id: solicitud.id,
-                    numero_requisicion: solicitud.numero_requisicion,
-                    justificacion: solicitud.justificacion,
-                    solicitado_por: usuario
-                        ? `${usuario.first_name} ${usuario.first_last_name}`
-                        : null,
-                    empresa: solicitud.empresa
-                        ? { id: solicitud.empresa.id, nombre: solicitud.empresa.nombre }
-                        : null
-                }
+                cotizacion_url
             }
         });
 
     } catch (err) {
-        if (t) await t.rollback();
-        console.error('Error al crear orden de compra:', err);
+        // Si ocurre cualquier error de validación o base de datos ANTES del commit, se ejecuta esto:
+        if (t && !t.finished) await t.rollback();
+        console.error('Error al crear orden de compra:', err.stack);
         return res.status(500).json({ error: err.message });
     }
 }
@@ -501,6 +579,10 @@ async function getOrdenesCompra(req, res) {
             where
         });
 
+        if(total === 0) {
+            return res.status(404).json({ error: 'No se encontraron órdenes de compra con los parámetros seleccionados' })
+        }
+
         const ordenes = await OrdenCompraModel.findAll({
             where,
             include: [
@@ -676,9 +758,89 @@ async function getAprobacionOrden(req, res) {
     }
 }
 
+async function getOrdenCompraDetalle(req, res) {
+    const { id_orden } = req.params;
+
+    try {
+        const orden = await OrdenCompraModel.findByPk(id_orden, {
+            include: [
+                {
+                    model: EmpresaModel,
+                    as: 'empresa',
+                    attributes: ['id', 'nombre']
+                },
+                {
+                    model: SolicitudCompraModel,
+                    as: 'solicitud',
+                    attributes: ['id', 'numero_requisicion']
+                },
+                {
+                    model: LineaOrdenCompraModel,
+                    as: 'lineas',
+                    include: [
+                        {
+                            model: LineaOrdenProveedorModel,
+                            as: 'proveedores'
+                        }
+                    ]
+                }
+            ],
+            order: [
+                [{ model: LineaOrdenCompraModel, as: 'lineas' }, 'numero_linea', 'ASC']
+            ]
+        });
+
+        if (!orden) {
+            return res.status(404).json({ error: 'No se encontró la orden de compra' });
+        }
+
+        const usuario = await UsersModel.findByPk(orden.solicitado_por, {
+            attributes: ['id_users', 'first_name', 'first_last_name']
+        });
+
+        const ordenJson = orden.toJSON();
+
+        const response = {
+            ...ordenJson,
+            solicitado_por_id: ordenJson.solicitado_por,
+            solicitado_por: usuario
+                ? `${usuario.first_name} ${usuario.first_last_name}`
+                : null,
+            empresa: ordenJson.empresa
+                ? { id: ordenJson.empresa.id, nombre: ordenJson.empresa.nombre }
+                : null,
+            solicitud: ordenJson.solicitud
+                ? { id: ordenJson.solicitud.id, numero_requisicion: ordenJson.solicitud.numero_requisicion }
+                : null,
+            items: (ordenJson.lineas || []).map(linea => ({
+                ...linea,
+                proveedores: (linea.proveedores || []).sort(
+                    (a, b) => (b.es_seleccionado === true) - (a.es_seleccionado === true)
+                )
+            }))
+        };
+
+        delete response.lineas;
+
+        return res.json(response);
+
+    } catch (err) {
+        console.error('Error al obtener el detalle de la orden de compra', err);
+        return res.status(500).json({ error: err.message });
+    }
+}
+
+function getXlsxContentType(originalName) {
+  const ext = path.extname(originalName).toLowerCase();
+  if (ext === '.xlsx') return 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+  if (ext === '.xls') return 'application/vnd.ms-excel';
+  return 'application/octet-stream';
+}
+
 module.exports = {
     createOrdenCompra,
     getOrdenesCompraByUser,
     getOrdenesCompra,
-    getAprobacionOrden
+    getAprobacionOrden,
+    getOrdenCompraDetalle
 };

@@ -14,8 +14,8 @@ LineaOrdenCompraModel.init({
     cantidad: { type: DataTypes.DECIMAL(15, 3), allowNull: false },
     precio_unitario: { type: DataTypes.DECIMAL(15, 2), allowNull: false },
     total_linea: { type: DataTypes.DECIMAL(15, 2), allowNull: false },
-    centro_costo: { type: DataTypes.STRING(100), allowNull: false },
-    cuenta_contable: { type: DataTypes.STRING(100), allowNull: false },
+    centro_costo: { type: DataTypes.STRING(100), allowNull: true },
+    cuenta_contable: { type: DataTypes.STRING(100), allowNull: true },
     fecha_creacion: { type: DataTypes.DATE, allowNull: false }
 }, {
     sequelize: sequelize,
