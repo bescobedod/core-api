@@ -19,6 +19,18 @@ const camiones = require('../controllers/core/camion.controller.js');
 const vales = require('../controllers/core/vales_combustible.controller.js');
 const auth = require('../middlewares/auth.js');
 const upload = require('../middlewares/upload.js');
+const rateLimit = require('express-rate-limit');
+
+// Limita cuántas veces se puede llamar el procesamiento de archivo de pedidos
+// POS en una ventana de tiempo, ya que es una operación costosa (I/O + varias
+// consultas a PDV/Core por cada pedido del archivo).
+const limitePedidosPos = rateLimit({
+    windowMs: 5 * 60 * 1000, // 5 minutos
+    max: 30,                 // 30 archivos por IP en esa ventana
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Demasiadas solicitudes de pedidos POS, intenta más tarde', success: false }
+});
 
 //TIENDAS
 router.get('/tiendas/getAllTiendas', tiendas.getAllTiendas);
@@ -39,10 +51,18 @@ router.get('/menus/getPermiso', auth, menus.getPermiso);
 router.get('/pedido/getAllTipoPedidoEnvio', tiposPedidoEnvio.getAllTipoPedidoEnvio);
 
 //PEDIDOS
-router.get('/pedido/getAllPedidosEncabezado', pedidos.getAllPedidosEncabezado);
-router.get('/pedido/getPedidoDetalleByEncabezado/:id_p', pedidos.getPedidoDetalleByEncabezado);
-router.get('/pedido/validarYObtenerPedido', pedidos.validarYObtenerPedido)
-router.post('/pedido/createPedido', pedidos.createPedido)
+router.get('/pedido/getAllPedidosEncabezado', auth, pedidos.getAllPedidosEncabezado);
+router.get('/pedido/getPedidoDetalleByEncabezado/:id_p', auth, pedidos.getPedidoDetalleByEncabezado);
+router.get('/pedido/validarYObtenerPedido', auth, pedidos.validarYObtenerPedido)
+router.post('/pedido/createPedido', auth, pedidos.createPedido)
+
+//PEDIDOS POS (Oracle Simphony -> SFTP -> middleware -> Core)
+// TODO: evaluar si esta ruta debe llevar 'auth' (login de usuario) o un
+// middleware de autenticación de servicio (API key) distinto, ya que quien
+// llama aquí es el middleware, no un usuario logueado desde el portal.
+// Acepta uno o más archivos .txt en la misma petición (form-data, campo repetible).
+router.post('/pedido/subirArchivoPedidoPos', limitePedidosPos, upload.uploadPedidosPos.any(), pedidos.subirYProcesarArchivosPedidoPos)
+router.get('/pedido/getPedidosPos', auth, pedidos.getPedidosPos)
 
 //LOGIN
 router.post('/login', login.login);

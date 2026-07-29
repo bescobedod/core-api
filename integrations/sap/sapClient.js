@@ -2,6 +2,8 @@ const axios = require('axios');
 const https = require('https');
 const agent = new https.Agent({ rejectUnauthorized: false });
 const EmpresaModel = require('../../models/core/tbl_empresa.model');
+const initvwTiendasModulo = require('../../models/pdv/views/vwTiendasModulo.view');
+const sequelizeInit = require('../../configuration/db');
 
 const sapSessions = {
     global: null,
@@ -25,6 +27,45 @@ async function obtenerEmpresaSAP(empresaId) {
     });
 
     if (!empresa) throw new Error("Empresa no encontrada o inactiva");
+
+    return {
+        id: empresa.id,
+        CompanyDB: empresa.sap_database,
+        UserName: empresa.sap_user,
+        Password: empresa.sap_password
+    };
+}
+
+async function obtenerEmpresaSAPPorTienda(id_tienda) {
+    if (!id_tienda) {
+        throw new Error("Debe enviar id_tienda");
+    }
+
+    const sequelizePDV = await sequelizeInit.sequelizeInit('PDV');
+    const TiendaModel = initvwTiendasModulo(sequelizePDV);
+
+    const tienda = await TiendaModel.findOne({
+        where: {
+            id_tienda
+        }
+    });
+
+    if (!tienda) {
+        throw new Error(`No existe la tienda ${id_tienda}`);
+    }
+
+    const empresa = await EmpresaModel.findOne({
+        where: {
+            id_pdv: tienda.codigo_empresa,
+            esta_activo: true
+        }
+    });
+
+    if (!empresa) {
+        throw new Error(
+            `No existe una empresa activa para el código PDV ${tienda.codigo_empresa}`
+        );
+    }
 
     return {
         id: empresa.id,
@@ -326,6 +367,78 @@ async function getProveedores(req, res) {
     }
 }
 
+async function obtenerProductosData(id_tienda) {
+    const empresa = await obtenerEmpresaSAPPorTienda(id_tienda);
+
+    const executeRequest = async () => {
+        let session = sapSessions.byEmpresa[empresa.id];
+
+        if (!session || !session.sessionId) {
+            session = await loginSAP(empresa);
+            sapSessions.byEmpresa[empresa.id] = session;
+        }
+
+        const headers = {
+            Cookie: `B1SESSION=${session.sessionId}; ROUTEID=${session.routeId}`,
+            Prefer: 'odata.maxpagesize=5000'
+        };
+
+        const [catRes, prodRes] = await Promise.all([
+            axios.get(
+                `${process.env.SAP_URL}/UserFieldsMD?$filter=Name eq 'Categoria' and TableName eq 'OITM'`,
+                { headers, httpsAgent: agent }
+            ),
+            axios.get(
+                `${process.env.SAP_URL}/Items?$select=ItemCode,ItemName,InventoryUOM,QuantityOnStock,SalesUnit,U_Categoria&$filter=U_Categoria ne null&$top=5000`,
+                { headers, httpsAgent: agent }
+            )
+        ]);
+
+        const listaCategorias = catRes.data.value[0]?.ValidValuesMD || [];
+        const todosLosProductos = prodRes.data.value || [];
+
+        return listaCategorias
+            .filter(cat => cat.Value && cat.Value !== "-")
+            .map(cat => {
+                const categoriaId = String(cat.Value).trim();
+
+                const productosDeEstaCat = todosLosProductos
+                    .filter(item => String(item.U_Categoria).trim() === categoriaId)
+                    .map(item => ({
+                        id: item.ItemCode,
+                        name: item.ItemName,
+                        unit: item.InventoryUOM || "UND",
+                        currentStock: item.QuantityOnStock,
+                        salesUnit: item.SalesUnit
+                    }));
+
+                return {
+                    id: categoriaId,
+                    name: cat.Description,
+                    products: productosDeEstaCat
+                };
+            })
+            .filter(c => c.products.length > 0);
+    };
+
+    try {
+        return await executeRequest();
+    } catch (error) {
+        const isAuthError =
+            error.response?.status === 401 ||
+            error.response?.data?.error?.code === "301" ||
+            error.response?.data?.error?.code === "302" ||
+            error.response?.data?.error?.code === "206";
+
+        if (isAuthError) {
+            delete sapSessions.byEmpresa[empresa.id];
+            return await executeRequest();
+        }
+
+        throw error;
+    }
+}
+
 module.exports = {
     loginSAP,
     loginSAPGlobal,
@@ -333,5 +446,6 @@ module.exports = {
     verificarArticulosSAP,
     sendSolicitudCompra,
     buscarProductosPorNombre,
-    getProveedores
+    getProveedores,
+    obtenerProductosData
 };

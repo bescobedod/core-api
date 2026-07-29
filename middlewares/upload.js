@@ -14,6 +14,10 @@ const ALLOWED_MIME_DOCS = new Set([
   'application/octet-stream'
 ]);
 
+const ALLOWED_MIME_TXT = new Set([
+  'text/plain'
+]);
+
 const storage = multer.memoryStorage();
 
 const fileFilter = (req, file, cb) => {
@@ -34,7 +38,18 @@ const fileFilterDocs = (req, file, cb) => {
   cb(null, true);
 };
 
+const fileFilterTxt = (req, file, cb) => {
+  const ext = file.originalname.split('.').pop().toLowerCase();
+  const esTxt = ALLOWED_MIME_TXT.has(file.mimetype) || ext === 'txt';
+
+  if (!esTxt) {
+    return cb(new Error('Solo se permiten archivos .txt'), false);
+  }
+  cb(null, true);
+};
+
 const upload = multer({ storage, limits: { fileSize: MAX_FILE_SIZE }, fileFilter });
 const uploadDocumentos = multer({ storage, limits: { fileSize: MAX_FILE_SIZE }, fileFilterDocs });
+const uploadPedidosPos = multer({ storage, limits: { fileSize: MAX_FILE_SIZE }, fileFilter: fileFilterTxt });
 
-module.exports = { upload, uploadDocumentos };
+module.exports = { upload, uploadDocumentos, uploadPedidosPos };
