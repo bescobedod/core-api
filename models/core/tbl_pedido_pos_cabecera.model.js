@@ -9,11 +9,13 @@ PedidoPosCabeceraModel.init({
     codigo_tienda: { type: DataTypes.STRING(20), allowNull: true },
     numero_pedido: { type: DataTypes.STRING(30), allowNull: false },
     fecha_pedido: { type: DataTypes.DATEONLY, allowNull: false },
+    fecha_requerida: { type: DataTypes.DATEONLY, allowNull: true }, // tomada de la primera línea del archivo; se asume que todas las líneas comparten la misma fecha
     hora_pedido: { type: DataTypes.TIME, allowNull: false },
     nombre_tienda: { type: DataTypes.STRING(150), allowNull: true },
     codigo_bodega: { type: DataTypes.STRING(20), allowNull: true }, // resuelto en SAP, desde tTienda.whsCode
     tipo_pedido: { type: DataTypes.STRING(20), allowNull: true }, // POLLO o INSUMOS, derivado del Vendor ID del archivo
-    codigo_bodega_simphony: { type: DataTypes.STRING(20), allowNull: true }, // crudo, viene de la posición 2 del archivo ("Vendor ID")
+    codigo_bodega_simphony: { type: DataTypes.STRING(20), allowNull: true }, // Vendor ID del archivo (origen/bodega en Simphony)
+    nombre_bodega_simphony: { type: DataTypes.STRING(150), allowNull: true }, // Vendor Name del archivo
     nombre_bodega: { type: DataTypes.STRING(150), allowNull: true },
     ruta_id: { type: DataTypes.UUID, allowNull: true },
     nombre_ruta: { type: DataTypes.STRING(100), allowNull: true },

@@ -1,4 +1,5 @@
 const CamionInspeccionModel = require('../../models/core/tbl_camion_inspeccion.model');
+const CamionModel = require('../../models/core/tbl_camion.model');
 const UsersModel = require('../../models/pioapp/users.model');
 const ValesCombustibleModel = require('../../models/core/tbl_vales_combustible.model');
 const { Op } = require('sequelize');
@@ -184,6 +185,22 @@ async function getInspecciones(req, res) {
     }
 }
 
+// ------------------------------------------------------------
+// Lista todos los camiones (para dropdowns de asignación, etc.)
+// ------------------------------------------------------------
+async function getAllCamiones(req, res) {
+    try {
+        const camiones = await CamionModel.findAll({
+            order: [['placa', 'ASC']]
+        });
+
+        return res.json(camiones);
+    } catch (err) {
+        return res.status(500).json({ error: err.message });
+    }
+}
+
 module.exports = {
-    getInspecciones
+    getInspecciones,
+    getAllCamiones
 };

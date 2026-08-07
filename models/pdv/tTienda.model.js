@@ -11,7 +11,9 @@ function initTiendaModel(sequelizeInstance) {
         direccion: { type: DataTypes.STRING(1024), allowNull: false },
         altitudGps: { type: DataTypes.STRING(100), allowNull: true },
         latitudGps: { type: DataTypes.STRING(100), allowNull: true },
-        clienteSAP: { type: DataTypes.STRING(8), allowNull: false }
+        clienteSAP: { type: DataTypes.STRING(8), allowNull: false },
+        whsCode: { type: DataTypes.STRING(32), allowNull: true },
+        StoreNumberSimphony: { type: DataTypes.STRING(50), allowNull: true }
     }, {
         sequelize: sequelizeInstance,
         tableName: 'tTienda',

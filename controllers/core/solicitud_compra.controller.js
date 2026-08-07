@@ -14,6 +14,7 @@ const { sequelize } = require('../../configuration/db');
 const { buildS3Key, uploadBufferToS3 } = require('../../integrations/aws/s3');
 const sap = require('../../integrations/sap/sapClient');
 const axios = require('axios');
+const https = require('https');
 
 const S3_BUCKET = process.env.AWS_BUCKET_NAME;
 const REGION = process.env.AWS_BUCKET_REGION;
@@ -49,25 +50,39 @@ EmpresaModel.hasMany(SolicitudCompraModel, {
 });
 
 async function enviarNotificacionPush(idUsuario, titulo, mensaje, id_solicitud, numero_requisicion) {
+    if (!idUsuario || !titulo || !mensaje) {
+        console.error('enviarNotificacionPush: parámetros incompletos', { idUsuario, titulo, mensaje });
+        return { success: false, error: 'Parámetros incompletos' };
+    }
+
     try {
-        await axios.post('https://services.sistemaspinulito.com/coreapi/notificaciones/send', {
+        await axios.post(process.env.NOTIFICACIONES_API_URL, {
             id_usuario: [idUsuario],
             title: titulo,
             body: mensaje,
             id_asunto_notificacion: 3,
             payload: {
-              id_solicitud,
-              numero_requisicion,
-              tipo: 'solicitud_compra'
+                id_solicitud,
+                numero_requisicion,
+                tipo: 'solicitud_compra'
             }
         }, {
             headers: {
                 'Content-Type': 'application/json',
                 'x-api-key': process.env.API_KEY_NOTIFICACIONES
-            }
+            },
+            httpsAgent: new https.Agent({ rejectUnauthorized: false }),
+            timeout: 5000
         });
+        console.log('Éxito')
+        return { success: true };
     } catch (error) {
-        console.error('Error enviando notificación:', error.message);
+        console.error('Error enviando notificación:', {
+            message: error.message,
+            status: error.response?.status,
+            data: error.response?.data
+        });
+        return { success: false, error: error.message };
     }
 }
 

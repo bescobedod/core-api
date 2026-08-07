@@ -13,12 +13,20 @@ const { sequelize } = require('../../configuration/db');
 const AreaModel = require('../../models/pioapp/tbl_area.model');
 const DepartamentoModel = require('../../models/pioapp/tbl_departamento.model');
 
+const ROLES_CON_ACCESO_TOTAL = [1];
+
 async function getEstrategias(req, res) {
     try {
+        const esAdmin = ROLES_CON_ACCESO_TOTAL.includes(Number(req.user.rol));
+        const departamentoId = esAdmin && req.query.departamento_id
+            ? req.query.departamento_id
+            : req.user.id_departamento;
+
         const estrategias = await EstrategiaAdquisicionModel.findAll({
             where: {
-                departamento_id: req.user.id_departamento
-            }
+                departamento_id: departamentoId
+            },
+            order: [['codigo', 'ASC']]
         });
 
         if(estrategias.length === 0) {
@@ -392,10 +400,15 @@ async function updateEstrategiaAdquisicion(req, res) {
 }
 
 async function createEstrategiaByArea(req, res) {
-    const { estrategia } = req.body;
+    const { estrategia, departamento_id } = req.body;
     const { area } = req.params;
 
     try {
+        const esAdmin = ROLES_CON_ACCESO_TOTAL.includes(Number(req.user.rol));
+        const departamentoId = esAdmin && departamento_id
+            ? departamento_id
+            : req.user.id_departamento;
+
         const estrategiaExistente = await EstrategiaAdquisicionModel.findOne({
             where: {
                 area_id: area,
@@ -407,14 +420,14 @@ async function createEstrategiaByArea(req, res) {
             return res.status(401).json({ error: "Tienes una estrategia de adquisición activa para esta área, por favor inactivala y vuelvelo a intentar" });
         }
 
-        const departamento = await DepartamentoModel.findByPk(req.user.id_departamento);
+        const departamento = await DepartamentoModel.findByPk(departamentoId);
 
         if(!departamento) return res.status(404).json({ error: "Departamento no encontrado o no existe" });
 
-        const nuevaEstrategia = EstrategiaAdquisicionModel.create({
+        const nuevaEstrategia = await EstrategiaAdquisicionModel.create({
             ...estrategia,
             area_id: area,
-            departamento_id: req.user.id_departamento,
+            departamento_id: departamentoId,
             codigo_departamento: departamento.codigo
         });
 

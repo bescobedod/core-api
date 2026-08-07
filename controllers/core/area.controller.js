@@ -4,11 +4,18 @@ const { Op } = require('sequelize');
 const { sequelizePioApp } = require('../../configuration/db');
 const VwUsuariosModel = require('../../models/pioapp/views/vw_usuarios');
 
+const ROLES_CON_ACCESO_TOTAL = [1];
+
 async function getAreasByDepartamento(req, res) {
     try {
+        const esAdmin = ROLES_CON_ACCESO_TOTAL.includes(Number(req.user.rol));
+        const departamentoId = esAdmin && req.query.departamento_id
+            ? req.query.departamento_id
+            : req.user.id_departamento;
+
         const areas = await AreaModel.findAll({
             where: {
-                departamento_id: req.user.id_departamento,
+                departamento_id: departamentoId,
                 activo: true
             }
         });

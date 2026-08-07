@@ -16,6 +16,8 @@ const areas = require('../controllers/core/area.controller.js');
 const departamentos = require('../controllers/core/departamento.controller.js');
 const empresas = require('../controllers/core/empresa.controller.js');
 const camiones = require('../controllers/core/camion.controller.js');
+const rutasPollo = require('../controllers/core/ruta_pollo.controller.js');
+const rutasInsumos = require('../controllers/core/ruta_insumo.controller.js');
 const vales = require('../controllers/core/vales_combustible.controller.js');
 const auth = require('../middlewares/auth.js');
 const upload = require('../middlewares/upload.js');
@@ -63,6 +65,13 @@ router.post('/pedido/createPedido', auth, pedidos.createPedido)
 // Acepta uno o más archivos .txt en la misma petición (form-data, campo repetible).
 router.post('/pedido/subirArchivoPedidoPos', limitePedidosPos, upload.uploadPedidosPos.any(), pedidos.subirYProcesarArchivosPedidoPos)
 router.get('/pedido/getPedidosPos', auth, pedidos.getPedidosPos)
+router.get('/pedido/getComparativoStockPollo', auth, pedidos.getComparativoStockPollo)
+router.get('/pedido/getComparativoStockInsumos', auth, pedidos.getComparativoStockInsumos)
+router.post('/pedido/guardarAsignacionCantidades', auth, pedidos.guardarAsignacionCantidades)
+router.post('/pedido/enviarTransferenciaPollo', auth, pedidos.enviarTransferenciaPollo)
+router.post('/pedido/enviarTransferenciaInsumos', auth, pedidos.enviarTransferenciaInsumos)
+router.get('/pedido/getAsignacionesTransporte', auth, pedidos.getAsignacionesTransporte)
+router.post('/pedido/asignarTransporte', auth, pedidos.asignarTransporte)
 
 //LOGIN
 router.post('/login', login.login);
@@ -116,6 +125,7 @@ router.get('/usuario/getUsersByDepartamento/:id_matriz', auth, usuarios.getUsers
 router.get('/usuario/getUsersByDepartamento2/:departamento_id', auth, usuarios.getUsersByDepartamento2);
 router.get('/usuario/searchUsers', auth, usuarios.searchUsers);
 router.put('/usuario/updateUser', auth, usuarios.updateUser);
+router.get('/usuario/getUsersByRol', auth, usuarios.getUsersByRol);
 
 //DEPARTAMENTO
 router.get('/departamento/getDepartamentos', auth, departamentos.getDepartamentos);
@@ -130,6 +140,32 @@ router.get('/empresa/getEmpresasActivas', auth, empresas.getEmpresasActivas);
 
 //CAMION
 router.get('/camion/getInspecciones', auth, camiones.getInspecciones);
+router.get('/camion/getAllCamiones', auth, camiones.getAllCamiones);
+
+//RUTAS DE POLLO (maestro de rutas + asignación de tiendas)
+router.get('/rutaPollo/getRutas', auth, rutasPollo.getRutasPollo);
+router.post('/rutaPollo/crearRuta', auth, rutasPollo.crearRutaPollo);
+router.put('/rutaPollo/actualizarRuta', auth, rutasPollo.actualizarRutaPollo);
+router.get('/rutaPollo/buscarTiendasPdv', auth, rutasPollo.buscarTiendasPdv);
+router.get('/rutaPollo/getTiendasDeRuta/:ruta_id', auth, rutasPollo.getTiendasDeRuta);
+router.post('/rutaPollo/asignarTiendaRuta', auth, rutasPollo.asignarTiendaRutaPollo);
+router.post('/rutaPollo/quitarTiendaDeRuta', auth, rutasPollo.quitarTiendaDeRutaPollo);
+router.get('/rutaPollo/getMuelleUsuario', auth, rutasPollo.getMuelleUsuario);
+router.get('/rutaPollo/getCandadoActivo', auth, rutasPollo.getCandadoActivo);
+router.post('/rutaPollo/tomarCandado', auth, rutasPollo.tomarCandado);
+router.post('/rutaPollo/liberarCandado', auth, rutasPollo.liberarCandado);
+
+//RUTAS DE INSUMOS (maestro de rutas + asignación de tiendas + candado global)
+router.get('/rutaInsumos/getRutas', auth, rutasInsumos.getRutasInsumos);
+router.post('/rutaInsumos/crearRuta', auth, rutasInsumos.crearRutaInsumos);
+router.put('/rutaInsumos/actualizarRuta', auth, rutasInsumos.actualizarRutaInsumos);
+router.get('/rutaInsumos/buscarTiendasPdv', auth, rutasInsumos.buscarTiendasPdv);
+router.get('/rutaInsumos/getTiendasDeRuta/:ruta_id', auth, rutasInsumos.getTiendasDeRuta);
+router.post('/rutaInsumos/asignarTiendaRuta', auth, rutasInsumos.asignarTiendaRutaInsumos);
+router.post('/rutaInsumos/quitarTiendaDeRuta', auth, rutasInsumos.quitarTiendaDeRutaInsumos);
+router.get('/rutaInsumos/getCandadoActivo', auth, rutasInsumos.getCandadoActivoInsumos);
+router.post('/rutaInsumos/tomarCandado', auth, rutasInsumos.tomarCandadoInsumos);
+router.post('/rutaInsumos/liberarCandado', auth, rutasInsumos.liberarCandadoInsumos);
 
 //VALES DE COMBUSTIBLE
 router.get('/vale/getValesCombustible', auth, vales.getValesCombustible)

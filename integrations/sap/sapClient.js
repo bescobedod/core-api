@@ -10,6 +10,15 @@ const sapSessions = {
     byEmpresa: {}
 };
 
+// ------------------------------------------------------------
+// Conexión a la base de AVIGUA (pollo) — servidor/base distintos
+// a los de las demás empresas, por eso loginSAP acepta un baseUrl
+// aparte en vez de usar siempre process.env.SAP_URL.
+// ------------------------------------------------------------
+const SAP_AVIGUA_URL = process.env.SAP_AVIGUA_URL;
+// El whsCode ya no es fijo: viene del maestro de rutas de pollo (cada ruta
+// pertenece a un muelle — RAS-002/003/004), se recibe como parámetro.
+
 
 function normalizeSession(data) {
     return {
@@ -75,7 +84,9 @@ async function obtenerEmpresaSAPPorTienda(id_tienda) {
     };
 }
 
-async function loginSAP(empresa) {
+// baseUrl es opcional: por defecto sigue usando process.env.SAP_URL como
+// siempre (no rompe nada existente), pero AVIGUA pasa su propia URL.
+async function loginSAP(empresa, baseUrl = process.env.SAP_URL) {
     try {
         if (!empresa?.CompanyDB || !empresa?.UserName || !empresa?.Password) {
             throw new Error("Faltan credenciales SAP en empresa");
@@ -87,7 +98,7 @@ async function loginSAP(empresa) {
             Password: empresa.Password,
         };
 
-        const url = `${process.env.SAP_URL.replace(/\/$/, '')}/Login`;
+        const url = `${baseUrl.replace(/\/$/, '')}/Login`;
 
         const response = await axios.post(url, payload, {
             httpsAgent: agent,
@@ -439,6 +450,368 @@ async function obtenerProductosData(id_tienda) {
     }
 }
 
+// ------------------------------------------------------------
+// AVIGUA (pollo): credenciales fijas por variables de entorno,
+// no dependen de la tienda ni de EmpresaModel — siempre la misma base.
+// ------------------------------------------------------------
+function obtenerCredencialesAvigua() {
+    if (!process.env.SAP_AVIGUA_BD || !process.env.SAP_AVIGUA_USER || !process.env.SAP_AVIGUA_PASSWORD) {
+        throw new Error("Faltan variables de entorno SAP_AVIGUA_BD / SAP_AVIGUA_USER / SAP_AVIGUA_PASSWORD");
+    }
+
+    return {
+        id: 'avigua',
+        CompanyDB: process.env.SAP_AVIGUA_BD,
+        UserName: process.env.SAP_AVIGUA_USER,
+        Password: process.env.SAP_AVIGUA_PASSWORD
+    };
+}
+
+async function getAviguaSession() {
+    let session = sapSessions.byEmpresa['avigua'];
+
+    if (!session || !session.sessionId) {
+        const empresa = obtenerCredencialesAvigua();
+        session = await loginSAP(empresa, SAP_AVIGUA_URL);
+        sapSessions.byEmpresa['avigua'] = session;
+    }
+
+    return session;
+}
+
+// Consulta el stock disponible en la bodega indicada (el muelle de la ruta
+// que se esté trabajando) para una lista de códigos de artículo, en AVIGUA.
+async function consultarStockPollo(codigosArticulo, whsCode) {
+    const codigosUnicos = [...new Set((codigosArticulo || []).filter(Boolean))];
+
+    if (codigosUnicos.length === 0) {
+        return [];
+    }
+
+    if (!whsCode) {
+        throw new Error('whsCode es requerido para consultar stock de pollo');
+    }
+
+    const executeRequest = async () => {
+        const session = await getAviguaSession();
+        const headers = {
+            Cookie: `B1SESSION=${session.sessionId}; ROUTEID=${session.routeId}`
+        };
+
+        // Se consulta un artículo a la vez (secuencial, no en paralelo):
+        // SAP Service Layer no soporta bien varias peticiones concurrentes
+        // usando la misma sesión (B1SESSION) — dispara errores de bloqueo.
+        const resultados = [];
+
+        for (const codigo of codigosUnicos) {
+            const codigoEscapado = String(codigo).replace(/'/g, "''");
+            const url = `${SAP_AVIGUA_URL.replace(/\/$/, '')}/Items('${codigoEscapado}')`;
+
+            try {
+                const response = await axios.get(url, { headers, httpsAgent: agent });
+                const item = response.data;
+                const infoBodega = (item.ItemWarehouseInfoCollection || [])
+                    .find(w => w.WarehouseCode === whsCode);
+
+                resultados.push({
+                    codigo_articulo: item.ItemCode,
+                    nombre_articulo: item.ItemName,
+                    stock_disponible: infoBodega ? infoBodega.InStock : 0
+                });
+            } catch (err) {
+                if (err.response?.status === 404) {
+                    continue; // el artículo no existe en esta base de SAP
+                }
+                throw err; // otros errores (ej. sesión expirada) sí deben propagarse
+            }
+        }
+
+        return resultados;
+    };
+
+    try {
+        return await executeRequest();
+    } catch (error) {
+        const isAuthError =
+            error.response?.status === 401 ||
+            error.response?.data?.error?.code === "301" ||
+            error.response?.data?.error?.code === "302" ||
+            error.response?.data?.error?.code === "206";
+
+        if (isAuthError) {
+            delete sapSessions.byEmpresa['avigua'];
+            return await executeRequest();
+        }
+
+        console.log("===== SAP AVIGUA ERROR =====");
+        console.log("STATUS:", error.response?.status);
+        console.log(JSON.stringify(error.response?.data, null, 2));
+
+        const sapErrorData = error.response?.data?.error;
+        const sapMessage =
+            typeof sapErrorData?.message === 'string'
+                ? sapErrorData.message
+                : sapErrorData?.message?.value;
+
+        const finalError = new Error(sapMessage || error.message);
+        finalError.sapCode = sapErrorData?.code;
+        finalError.sapStatus = error.response?.status;
+
+        throw finalError;
+    }
+}
+
+// ------------------------------------------------------------
+// INSUMOS: una sola conexión SAP fija (variables de entorno genéricas),
+// bodega siempre "01". A diferencia de POLLO, no hay múltiples muelles.
+// ------------------------------------------------------------
+const WHS_INSUMOS = '01';
+
+function obtenerCredencialesInsumos() {
+    if (!process.env.SAP_COMPANY_DB || !process.env.SAP_USER || !process.env.SAP_PASSWORD) {
+        throw new Error("Faltan variables de entorno SAP_COMPANY_DB / SAP_USER / SAP_PASSWORD");
+    }
+
+    return {
+        id: 'insumos',
+        CompanyDB: process.env.SAP_COMPANY_DB,
+        UserName: process.env.SAP_USER,
+        Password: process.env.SAP_PASSWORD
+    };
+}
+
+async function getInsumosSession() {
+    let session = sapSessions.byEmpresa['insumos'];
+
+    if (!session || !session.sessionId) {
+        const empresa = obtenerCredencialesInsumos();
+        session = await loginSAP(empresa, process.env.SAP_URL);
+        sapSessions.byEmpresa['insumos'] = session;
+    }
+
+    return session;
+}
+
+// Consulta el stock disponible en la bodega "01" para una lista de
+// códigos de artículo, en la base fija de insumos.
+async function consultarStockInsumos(codigosArticulo) {
+    const codigosUnicos = [...new Set((codigosArticulo || []).filter(Boolean))];
+
+    if (codigosUnicos.length === 0) {
+        return [];
+    }
+
+    const executeRequest = async () => {
+        const session = await getInsumosSession();
+        const headers = {
+            Cookie: `B1SESSION=${session.sessionId}; ROUTEID=${session.routeId}`
+        };
+
+        // Igual que en POLLO: se consulta un artículo a la vez porque
+        // ItemWarehouseInfoCollection solo viene completo en GET de un
+        // solo Item, y varias peticiones concurrentes con la misma
+        // sesión causan errores de bloqueo en SAP.
+        const resultados = [];
+
+        for (const codigo of codigosUnicos) {
+            const codigoEscapado = String(codigo).replace(/'/g, "''");
+            const url = `${process.env.SAP_URL.replace(/\/$/, '')}/Items('${codigoEscapado}')`;
+
+            try {
+                const response = await axios.get(url, { headers, httpsAgent: agent });
+                const item = response.data;
+                const infoBodega = (item.ItemWarehouseInfoCollection || [])
+                    .find(w => w.WarehouseCode === WHS_INSUMOS);
+
+                resultados.push({
+                    codigo_articulo: item.ItemCode,
+                    nombre_articulo: item.ItemName,
+                    stock_disponible: infoBodega ? infoBodega.InStock : 0
+                });
+            } catch (err) {
+                if (err.response?.status === 404) {
+                    continue;
+                }
+                throw err;
+            }
+        }
+
+        return resultados;
+    };
+
+    try {
+        return await executeRequest();
+    } catch (error) {
+        const isAuthError =
+            error.response?.status === 401 ||
+            error.response?.data?.error?.code === "301" ||
+            error.response?.data?.error?.code === "302" ||
+            error.response?.data?.error?.code === "206";
+
+        if (isAuthError) {
+            delete sapSessions.byEmpresa['insumos'];
+            return await executeRequest();
+        }
+
+        console.log("===== SAP INSUMOS ERROR =====");
+        console.log("STATUS:", error.response?.status);
+        console.log(JSON.stringify(error.response?.data, null, 2));
+
+        const sapErrorData = error.response?.data?.error;
+        const sapMessage =
+            typeof sapErrorData?.message === 'string'
+                ? sapErrorData.message
+                : sapErrorData?.message?.value;
+
+        const finalError = new Error(sapMessage || error.message);
+        finalError.sapCode = sapErrorData?.code;
+        finalError.sapStatus = error.response?.status;
+
+        throw finalError;
+    }
+}
+
+// ------------------------------------------------------------
+// Crea la transferencia de inventario (OWTR / StockTransfers) de la
+// bodega origen a la bodega destino de la ruta, en la base de AVIGUA.
+// lineas: [{ codigo_producto, cantidad }]
+// ------------------------------------------------------------
+async function crearTransferenciaPollo({ fromWarehouse, toWarehouse, lineas, comentarios }) {
+    if (!fromWarehouse || !toWarehouse) {
+        throw new Error('fromWarehouse y toWarehouse son requeridos');
+    }
+
+    if (!lineas || lineas.length === 0) {
+        throw new Error('Se requiere al menos una línea para transferir');
+    }
+
+    const executeRequest = async () => {
+        const session = await getAviguaSession();
+        const headers = {
+            Cookie: `B1SESSION=${session.sessionId}; ROUTEID=${session.routeId}`,
+            'Content-Type': 'application/json'
+        };
+
+        const payload = {
+            DocDate: new Date().toISOString().split('T')[0],
+            FromWarehouse: fromWarehouse,
+            ToWarehouse: toWarehouse,
+            Comments: comentarios || undefined,
+            StockTransferLines: lineas.map(l => ({
+                ItemCode: l.codigo_producto,
+                Quantity: Number(l.cantidad),
+                WarehouseCode: toWarehouse,
+                FromWarehouseCode: fromWarehouse
+            }))
+        };
+
+        const url = `${SAP_AVIGUA_URL.replace(/\/$/, '')}/StockTransfers`;
+        const response = await axios.post(url, payload, { headers, httpsAgent: agent });
+
+        return { DocEntry: response.data.DocEntry, DocNum: response.data.DocNum };
+    };
+
+    try {
+        return await executeRequest();
+    } catch (error) {
+        const isAuthError =
+            error.response?.status === 401 ||
+            error.response?.data?.error?.code === "301" ||
+            error.response?.data?.error?.code === "302" ||
+            error.response?.data?.error?.code === "206";
+
+        if (isAuthError) {
+            delete sapSessions.byEmpresa['avigua'];
+            return await executeRequest();
+        }
+
+        console.log("===== SAP AVIGUA TRANSFERENCIA ERROR =====");
+        console.log("STATUS:", error.response?.status);
+        console.log(JSON.stringify(error.response?.data, null, 2));
+
+        const sapErrorData = error.response?.data?.error;
+        const sapMessage =
+            typeof sapErrorData?.message === 'string'
+                ? sapErrorData.message
+                : sapErrorData?.message?.value;
+
+        const finalError = new Error(sapMessage || error.message);
+        finalError.sapCode = sapErrorData?.code;
+        finalError.sapStatus = error.response?.status;
+
+        throw finalError;
+    }
+}
+
+// Igual que crearTransferenciaPollo, pero en la base fija de insumos
+// (WhsCode origen siempre "01").
+async function crearTransferenciaInsumos({ fromWarehouse, toWarehouse, lineas, comentarios }) {
+    if (!fromWarehouse || !toWarehouse) {
+        throw new Error('fromWarehouse y toWarehouse son requeridos');
+    }
+
+    if (!lineas || lineas.length === 0) {
+        throw new Error('Se requiere al menos una línea para transferir');
+    }
+
+    const executeRequest = async () => {
+        const session = await getInsumosSession();
+        const headers = {
+            Cookie: `B1SESSION=${session.sessionId}; ROUTEID=${session.routeId}`,
+            'Content-Type': 'application/json'
+        };
+
+        const payload = {
+            DocDate: new Date().toISOString().split('T')[0],
+            FromWarehouse: fromWarehouse,
+            ToWarehouse: toWarehouse,
+            Comments: comentarios || undefined,
+            StockTransferLines: lineas.map(l => ({
+                ItemCode: l.codigo_producto,
+                Quantity: Number(l.cantidad),
+                WarehouseCode: toWarehouse,
+                FromWarehouseCode: fromWarehouse
+            }))
+        };
+
+        const url = `${process.env.SAP_URL.replace(/\/$/, '')}/StockTransfers`;
+        const response = await axios.post(url, payload, { headers, httpsAgent: agent });
+
+        return { DocEntry: response.data.DocEntry, DocNum: response.data.DocNum };
+    };
+
+    try {
+        return await executeRequest();
+    } catch (error) {
+        const isAuthError =
+            error.response?.status === 401 ||
+            error.response?.data?.error?.code === "301" ||
+            error.response?.data?.error?.code === "302" ||
+            error.response?.data?.error?.code === "206";
+
+        if (isAuthError) {
+            delete sapSessions.byEmpresa['insumos'];
+            return await executeRequest();
+        }
+
+        console.log("===== SAP INSUMOS TRANSFERENCIA ERROR =====");
+        console.log("STATUS:", error.response?.status);
+        console.log(JSON.stringify(error.response?.data, null, 2));
+
+        const sapErrorData = error.response?.data?.error;
+        const sapMessage =
+            typeof sapErrorData?.message === 'string'
+                ? sapErrorData.message
+                : sapErrorData?.message?.value;
+
+        const finalError = new Error(sapMessage || error.message);
+        finalError.sapCode = sapErrorData?.code;
+        finalError.sapStatus = error.response?.status;
+
+        throw finalError;
+    }
+}
+
 module.exports = {
     loginSAP,
     loginSAPGlobal,
@@ -447,5 +820,9 @@ module.exports = {
     sendSolicitudCompra,
     buscarProductosPorNombre,
     getProveedores,
-    obtenerProductosData
+    obtenerProductosData,
+    consultarStockPollo,
+    consultarStockInsumos,
+    crearTransferenciaPollo,
+    crearTransferenciaInsumos
 };

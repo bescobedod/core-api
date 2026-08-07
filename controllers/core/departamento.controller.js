@@ -3,6 +3,7 @@ const { Op } = require('sequelize');
 const { sequelizePioApp } = require('../../configuration/db');
 const AreaModel = require('../../models/pioapp/tbl_area.model');
 const UsersModel = require('../../models/pioapp/users.model');
+const { v4: uuidv4 } = require('uuid');
 
 async function getDepartamentos(req, res) {
     try {
@@ -15,6 +16,33 @@ async function getDepartamentos(req, res) {
         return res.json(departamentos);
     } catch (err) {
         console.error("Error al obtener los departamentos");
+        return res.status(500).json({ error: err.message });
+    }
+}
+
+async function createDepartamento(req, res) {
+    const { codigo, nombre, descripcion, codigo_sap } = req.body;
+
+    if (!codigo?.trim() || !nombre?.trim() || !descripcion?.trim() || !codigo_sap?.trim()) {
+        return res.status(400).json({ error: "Código, nombre, descripción y código SAP son obligatorios" });
+    }
+
+    if (codigo.trim().length > 20) {
+        return res.status(400).json({ error: "El código no puede exceder 20 caracteres" });
+    }
+
+    try {
+        const nuevoDepartamento = await DepartamentoModel.create({
+            codigo: codigo.trim().toUpperCase(),
+            nombre,
+            descripcion,
+            codigo_sap,
+            esta_activo: true
+        });
+
+        return res.status(201).json(nuevoDepartamento);
+    } catch (err) {
+        console.error("Error al crear el departamento", err);
         return res.status(500).json({ error: err.message });
     }
 }
@@ -155,5 +183,6 @@ async function updateDepartamento(req, res) {
 
 module.exports = {
     getDepartamentos,
+    createDepartamento,
     updateDepartamento
 }

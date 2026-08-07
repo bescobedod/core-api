@@ -154,9 +154,32 @@ async function updateUser(req, res) {
     }
 }
 
+// ------------------------------------------------------------
+// Obtiene usuarios filtrados por id_rol (ej. id_rol=1 para pilotos)
+// ------------------------------------------------------------
+async function getUsersByRol(req, res) {
+    const { id_rol } = req.query;
+
+    if (!id_rol) {
+        return res.status(400).json({ error: "El parámetro id_rol es requerido" });
+    }
+
+    try {
+        const usuarios = await UsersModel.findAll({
+            where: { id_rol: Number(id_rol) },
+            attributes: ['id_users', 'first_name', 'second_name', 'first_last_name', 'second_last_name', 'codigo_user', 'email']
+        });
+
+        return res.json(usuarios);
+    } catch (err) {
+        return res.status(500).json({ error: err.message });
+    }
+}
+
 module.exports = {
     getUsersByDepartamento,
     getUsersByDepartamento2,
     searchUsers,
-    updateUser
+    updateUser,
+    getUsersByRol
 }

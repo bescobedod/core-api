@@ -2,14 +2,22 @@ const initPedidoEncabezadoModel = require('../../models/core/tbl_pedido_encabeza
 const initPedidoDetalleModel = require('../../models/core/tbl_pedido_detalle.model');
 const initTiendaModel = require('../../models/pdv/tTienda.model');
 const UsersModel = require('../../models/pioapp/users.model');
-const { obtenerProductosData } = require('../../integrations/sap/sapClient');
+const { obtenerProductosData, consultarStockPollo, consultarStockInsumos, crearTransferenciaPollo, crearTransferenciaInsumos } = require('../../integrations/sap/sapClient');
+const CatalogoRutaPolloModel = require('../../models/core/tbl_catalogo_rutas_pollo.model');
+const BloqueoRutaPolloModel = require('../../models/core/tbl_bloqueo_ruta_pollo.model');
+const CatalogoRutaInsumosModel = require('../../models/core/tbl_catalogo_rutas_insumos.model');
+const BloqueoRutaInsumosModel = require('../../models/core/tbl_bloqueo_ruta_insumos.model');
 const sequelizeInit = require('../../configuration/db');
-const { Op } = require('sequelize');
+const { Op, fn, col } = require('sequelize');
 const PedidoPosCabeceraModel = require('../../models/core/tbl_pedido_pos_cabecera.model');
 const PedidoPosDetalleModel = require('../../models/core/tbl_pedido_pos_detalle.model');
 const PedidoPosHistorialModel = require('../../models/core/tbl_pedido_pos_historial.model');
 const CatalogoRutaModel = require('../../models/core/tbl_catalogo_ruta.model');
 const TiendaRutaModel = require('../../models/core/tbl_tienda_ruta.model');
+const TiendaRutaPolloModel = require('../../models/core/tbl_tiendas_rutas_pollo.model');
+const TiendaRutaInsumosModel = require('../../models/core/tbl_tiendas_rutas_insumos.model');
+const CamionModel = require('../../models/core/tbl_camion.model');
+const DespachoRutaModel = require('../../models/core/tbl_despacho_ruta.model');
 
 PedidoPosCabeceraModel.hasMany(PedidoPosDetalleModel, { foreignKey: 'pedido_id', as: 'detalle' });
 PedidoPosDetalleModel.belongsTo(PedidoPosCabeceraModel, { foreignKey: 'pedido_id', as: 'cabecera' });
@@ -20,10 +28,14 @@ PedidoPosHistorialModel.belongsTo(PedidoPosCabeceraModel, { foreignKey: 'pedido_
 CatalogoRutaModel.hasMany(TiendaRutaModel, { foreignKey: 'ruta_id', as: 'tiendas' });
 TiendaRutaModel.belongsTo(CatalogoRutaModel, { foreignKey: 'ruta_id', as: 'ruta' });
  
+CatalogoRutaPolloModel.hasMany(TiendaRutaPolloModel, { foreignKey: 'ruta_id', as: 'tiendas' });
+TiendaRutaPolloModel.belongsTo(CatalogoRutaPolloModel, { foreignKey: 'ruta_id', as: 'ruta' });
+ 
+CatalogoRutaInsumosModel.hasMany(TiendaRutaInsumosModel, { foreignKey: 'ruta_id', as: 'tiendas' });
+TiendaRutaInsumosModel.belongsTo(CatalogoRutaInsumosModel, { foreignKey: 'ruta_id', as: 'ruta' });
+ 
 PedidoPosCabeceraModel.belongsTo(CatalogoRutaModel, { foreignKey: 'ruta_id', as: 'ruta' });
 
-// TODO: confirmar el nombre real de la clave de conexión a PDV en configDatabase
-// (aquí se asume 'PDV', ajustar si en configDatabase.js tiene otro nombre)
 const PDV_CONNECTION = 'PDV';
 
 async function getAllPedidosEncabezado(req, res) {
@@ -223,17 +235,11 @@ async function validarYObtenerPedido(req, res) {
 }
 }
 
-// async function getPedidosByTipoYFecha(req, res) {
-//     const { }
-// }
-
 // ============================================================
-// A PARTIR DE AQUÍ: servicio que recibe/procesa los pedidos POS
-// de Oracle Simphony (SFTP -> middleware -> Core)
+// servicio que recibe/procesa los pedidos POS de Oracle Simphony (SFTP -> middleware -> Core)
 // ============================================================
 
 function formatearFechaOracle(valor) {
-    // Oracle Simphony manda fechas como 'AAAAMMDD' (ej. '20260718')
     if (!valor) return null;
 
     const texto = valor.toString();
@@ -254,7 +260,7 @@ function parsearLineaArchivo(lineaTexto) {
 
     return {
         vendor_name: campos[0],
-        vendor_id: campos[1],              // codigo_bodega_simphony (ej. "1004")
+        vendor_id: campos[1],
         numero_pedido: campos[2],
         fecha_pedido: campos[3],
         hora_pedido: campos[4],
@@ -269,7 +275,6 @@ function parsearLineaArchivo(lineaTexto) {
         informacion: campos[13],
         nombre_articulo: campos[14],
         unidad_medida: campos[15]
-        // campos[16] (Order Qty/Base Unit) no está soportado por Oracle, se ignora
     };
 }
 
@@ -339,6 +344,7 @@ async function guardarPedidoPos(datosPedido, archivo_origen) {
         let nombre_tienda = null;
         let codigo_empresa = null;
         let codigo_bodega = null;
+        let codigo_bodega_simphony = vendor_id || null;
         let estado_inicial = 'RECIBIDO';
 
         if (delivery_location_id) {
@@ -347,7 +353,6 @@ async function guardarPedidoPos(datosPedido, archivo_origen) {
             });
 
             if (tienda) {
-                codigo_tienda = tienda.tienda;
                 nombre_tienda = tienda.tda_nombre;
                 codigo_empresa = tienda.empresa;
                 codigo_bodega = tienda.whsCode;
@@ -358,54 +363,72 @@ async function guardarPedidoPos(datosPedido, archivo_origen) {
             estado_inicial = 'PENDIENTE_ENRIQUECIMIENTO';
         }
 
-        // vendor_id clasifica el TIPO de pedido, no identifica bodega ni empresa:
-        // '1004' (AVICOLA GUADALUPE) = POLLO, cualquier otro valor = INSUMOS
-        const tipo_pedido = vendor_id ? (vendor_id === '1004' ? 'POLLO' : 'INSUMOS') : null;
-
-        // nombre_bodega: SAP (Warehouses/OWHS) no trae el nombre en tTienda,
-        // solo el WhsCode. Queda pendiente resolverlo si se necesita mostrar
-        // (ej. consultando Service Layer al momento de mostrar en el portal).
+        const esAvicolaGuadalupe = (vendor_name || '').trim().toUpperCase().includes('AVICOLA GUADALUPE');
+        const tipo_pedido = vendor_name ? (esAvicolaGuadalupe ? 'POLLO' : 'INSUMOS') : null;
         const nombre_bodega = null;
 
         let ruta_id = null;
         let nombre_ruta = null;
 
-        if (codigo_tienda) {
-            const asignacionRuta = await TiendaRutaModel.findOne({
-                where: {
-                    codigo_tienda: codigo_tienda,
-                    fecha_fin_asignacion: null
-                },
-                include: [{ model: CatalogoRutaModel, as: 'ruta' }],
-                transaction: t
-            });
+        // POLLO usa el maestro de rutas nuevo (tbl_catalogo_rutas_pollo /
+        // tbl_tiendas_rutas_pollo, por whs_code_origen/muelle). INSUMOS
+        // todavía usa el maestro viejo hasta que se construya el suyo propio.
+        if (delivery_location_id) {
+            if (tipo_pedido === 'POLLO') {
+                const asignacionRutaPollo = await TiendaRutaPolloModel.findOne({
+                    where: {
+                        id_tienda_simphony: delivery_location_id,
+                        fecha_fin_asignacion: null
+                    },
+                    include: [{ model: CatalogoRutaPolloModel, as: 'ruta' }],
+                    transaction: t
+                });
 
-            if (asignacionRuta && asignacionRuta.ruta) {
-                ruta_id = asignacionRuta.ruta.id;
-                nombre_ruta = asignacionRuta.ruta.nombre_ruta;
+                if (asignacionRutaPollo && asignacionRutaPollo.ruta) {
+                    ruta_id = asignacionRutaPollo.ruta.id;
+                    nombre_ruta = asignacionRutaPollo.ruta.nombre_ruta;
+                }
+            } else {
+                const asignacionRutaInsumos = await TiendaRutaInsumosModel.findOne({
+                    where: {
+                        id_tienda_simphony: delivery_location_id,
+                        fecha_fin_asignacion: null
+                    },
+                    include: [{ model: CatalogoRutaInsumosModel, as: 'ruta' }],
+                    transaction: t
+                });
+
+                if (asignacionRutaInsumos && asignacionRutaInsumos.ruta) {
+                    ruta_id = asignacionRutaInsumos.ruta.id;
+                    nombre_ruta = asignacionRutaInsumos.ruta.nombre_ruta;
+                }
             }
         }
 
         const ahora = new Date();
+
+        const fecha_requerida = lineas.length > 0
+            ? formatearFechaOracle(lineas[0].fecha_entrega)
+            : null;
 
         const cabecera = await PedidoPosCabeceraModel.create({
             codigo_empresa: codigo_empresa,
             codigo_tienda: codigo_tienda,
             numero_pedido: numero_pedido,
             fecha_pedido: formatearFechaOracle(fecha_pedido),
+            fecha_requerida: fecha_requerida,
             hora_pedido: hora_pedido,
             nombre_tienda: nombre_tienda,
             codigo_bodega: codigo_bodega,
             tipo_pedido: tipo_pedido,
-            codigo_bodega_simphony: vendor_id || null,
+            codigo_bodega_simphony: codigo_bodega_simphony,
+            nombre_bodega_simphony: vendor_name || null,
             nombre_bodega: nombre_bodega,
             ruta_id: ruta_id,
             nombre_ruta: nombre_ruta,
             estado: estado_inicial,
             archivo_origen: archivo_origen || null,
             fecha_recepcion: ahora,
-            // camion/piloto y su fecha/usuario de asignación se llenan después,
-            // manualmente, desde el endpoint de asignación de transporte por ruta
             camion_id: null,
             camion_placa: null,
             piloto_id: null,
@@ -419,7 +442,7 @@ async function guardarPedidoPos(datosPedido, archivo_origen) {
         const detalles = lineas.map(linea => ({
             pedido_id: cabecera.id,
             numero_linea: linea.posicion,
-            codigo_producto: linea.item_no,
+            codigo_producto: linea.item_no || null,
             descripcion_producto: linea.nombre_articulo,
             unidad_medida: linea.unidad_orden,
             fecha_requerida: formatearFechaOracle(linea.fecha_entrega),
@@ -469,7 +492,7 @@ async function guardarPedidoPos(datosPedido, archivo_origen) {
 // que contenga.
 // ------------------------------------------------------------
 async function procesarArchivoPedidoPos(buffer, nombreArchivoOriginal) {
-    const contenido = buffer.toString('latin1'); // latin1 por acentos (ej. "Lasaña")
+    const contenido = buffer.toString('latin1');
     const pedidosDelArchivo = agruparLineasPorPedido(contenido);
 
     const resultados = [];
@@ -525,7 +548,7 @@ async function subirYProcesarArchivosPedidoPos(req, res) {
 }
 
 // ------------------------------------------------------------
-// GET: obtiene los pedidos POS ya guardados, agrupados por ruta -> tienda,
+// obtiene los pedidos POS ya guardados, agrupados por ruta -> tienda,
 // separado por tipo_pedido (POLLO / INSUMOS, son dos vistas distintas),
 // con filtros opcionales de bodega, tienda, ruta y fecha requerida
 // (si no se manda fecha_requerida, se usa el día siguiente por defecto).
@@ -544,11 +567,11 @@ async function getPedidosPos(req, res) {
     if (!fecha_requerida) {
         const manana = new Date();
         manana.setDate(manana.getDate() + 1);
-        fecha_requerida = manana.toISOString().split('T')[0]; // YYYY-MM-DD
+        fecha_requerida = manana.toISOString().split('T')[0];
     }
 
     try {
-        const whereCabecera = { tipo_pedido };
+        const whereCabecera = { tipo_pedido, fecha_requerida };
 
         if (codigo_bodega) {
             whereCabecera.codigo_bodega = codigo_bodega;
@@ -561,15 +584,6 @@ async function getPedidosPos(req, res) {
         if (ruta_id) {
             whereCabecera.ruta_id = ruta_id;
         }
-
-        const pedidosConFecha = await PedidoPosDetalleModel.findAll({
-            attributes: ['pedido_id'],
-            where: { fecha_requerida },
-            group: ['pedido_id'],
-            raw: true
-        });
-
-        whereCabecera.id = { [Op.in]: pedidosConFecha.map(p => p.pedido_id) };
 
         const pedidos = await PedidoPosCabeceraModel.findAll({
             where: whereCabecera,
@@ -610,7 +624,12 @@ async function getPedidosPos(req, res) {
                 codigo_bodega: p.codigo_bodega,
                 numero_pedido: p.numero_pedido,
                 fecha_pedido: p.fecha_pedido,
+                hora_pedido: p.hora_pedido,
+                fecha_requerida: p.fecha_requerida,
                 estado: p.estado,
+                sap_docentry: p.sap_docentry,
+                sap_docnum: p.sap_docnum,
+                sap_error: p.sap_error,
                 items: p.detalle.map(d => ({
                     id: d.id,
                     codigo_producto: d.codigo_producto,
@@ -628,11 +647,694 @@ async function getPedidosPos(req, res) {
             success: true,
             tipo_pedido: tipo_pedido,
             fecha_requerida: fecha_requerida,
-            rutas: Array.from(rutasMap.values())
+            rutas: Array.from(rutasMap.values()).map(ruta => {
+                const estadosUnicos = [...new Set(ruta.tiendas.map(t => t.estado))];
+                const estado_general = estadosUnicos.length === 1 ? estadosUnicos[0] : 'MIXTO';
+                const pedidoConDoc = ruta.tiendas.find(t => t.sap_docnum);
+                const sap_docnum = pedidoConDoc ? pedidoConDoc.sap_docnum : null;
+                const sap_docentry = pedidoConDoc ? pedidoConDoc.sap_docentry : null;
+
+                return { ...ruta, estado_general, sap_docnum, sap_docentry };
+            })
         });
     } catch (error) {
         return res.status(500).json({
             error: 'Error al obtener pedidos POS',
+            details: error.message,
+            success: false
+        });
+    }
+}
+
+// ------------------------------------------------------------
+// Obtiene las asignaciones de camión/piloto por ruta para una fecha
+// (útil para que el frontend sepa qué camiones/pilotos ya están tomados
+// ese día, y los deshabilite en los dropdowns de las demás rutas).
+// ------------------------------------------------------------
+async function getAsignacionesTransporte(req, res) {
+    const { fecha } = req.query;
+
+    if (!fecha) {
+        return res.status(400).json({ error: 'El parámetro fecha es requerido', success: false });
+    }
+
+    try {
+        const asignaciones = await DespachoRutaModel.findAll({
+            where: { fecha }
+        });
+
+        return res.json({ success: true, asignaciones });
+    } catch (error) {
+        return res.status(500).json({
+            error: 'Error al obtener asignaciones de transporte',
+            details: error.message,
+            success: false
+        });
+    }
+}
+
+// ------------------------------------------------------------
+// Asigna (crea o actualiza) camión + piloto para una ruta en una
+// fecha específica. Las constraints UNIQUE de tbl_despacho_ruta evitan que
+// se repita el mismo camión o piloto en otra ruta ese mismo día.
+// Además propaga camion/piloto a todos los pedidos de esa ruta+fecha.
+// ------------------------------------------------------------
+async function asignarTransporte(req, res) {
+    const { ruta_id, fecha, camion_id, piloto_id } = req.body;
+    const usuario_asigno = (req.user && (req.user.nombre || req.user.id_usuario)) || null;
+
+    if (!ruta_id || !fecha || !camion_id || !piloto_id) {
+        return res.status(400).json({
+            error: 'ruta_id, fecha, camion_id y piloto_id son requeridos',
+            success: false
+        });
+    }
+
+    const sequelizeCore = await sequelizeInit.sequelizeInit('CORE');
+    const t = await sequelizeCore.transaction();
+
+    try {
+        const camion = await CamionModel.findByPk(camion_id, { transaction: t });
+        const piloto = await UsersModel.findByPk(piloto_id);
+
+        const camion_placa = camion ? camion.placa : null;
+        const piloto_nombre = piloto
+            ? [piloto.first_name, piloto.second_name, piloto.first_last_name, piloto.second_last_name].filter(Boolean).join(' ')
+            : null;
+
+        const ahora = new Date();
+
+        const [asignacion, created] = await DespachoRutaModel.findOrCreate({
+            where: { ruta_id, fecha },
+            defaults: {
+                camion_id,
+                camion_placa,
+                piloto_id,
+                piloto_nombre,
+                usuario_asigno,
+                fecha_asignacion: ahora,
+                actualizado_en: ahora
+            },
+            transaction: t
+        });
+
+        if (!created) {
+            await asignacion.update({
+                camion_id,
+                camion_placa,
+                piloto_id,
+                piloto_nombre,
+                usuario_asigno,
+                actualizado_en: ahora
+            }, { transaction: t });
+        }
+
+        await PedidoPosCabeceraModel.update({
+            camion_id,
+            camion_placa,
+            piloto_id,
+            piloto_nombre,
+            fecha_asignacion_transporte: ahora,
+            usuario_asigno_transporte: usuario_asigno
+        }, {
+            where: { ruta_id, fecha_requerida: fecha },
+            transaction: t
+        });
+
+        await t.commit();
+
+        return res.json({ success: true, asignacion });
+    } catch (error) {
+        await t.rollback();
+
+        if (error.name === 'SequelizeUniqueConstraintError') {
+            const campo = (error.errors && error.errors[0] && error.errors[0].path) || '';
+            let mensaje = 'Ese camión o piloto ya está asignado a otra ruta este día';
+
+            if (campo.includes('camion')) mensaje = 'Ese camión ya está asignado a otra ruta este día';
+            if (campo.includes('piloto')) mensaje = 'Ese piloto ya está asignado a otra ruta este día';
+
+            return res.status(409).json({ error: mensaje, success: false });
+        }
+
+        return res.status(500).json({
+            error: 'Error al asignar transporte',
+            details: error.message,
+            success: false
+        });
+    }
+}
+
+// ------------------------------------------------------------
+// PASO 1: totales solicitados de POLLO por artículo (sumando todas las
+// tiendas para una fecha_requerida) + stock disponible en SAP AVIGUA,
+// bodega RAS-002 (Muelle Despacho Pollo). Es solo comparativo, no asigna
+// nada todavía (eso es el Paso 2, en frontend).
+// ------------------------------------------------------------
+async function getComparativoStockPollo(req, res) {
+    const { fecha, ruta_id } = req.query;
+    const id_usuario = req.user && req.user.id_usuario;
+
+    if (!fecha || !ruta_id) {
+        return res.status(400).json({ error: 'fecha y ruta_id son requeridos', success: false });
+    }
+
+    try {
+        const ruta = await CatalogoRutaPolloModel.findByPk(ruta_id);
+
+        if (!ruta) {
+            return res.status(404).json({ error: 'Ruta no encontrada', success: false });
+        }
+
+        const candado = await BloqueoRutaPolloModel.findOne({
+            where: { ruta_id, fecha, estado: 'ACTIVO' }
+        });
+
+        if (!candado || String(candado.id_usuario) !== String(id_usuario)) {
+            return res.status(403).json({
+                error: 'Debes tomar el candado de esta ruta antes de calcular el stock',
+                success: false
+            });
+        }
+
+        const totales = await PedidoPosDetalleModel.findAll({
+            attributes: [
+                'codigo_producto',
+                [fn('SUM', col('cantidad_solicitada')), 'cantidad_solicitada_total'],
+                [fn('MAX', col('descripcion_producto')), 'descripcion_producto'],
+                [fn('MAX', col('unidad_medida')), 'unidad_medida']
+            ],
+            include: [{
+                model: PedidoPosCabeceraModel,
+                as: 'cabecera',
+                attributes: [],
+                where: { tipo_pedido: 'POLLO', fecha_requerida: fecha, ruta_id }
+            }],
+            group: ['codigo_producto'],
+            subQuery: false,
+            raw: true
+        });
+
+        const codigos = totales.map(t => t.codigo_producto).filter(Boolean);
+        const stockSAP = await consultarStockPollo(codigos, ruta.whs_code_origen);
+        const stockMap = new Map(stockSAP.map(s => [s.codigo_articulo, s]));
+
+        const comparativo = totales.map(t => {
+            const stock = t.codigo_producto ? stockMap.get(t.codigo_producto) : null;
+            const cantidadSolicitada = Number(t.cantidad_solicitada_total);
+            const stockDisponible = stock ? Number(stock.stock_disponible) : 0;
+
+            return {
+                codigo_producto: t.codigo_producto,
+                descripcion_producto: t.descripcion_producto,
+                unidad_medida: t.unidad_medida,
+                cantidad_solicitada_total: cantidadSolicitada,
+                stock_disponible: stockDisponible,
+                encontrado_en_sap: !!stock,
+                diferencia: stockDisponible - cantidadSolicitada
+            };
+        });
+
+        return res.json({
+            success: true,
+            fecha,
+            ruta_id,
+            whs_code: ruta.whs_code_origen,
+            comparativo
+        });
+    } catch (error) {
+        return res.status(500).json({
+            error: 'Error al obtener el comparativo de stock de pollo',
+            details: error.message,
+            success: false
+        });
+    }
+}
+
+// ------------------------------------------------------------
+// Comparativo de stock de INSUMOS, escopado por ruta (igual que
+// pollo), verificando el candado GLOBAL de insumos.
+// ------------------------------------------------------------
+async function getComparativoStockInsumos(req, res) {
+    const { fecha, ruta_id } = req.query;
+    const id_usuario = req.user && req.user.id_usuario;
+
+    if (!fecha || !ruta_id) {
+        return res.status(400).json({ error: 'fecha y ruta_id son requeridos', success: false });
+    }
+
+    try {
+        const ruta = await CatalogoRutaInsumosModel.findByPk(ruta_id);
+
+        if (!ruta) {
+            return res.status(404).json({ error: 'Ruta no encontrada', success: false });
+        }
+
+        const candado = await BloqueoRutaInsumosModel.findOne({
+            where: { ruta_id, fecha, estado: 'ACTIVO' }
+        });
+
+        if (!candado || String(candado.id_usuario) !== String(id_usuario)) {
+            return res.status(403).json({
+                error: 'Debes tomar el candado de esta ruta antes de calcular el stock',
+                success: false
+            });
+        }
+
+        const totales = await PedidoPosDetalleModel.findAll({
+            attributes: [
+                'codigo_producto',
+                [fn('SUM', col('cantidad_solicitada')), 'cantidad_solicitada_total'],
+                [fn('MAX', col('descripcion_producto')), 'descripcion_producto'],
+                [fn('MAX', col('unidad_medida')), 'unidad_medida']
+            ],
+            include: [{
+                model: PedidoPosCabeceraModel,
+                as: 'cabecera',
+                attributes: [],
+                where: { tipo_pedido: 'INSUMOS', fecha_requerida: fecha, ruta_id }
+            }],
+            group: ['codigo_producto'],
+            subQuery: false,
+            raw: true
+        });
+
+        const codigos = totales.map(t => t.codigo_producto).filter(Boolean);
+        const stockSAP = await consultarStockInsumos(codigos);
+        const stockMap = new Map(stockSAP.map(s => [s.codigo_articulo, s]));
+
+        const comparativo = totales.map(t => {
+            const stock = t.codigo_producto ? stockMap.get(t.codigo_producto) : null;
+            const cantidadSolicitada = Number(t.cantidad_solicitada_total);
+            const stockDisponible = stock ? Number(stock.stock_disponible) : 0;
+
+            return {
+                codigo_producto: t.codigo_producto,
+                descripcion_producto: t.descripcion_producto,
+                unidad_medida: t.unidad_medida,
+                cantidad_solicitada_total: cantidadSolicitada,
+                stock_disponible: stockDisponible,
+                encontrado_en_sap: !!stock,
+                diferencia: stockDisponible - cantidadSolicitada
+            };
+        });
+
+        return res.json({
+            success: true,
+            fecha,
+            ruta_id,
+            whs_code: ruta.whs_code_origen,
+            comparativo
+        });
+    } catch (error) {
+        return res.status(500).json({
+            error: 'Error al obtener el comparativo de stock de insumos',
+            details: error.message,
+            success: false
+        });
+    }
+}
+
+// ------------------------------------------------------------
+// Guarda el resultado final de la asignación de cantidades por línea
+// (ya sea automática por FIFO o ajustada manualmente en el frontend).
+// Actualiza cantidad_asignada + estado_linea en el detalle, y marca el
+// encabezado como VALIDADO. No toca SAP todavía — es el paso previo.
+// ------------------------------------------------------------
+async function guardarAsignacionCantidades(req, res) {
+    const { fecha, asignaciones } = req.body;
+    const usuario_ajuste = (req.user && (req.user.nombre || req.user.id_usuario)) || null;
+
+    if (!fecha || !Array.isArray(asignaciones) || asignaciones.length === 0) {
+        return res.status(400).json({
+            error: 'fecha y asignaciones (arreglo) son requeridos',
+            success: false
+        });
+    }
+
+    const sequelizeCore = await sequelizeInit.sequelizeInit('CORE');
+    const t = await sequelizeCore.transaction();
+
+    try {
+        const idsPedidosAfectados = new Set();
+
+        for (const asign of asignaciones) {
+            const { detalle_id, cantidad_asignada, ajustado_manual } = asign;
+
+            if (!detalle_id || cantidad_asignada === undefined || cantidad_asignada === null) {
+                throw new Error(`Cada asignación requiere detalle_id y cantidad_asignada (falló en: ${JSON.stringify(asign)})`);
+            }
+
+            const detalle = await PedidoPosDetalleModel.findByPk(detalle_id, { transaction: t });
+
+            if (!detalle) {
+                throw new Error(`No existe la línea de detalle ${detalle_id}`);
+            }
+
+            const cantidadNum = Number(cantidad_asignada);
+            const solicitada = Number(detalle.cantidad_solicitada);
+
+            if (isNaN(cantidadNum) || cantidadNum < 0) {
+                throw new Error(`Cantidad inválida para la línea ${detalle_id}: ${cantidad_asignada}`);
+            }
+
+            if (cantidadNum > solicitada) {
+                throw new Error(`La línea ${detalle_id} no puede asignar más de lo solicitado (${solicitada})`);
+            }
+
+            let estado_linea = 'PENDIENTE';
+            if (cantidadNum <= 0) estado_linea = 'SIN_STOCK';
+            else if (cantidadNum >= solicitada) estado_linea = 'VALIDADA';
+            else estado_linea = 'PARCIAL';
+
+            await detalle.update({
+                cantidad_asignada: cantidadNum,
+                estado_linea,
+                ajustado_manual: ajustado_manual === true,
+                usuario_ajuste,
+                fecha_ajuste: new Date()
+            }, { transaction: t });
+
+            idsPedidosAfectados.add(detalle.pedido_id);
+        }
+
+        const ahora = new Date();
+
+        await PedidoPosCabeceraModel.update({
+            estado: 'VALIDADO',
+            fecha_validacion: ahora,
+            usuario_ajuste
+        }, {
+            where: { id: { [Op.in]: Array.from(idsPedidosAfectados) } },
+            transaction: t
+        });
+
+        await t.commit();
+
+        return res.json({
+            success: true,
+            pedidos_actualizados: idsPedidosAfectados.size,
+            lineas_actualizadas: asignaciones.length
+        });
+    } catch (error) {
+        await t.rollback();
+
+        return res.status(400).json({
+            error: 'Error al guardar la asignación de cantidades',
+            details: error.message,
+            success: false
+        });
+    }
+}
+
+// ------------------------------------------------------------
+// Envía la transferencia de inventario (bodega -> camión) a SAP
+// para una ruta+fecha de POLLO. Agrupa por artículo (suma entre tiendas),
+// solo líneas con cantidad_asignada > 0. Si sale bien, marca EN_TRANSITO
+// y libera el candado; si falla, marca ERROR_ENVIO_SAP y el candado sigue.
+// ------------------------------------------------------------
+async function enviarTransferenciaPollo(req, res) {
+    const { ruta_id, fecha } = req.body;
+    const id_usuario = req.user && req.user.id_usuario;
+
+    if (!ruta_id || !fecha) {
+        return res.status(400).json({ error: 'ruta_id y fecha son requeridos', success: false });
+    }
+
+    try {
+        const ruta = await CatalogoRutaPolloModel.findByPk(ruta_id);
+
+        if (!ruta) {
+            return res.status(404).json({ error: 'Ruta no encontrada', success: false });
+        }
+
+        const candado = await BloqueoRutaPolloModel.findOne({
+            where: { ruta_id, fecha, estado: 'ACTIVO' }
+        });
+
+        if (!candado || String(candado.id_usuario) !== String(id_usuario)) {
+            return res.status(403).json({
+                error: 'Debes tener el candado de esta ruta activo para enviar la transferencia',
+                success: false
+            });
+        }
+
+        const despacho = await DespachoRutaModel.findOne({ where: { ruta_id, fecha } });
+
+        if (!despacho || !despacho.camion_id || !despacho.piloto_id) {
+            return res.status(400).json({
+                error: 'Debes asignar piloto y camión a esta ruta antes de enviarla a SAP',
+                success: false
+            });
+        }
+
+        const lineasDetalle = await PedidoPosDetalleModel.findAll({
+            attributes: [
+                'codigo_producto',
+                [fn('SUM', col('cantidad_asignada')), 'cantidad_total']
+            ],
+            include: [{
+                model: PedidoPosCabeceraModel,
+                as: 'cabecera',
+                attributes: [],
+                where: { tipo_pedido: 'POLLO', fecha_requerida: fecha, ruta_id }
+            }],
+            where: { cantidad_asignada: { [Op.gt]: 0 } },
+            group: ['codigo_producto'],
+            raw: true
+        });
+
+        if (lineasDetalle.length === 0) {
+            return res.status(400).json({
+                error: 'No hay artículos con cantidad asignada para transferir. Primero calcula el stock y guarda la asignación.',
+                success: false
+            });
+        }
+
+        const lineasSap = lineasDetalle.map(l => ({
+            codigo_producto: l.codigo_producto,
+            cantidad: Number(l.cantidad_total)
+        }));
+
+        const cabecerasAfectadas = await PedidoPosCabeceraModel.findAll({
+            where: { tipo_pedido: 'POLLO', fecha_requerida: fecha, ruta_id },
+            attributes: ['id', 'numero_pedido']
+        });
+        const idsPedidos = cabecerasAfectadas.map(c => c.id);
+        const comentarios = [...new Set(cabecerasAfectadas.map(c => c.numero_pedido).filter(Boolean))].join(', ');
+
+        let resultadoSap;
+
+        try {
+            resultadoSap = await crearTransferenciaPollo({
+                fromWarehouse: ruta.whs_code_origen,
+                toWarehouse: ruta.whs_code_destino,
+                lineas: lineasSap,
+                comentarios
+            });
+        } catch (sapError) {
+            await PedidoPosCabeceraModel.update({
+                estado: 'ERROR_ENVIO_SAP',
+                sap_error: sapError.message
+            }, { where: { id: { [Op.in]: idsPedidos } } });
+
+            return res.status(502).json({
+                error: 'SAP rechazó la transferencia',
+                details: sapError.message,
+                success: false
+            });
+        }
+
+        const sequelizeCore = await sequelizeInit.sequelizeInit('CORE');
+        const t = await sequelizeCore.transaction();
+
+        try {
+            const ahora = new Date();
+
+            await PedidoPosCabeceraModel.update({
+                estado: 'EN_TRANSITO',
+                fecha_envio_sap: ahora,
+                sap_docentry: resultadoSap.DocEntry,
+                sap_docnum: resultadoSap.DocNum,
+                sap_error: null
+            }, { where: { id: { [Op.in]: idsPedidos } }, transaction: t });
+
+            await PedidoPosDetalleModel.update({
+                estado_linea: 'DESPACHADA'
+            }, {
+                where: {
+                    pedido_id: { [Op.in]: idsPedidos },
+                    cantidad_asignada: { [Op.gt]: 0 }
+                },
+                transaction: t
+            });
+
+            await BloqueoRutaPolloModel.update({
+                estado: 'LIBERADO',
+                fecha_liberacion: ahora
+            }, { where: { ruta_id, fecha, estado: 'ACTIVO' }, transaction: t });
+
+            await t.commit();
+        } catch (dbError) {
+            await t.rollback();
+            throw dbError;
+        }
+
+        return res.json({
+            success: true,
+            sap_docentry: resultadoSap.DocEntry,
+            sap_docnum: resultadoSap.DocNum,
+            pedidos_actualizados: idsPedidos.length
+        });
+    } catch (error) {
+        return res.status(500).json({
+            error: 'Error al enviar la transferencia a SAP',
+            details: error.message,
+            success: false
+        });
+    }
+}
+
+// ------------------------------------------------------------
+// Igual que enviarTransferenciaPollo, pero para INSUMOS
+// (candado global, sin dimensión de muelle).
+// ------------------------------------------------------------
+async function enviarTransferenciaInsumos(req, res) {
+    const { ruta_id, fecha } = req.body;
+    const id_usuario = req.user && req.user.id_usuario;
+
+    if (!ruta_id || !fecha) {
+        return res.status(400).json({ error: 'ruta_id y fecha son requeridos', success: false });
+    }
+
+    try {
+        const ruta = await CatalogoRutaInsumosModel.findByPk(ruta_id);
+
+        if (!ruta) {
+            return res.status(404).json({ error: 'Ruta no encontrada', success: false });
+        }
+
+        const candado = await BloqueoRutaInsumosModel.findOne({
+            where: { ruta_id, fecha, estado: 'ACTIVO' }
+        });
+
+        if (!candado || String(candado.id_usuario) !== String(id_usuario)) {
+            return res.status(403).json({
+                error: 'Debes tener el candado de esta ruta activo para enviar la transferencia',
+                success: false
+            });
+        }
+
+        const despacho = await DespachoRutaModel.findOne({ where: { ruta_id, fecha } });
+
+        if (!despacho || !despacho.camion_id || !despacho.piloto_id) {
+            return res.status(400).json({
+                error: 'Debes asignar piloto y camión a esta ruta antes de enviarla a SAP',
+                success: false
+            });
+        }
+
+        const lineasDetalle = await PedidoPosDetalleModel.findAll({
+            attributes: [
+                'codigo_producto',
+                [fn('SUM', col('cantidad_asignada')), 'cantidad_total']
+            ],
+            include: [{
+                model: PedidoPosCabeceraModel,
+                as: 'cabecera',
+                attributes: [],
+                where: { tipo_pedido: 'INSUMOS', fecha_requerida: fecha, ruta_id }
+            }],
+            where: { cantidad_asignada: { [Op.gt]: 0 } },
+            group: ['codigo_producto'],
+            raw: true
+        });
+
+        if (lineasDetalle.length === 0) {
+            return res.status(400).json({
+                error: 'No hay artículos con cantidad asignada para transferir. Primero calcula el stock y guarda la asignación.',
+                success: false
+            });
+        }
+
+        const lineasSap = lineasDetalle.map(l => ({
+            codigo_producto: l.codigo_producto,
+            cantidad: Number(l.cantidad_total)
+        }));
+
+        const cabecerasAfectadas = await PedidoPosCabeceraModel.findAll({
+            where: { tipo_pedido: 'INSUMOS', fecha_requerida: fecha, ruta_id },
+            attributes: ['id', 'numero_pedido']
+        });
+        const idsPedidos = cabecerasAfectadas.map(c => c.id);
+        const comentarios = [...new Set(cabecerasAfectadas.map(c => c.numero_pedido).filter(Boolean))].join(', ');
+
+        let resultadoSap;
+
+        try {
+            resultadoSap = await crearTransferenciaInsumos({
+                fromWarehouse: ruta.whs_code_origen,
+                toWarehouse: ruta.whs_code_destino,
+                lineas: lineasSap,
+                comentarios
+            });
+        } catch (sapError) {
+            await PedidoPosCabeceraModel.update({
+                estado: 'ERROR_ENVIO_SAP',
+                sap_error: sapError.message
+            }, { where: { id: { [Op.in]: idsPedidos } } });
+
+            return res.status(502).json({
+                error: 'SAP rechazó la transferencia',
+                details: sapError.message,
+                success: false
+            });
+        }
+
+        const sequelizeCore = await sequelizeInit.sequelizeInit('CORE');
+        const t = await sequelizeCore.transaction();
+
+        try {
+            const ahora = new Date();
+
+            await PedidoPosCabeceraModel.update({
+                estado: 'EN_TRANSITO',
+                fecha_envio_sap: ahora,
+                sap_docentry: resultadoSap.DocEntry,
+                sap_docnum: resultadoSap.DocNum,
+                sap_error: null
+            }, { where: { id: { [Op.in]: idsPedidos } }, transaction: t });
+
+            await PedidoPosDetalleModel.update({
+                estado_linea: 'DESPACHADA'
+            }, {
+                where: {
+                    pedido_id: { [Op.in]: idsPedidos },
+                    cantidad_asignada: { [Op.gt]: 0 }
+                },
+                transaction: t
+            });
+
+            await BloqueoRutaInsumosModel.update({
+                estado: 'LIBERADO',
+                fecha_liberacion: ahora
+            }, { where: { ruta_id, fecha, estado: 'ACTIVO' }, transaction: t });
+
+            await t.commit();
+        } catch (dbError) {
+            await t.rollback();
+            throw dbError;
+        }
+
+        return res.json({
+            success: true,
+            sap_docentry: resultadoSap.DocEntry,
+            sap_docnum: resultadoSap.DocNum,
+            pedidos_actualizados: idsPedidos.length
+        });
+    } catch (error) {
+        return res.status(500).json({
+            error: 'Error al enviar la transferencia a SAP',
             details: error.message,
             success: false
         });
@@ -648,5 +1350,12 @@ module.exports = {
     procesarArchivoPedidoPos,
     guardarPedidoPos,
     agruparLineasPorPedido,
-    getPedidosPos
+    getPedidosPos,
+    getAsignacionesTransporte,
+    asignarTransporte,
+    getComparativoStockPollo,
+    getComparativoStockInsumos,
+    enviarTransferenciaPollo,
+    enviarTransferenciaInsumos,
+    guardarAsignacionCantidades
 }
