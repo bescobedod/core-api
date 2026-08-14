@@ -129,6 +129,7 @@ router.get('/usuario/getUsersByRol', auth, usuarios.getUsersByRol);
 
 //DEPARTAMENTO
 router.get('/departamento/getDepartamentos', auth, departamentos.getDepartamentos);
+router.post('/departamento/createDepartamento', auth, departamentos.createDepartamento);
 router.post('/departamento/updateDepartamento/:id_d', auth, departamentos.updateDepartamento);
 
 //AREA
