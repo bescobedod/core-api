@@ -59,19 +59,22 @@ router.get('/pedido/validarYObtenerPedido', auth, pedidos.validarYObtenerPedido)
 router.post('/pedido/createPedido', auth, pedidos.createPedido)
 
 //PEDIDOS POS (Oracle Simphony -> SFTP -> middleware -> Core)
-// TODO: evaluar si esta ruta debe llevar 'auth' (login de usuario) o un
-// middleware de autenticación de servicio (API key) distinto, ya que quien
-// llama aquí es el middleware, no un usuario logueado desde el portal.
 // Acepta uno o más archivos .txt en la misma petición (form-data, campo repetible).
 router.post('/pedido/subirArchivoPedidoPos', limitePedidosPos, upload.uploadPedidosPos.any(), pedidos.subirYProcesarArchivosPedidoPos)
+router.post('/pedido/crearPedidoActivoFijo', auth, pedidos.crearPedidoActivoFijo)
+router.get('/pedido/buscarPedidosActivoFijo', auth, pedidos.buscarPedidosActivoFijo)
 router.get('/pedido/getPedidosPos', auth, pedidos.getPedidosPos)
 router.get('/pedido/getComparativoStockPollo', auth, pedidos.getComparativoStockPollo)
 router.get('/pedido/getComparativoStockInsumos', auth, pedidos.getComparativoStockInsumos)
 router.post('/pedido/guardarAsignacionCantidades', auth, pedidos.guardarAsignacionCantidades)
 router.post('/pedido/enviarTransferenciaPollo', auth, pedidos.enviarTransferenciaPollo)
 router.post('/pedido/enviarTransferenciaInsumos', auth, pedidos.enviarTransferenciaInsumos)
+router.get('/pedido/generarTicketPollo', auth, pedidos.generarTicketPollo)
+router.get('/pedido/generarTicketInsumos', auth, pedidos.generarTicketInsumos)
 router.get('/pedido/getAsignacionesTransporte', auth, pedidos.getAsignacionesTransporte)
 router.post('/pedido/asignarTransporte', auth, pedidos.asignarTransporte)
+router.post('/pedido/firmarTicketPollo', auth, pedidos.firmarTicketPollo)
+router.post('/pedido/firmarTicketInsumos', auth, pedidos.firmarTicketInsumos)
 
 //LOGIN
 router.post('/login', login.login);
@@ -84,6 +87,7 @@ router.post('/validateLogin/:email', login.validateLogin);
 // router.get('/sap/obtenerProductosPorGrupo', sap.obtenerProductosPorGrupo);
 router.post('/sap/verificarArticulosSAP', auth, sap.verificarArticulosSAP);
 router.get('/sap/buscarProductosPorNombre', auth, sap.buscarProductosPorNombre);
+router.get('/sap/buscarActivosFijos', auth, sap.buscarActivosFijos);
 router.get('/sap/getProveedores', auth, sap.getProveedores);
 
 //SOLICITUDES COMPRA
@@ -100,7 +104,6 @@ router.get('/solicitud/getAprobacionSolicitud/:id_solicitud', auth, solicitudes.
 router.get('/solicitud/getSolicitudCompra/:id_solicitud', auth, solicitudes.getSolicitudCompra);
 
 //ORDENES COMPRA
-// Cambia esto en tu archivo de rutas:
 router.post('/orden/createOrdenCompra',
     auth,
     upload.uploadDocumentos.any(),

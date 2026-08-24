@@ -592,6 +592,50 @@ async function getInsumosSession() {
     return session;
 }
 
+// Busca artículos de activo fijo (prefijo "UC" en ItemCode) por nombre,
+// en la misma base fija de insumos. Usada por Pedidos de Activos Fijos.
+async function buscarActivosFijos(req, res) {
+    const { page = 1, query } = req.query;
+
+    if (!query || query.trim().length < 3) {
+        return res.status(400).json({ error: "Mínimo 3 caracteres" });
+    }
+
+    const pageSize = 50;
+    const skip = (page - 1) * pageSize;
+
+    try {
+        const session = await getInsumosSession();
+        const headers = {
+            Cookie: `B1SESSION=${session.sessionId}; ROUTEID=${session.routeId}`
+        };
+
+        const safeQuery = query.replace(/'/g, "''");
+
+        const url = `${process.env.SAP_URL.replace(/\/$/, '')}/Items?` +
+            `$select=ItemCode,ItemName&` +
+            `$filter=startswith(ItemCode,'UC') and contains(ItemName,'${safeQuery}')&` +
+            `$top=${pageSize}&$skip=${skip}&$count=true`;
+
+        const response = await axios.get(url, { headers, httpsAgent: agent });
+
+        return res.json({
+            items: response.data.value || [],
+            total: response.data['@odata.count'] || 0
+        });
+
+    } catch (error) {
+        if (error.response?.status === 401) {
+            delete sapSessions.byEmpresa['insumos'];
+        }
+
+        return res.status(500).json({
+            error: "Error SAP búsqueda de activos fijos",
+            details: error.message
+        });
+    }
+}
+
 // Consulta el stock disponible en la bodega "01" para una lista de
 // códigos de artículo, en la base fija de insumos.
 async function consultarStockInsumos(codigosArticulo) {
@@ -819,7 +863,9 @@ module.exports = {
     verificarArticulosSAP,
     sendSolicitudCompra,
     buscarProductosPorNombre,
+    buscarActivosFijos,
     getProveedores,
+    WHS_INSUMOS,
     obtenerProductosData,
     consultarStockPollo,
     consultarStockInsumos,
