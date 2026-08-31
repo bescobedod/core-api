@@ -157,6 +157,9 @@ async function updateUser(req, res) {
 // ------------------------------------------------------------
 // Obtiene usuarios filtrados por id_rol (ej. id_rol=1 para pilotos)
 // ------------------------------------------------------------
+const ROL_PILOTO_LEGACY = 5;
+const ROL_PILOTO_REAL = 1;
+
 async function getUsersByRol(req, res) {
     const { id_rol } = req.query;
 
@@ -164,9 +167,13 @@ async function getUsersByRol(req, res) {
         return res.status(400).json({ error: "El parámetro id_rol es requerido" });
     }
 
+    // El frontend de asignación de transporte todavía manda id_rol=5 (rol
+    // legado), pero los pilotos reales están marcados con id_rol=1 en PioApp.
+    const idRolBuscado = Number(id_rol) === ROL_PILOTO_LEGACY ? ROL_PILOTO_REAL : Number(id_rol);
+
     try {
         const usuarios = await UsersModel.findAll({
-            where: { id_rol: Number(id_rol) },
+            where: { id_rol: idRolBuscado },
             attributes: ['id_users', 'first_name', 'second_name', 'first_last_name', 'second_last_name', 'codigo_user', 'email']
         });
 
