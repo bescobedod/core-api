@@ -3,9 +3,9 @@ FROM node:20-alpine AS builder
 
 WORKDIR /app
 
-COPY package*.json ./
+COPY package.json pnpm-lock.yaml ./
 
-RUN npm ci --only=production
+RUN corepack enable && corepack pnpm install --prod --frozen-lockfile
 
 COPY . .
 
