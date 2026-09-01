@@ -11,6 +11,17 @@ const sapSessions = {
 };
 
 // ------------------------------------------------------------
+// Fecha de hoy en horario de Guatemala, formato YYYY-MM-DD. No usar
+// new Date().toISOString() para esto: el servidor corre en UTC, y entre
+// las 18:00 y 23:59 hora local esa fecha ya cae en el día siguiente, lo
+// que hace que SAP rechace el documento con "Posting date que sea igual
+// o anterior a la fecha del sistema".
+// ------------------------------------------------------------
+function fechaSapHoy() {
+    return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Guatemala' }).format(new Date());
+}
+
+// ------------------------------------------------------------
 // Conexión a la base de AVIGUA (pollo) — servidor/base distintos
 // a los de las demás empresas, por eso loginSAP acepta un baseUrl
 // aparte en vez de usar siempre process.env.SAP_URL.
@@ -209,9 +220,9 @@ async function sendSolicitudCompra(solicitud, empresa) {
         };
 
         const payload = {
-            DocDate: new Date().toISOString().split('T')[0],
+            DocDate: fechaSapHoy(),
             DocDueDate: solicitud.fecha_requerida,
-            TaxDate: new Date().toISOString().split('T')[0],
+            TaxDate: fechaSapHoy(),
             RequriedDate: solicitud.fecha_requerida,
             Comments: solicitud.justificacion,
             DocumentLines: solicitud.items.map(i => ({
@@ -636,9 +647,12 @@ async function buscarActivosFijos(req, res) {
     }
 }
 
-// Consulta el stock disponible en la bodega "01" para una lista de
-// códigos de artículo, en la base fija de insumos.
-async function consultarStockInsumos(codigosArticulo) {
+// Consulta el stock disponible en el WhsCode indicado (por defecto la
+// bodega fija "01") para una lista de códigos de artículo, en la base fija
+// de insumos. El segundo parámetro permite consultar otra bodega (por
+// ejemplo la bodega móvil de un camión) sin romper a quien ya la llama solo
+// con codigosArticulo.
+async function consultarStockInsumos(codigosArticulo, whsCode = WHS_INSUMOS) {
     const codigosUnicos = [...new Set((codigosArticulo || []).filter(Boolean))];
 
     if (codigosUnicos.length === 0) {
@@ -665,7 +679,7 @@ async function consultarStockInsumos(codigosArticulo) {
                 const response = await axios.get(url, { headers, httpsAgent: agent });
                 const item = response.data;
                 const infoBodega = (item.ItemWarehouseInfoCollection || [])
-                    .find(w => w.WarehouseCode === WHS_INSUMOS);
+                    .find(w => w.WarehouseCode === whsCode);
 
                 resultados.push({
                     codigo_articulo: item.ItemCode,
@@ -737,7 +751,7 @@ async function crearTransferenciaPollo({ fromWarehouse, toWarehouse, lineas, com
         };
 
         const payload = {
-            DocDate: new Date().toISOString().split('T')[0],
+            DocDate: fechaSapHoy(),
             FromWarehouse: fromWarehouse,
             ToWarehouse: toWarehouse,
             Comments: comentarios || undefined,
@@ -806,7 +820,7 @@ async function crearTransferenciaInsumos({ fromWarehouse, toWarehouse, lineas, c
         };
 
         const payload = {
-            DocDate: new Date().toISOString().split('T')[0],
+            DocDate: fechaSapHoy(),
             FromWarehouse: fromWarehouse,
             ToWarehouse: toWarehouse,
             Comments: comentarios || undefined,
@@ -856,6 +870,339 @@ async function crearTransferenciaInsumos({ fromWarehouse, toWarehouse, lineas, c
     }
 }
 
+// ------------------------------------------------------------
+// Crea la entrega (Deliveries) del camión al piloto, en AVIGUA. El piloto
+// se registra como el cliente (CardCode) de esa entrega — no hay tienda de
+// por medio, es el mismo botón "Entregar Producto" del camión completo.
+// lineas: [{ codigo_producto, cantidad }]
+// ------------------------------------------------------------
+async function crearEntregaPollo({ cardCode, whsCode, lineas, comentarios }) {
+    if (!cardCode || !whsCode) {
+        throw new Error('cardCode y whsCode son requeridos');
+    }
+
+    if (!lineas || lineas.length === 0) {
+        throw new Error('Se requiere al menos una línea para entregar');
+    }
+
+    const executeRequest = async () => {
+        const session = await getAviguaSession();
+        const headers = {
+            Cookie: `B1SESSION=${session.sessionId}; ROUTEID=${session.routeId}`,
+            'Content-Type': 'application/json'
+        };
+
+        const payload = {
+            CardCode: cardCode,
+            DocDate: fechaSapHoy(),
+            Comments: comentarios || undefined,
+            DocumentLines: lineas.map(l => ({
+                ItemCode: l.codigo_producto,
+                Quantity: Number(l.cantidad),
+                WarehouseCode: whsCode
+            }))
+        };
+
+        const url = `${SAP_AVIGUA_URL.replace(/\/$/, '')}/Deliveries`;
+        const response = await axios.post(url, payload, { headers, httpsAgent: agent });
+
+        return { DocEntry: response.data.DocEntry, DocNum: response.data.DocNum };
+    };
+
+    try {
+        return await executeRequest();
+    } catch (error) {
+        const isAuthError =
+            error.response?.status === 401 ||
+            error.response?.data?.error?.code === "301" ||
+            error.response?.data?.error?.code === "302" ||
+            error.response?.data?.error?.code === "206";
+
+        if (isAuthError) {
+            delete sapSessions.byEmpresa['avigua'];
+            return await executeRequest();
+        }
+
+        console.log("===== SAP AVIGUA ENTREGA ERROR =====");
+        console.log("STATUS:", error.response?.status);
+        console.log(JSON.stringify(error.response?.data, null, 2));
+
+        const sapErrorData = error.response?.data?.error;
+        const sapMessage =
+            typeof sapErrorData?.message === 'string'
+                ? sapErrorData.message
+                : sapErrorData?.message?.value;
+
+        const finalError = new Error(sapMessage || error.message);
+        finalError.sapCode = sapErrorData?.code;
+        finalError.sapStatus = error.response?.status;
+
+        throw finalError;
+    }
+}
+
+// Igual que crearEntregaPollo, pero en la base fija de insumos.
+async function crearEntregaInsumos({ cardCode, whsCode, lineas, comentarios }) {
+    if (!cardCode || !whsCode) {
+        throw new Error('cardCode y whsCode son requeridos');
+    }
+
+    if (!lineas || lineas.length === 0) {
+        throw new Error('Se requiere al menos una línea para entregar');
+    }
+
+    const executeRequest = async () => {
+        const session = await getInsumosSession();
+        const headers = {
+            Cookie: `B1SESSION=${session.sessionId}; ROUTEID=${session.routeId}`,
+            'Content-Type': 'application/json'
+        };
+
+        const payload = {
+            CardCode: cardCode,
+            DocDate: fechaSapHoy(),
+            Comments: comentarios || undefined,
+            DocumentLines: lineas.map(l => ({
+                ItemCode: l.codigo_producto,
+                Quantity: Number(l.cantidad),
+                WarehouseCode: whsCode
+            }))
+        };
+
+        const url = `${process.env.SAP_URL.replace(/\/$/, '')}/Deliveries`;
+        const response = await axios.post(url, payload, { headers, httpsAgent: agent });
+
+        return { DocEntry: response.data.DocEntry, DocNum: response.data.DocNum };
+    };
+
+    try {
+        return await executeRequest();
+    } catch (error) {
+        const isAuthError =
+            error.response?.status === 401 ||
+            error.response?.data?.error?.code === "301" ||
+            error.response?.data?.error?.code === "302" ||
+            error.response?.data?.error?.code === "206";
+
+        if (isAuthError) {
+            delete sapSessions.byEmpresa['insumos'];
+            return await executeRequest();
+        }
+
+        console.log("===== SAP INSUMOS ENTREGA ERROR =====");
+        console.log("STATUS:", error.response?.status);
+        console.log(JSON.stringify(error.response?.data, null, 2));
+
+        const sapErrorData = error.response?.data?.error;
+        const sapMessage =
+            typeof sapErrorData?.message === 'string'
+                ? sapErrorData.message
+                : sapErrorData?.message?.value;
+
+        const finalError = new Error(sapMessage || error.message);
+        finalError.sapCode = sapErrorData?.code;
+        finalError.sapStatus = error.response?.status;
+
+        throw finalError;
+    }
+}
+
+// ------------------------------------------------------------
+// Bodegas de cuarto frío (WhsCode que empieza con "CFR-") disponibles como
+// destino del botón "Trasladar a Cuarto Frío". A diferencia del inventario
+// completo, esto sí funciona con un solo $filter directo (startswith),
+// sin lambda ni $expand anidado — es el mismo tipo de filtro que ya usa
+// buscarActivosFijos más arriba, así que no debería toparse con la misma
+// limitación de Service Layer.
+// ------------------------------------------------------------
+async function obtenerBodegasCuartoFrioPollo() {
+    const executeRequest = async () => {
+        const session = await getAviguaSession();
+        const headers = {
+            Cookie: `B1SESSION=${session.sessionId}; ROUTEID=${session.routeId}`
+        };
+
+        const url = `${SAP_AVIGUA_URL.replace(/\/$/, '')}/Warehouses?` +
+            `$select=WarehouseCode,WarehouseName&` +
+            `$filter=startswith(WarehouseCode,'CFR-')`;
+
+        const response = await axios.get(url, { headers, httpsAgent: agent });
+        const bodegas = response.data.value || [];
+
+        return bodegas.map(b => ({ whs_code: b.WarehouseCode, nombre: b.WarehouseName }));
+    };
+
+    try {
+        return await executeRequest();
+    } catch (error) {
+        const isAuthError =
+            error.response?.status === 401 ||
+            error.response?.data?.error?.code === "301" ||
+            error.response?.data?.error?.code === "302" ||
+            error.response?.data?.error?.code === "206";
+
+        if (isAuthError) {
+            delete sapSessions.byEmpresa['avigua'];
+            return await executeRequest();
+        }
+
+        console.log("===== SAP AVIGUA BODEGAS CUARTO FRIO ERROR =====");
+        console.log("STATUS:", error.response?.status);
+        console.log(JSON.stringify(error.response?.data, null, 2));
+
+        const sapErrorData = error.response?.data?.error;
+        const sapMessage =
+            typeof sapErrorData?.message === 'string'
+                ? sapErrorData.message
+                : sapErrorData?.message?.value;
+
+        const finalError = new Error(sapMessage || error.message);
+        finalError.sapCode = sapErrorData?.code;
+        finalError.sapStatus = error.response?.status;
+
+        throw finalError;
+    }
+}
+
+// Igual que obtenerBodegasCuartoFrioPollo, pero en la base fija de insumos.
+async function obtenerBodegasCuartoFrioInsumos() {
+    const executeRequest = async () => {
+        const session = await getInsumosSession();
+        const headers = {
+            Cookie: `B1SESSION=${session.sessionId}; ROUTEID=${session.routeId}`
+        };
+
+        const url = `${process.env.SAP_URL.replace(/\/$/, '')}/Warehouses?` +
+            `$select=WarehouseCode,WarehouseName&` +
+            `$filter=startswith(WarehouseCode,'CFR-')`;
+
+        const response = await axios.get(url, { headers, httpsAgent: agent });
+        const bodegas = response.data.value || [];
+
+        return bodegas.map(b => ({ whs_code: b.WarehouseCode, nombre: b.WarehouseName }));
+    };
+
+    try {
+        return await executeRequest();
+    } catch (error) {
+        const isAuthError =
+            error.response?.status === 401 ||
+            error.response?.data?.error?.code === "301" ||
+            error.response?.data?.error?.code === "302" ||
+            error.response?.data?.error?.code === "206";
+
+        if (isAuthError) {
+            delete sapSessions.byEmpresa['insumos'];
+            return await executeRequest();
+        }
+
+        console.log("===== SAP INSUMOS BODEGAS CUARTO FRIO ERROR =====");
+        console.log("STATUS:", error.response?.status);
+        console.log(JSON.stringify(error.response?.data, null, 2));
+
+        const sapErrorData = error.response?.data?.error;
+        const sapMessage =
+            typeof sapErrorData?.message === 'string'
+                ? sapErrorData.message
+                : sapErrorData?.message?.value;
+
+        const finalError = new Error(sapMessage || error.message);
+        finalError.sapCode = sapErrorData?.code;
+        finalError.sapStatus = error.response?.status;
+
+        throw finalError;
+    }
+}
+
+// ------------------------------------------------------------
+// Busca clientes (CardType 'cCustomer') por nombre, en AVIGUA — para poder
+// asignarle a un piloto su CardCode en la vista de mantenimiento.
+// ------------------------------------------------------------
+async function buscarClientesPollo(query) {
+    const executeRequest = async () => {
+        const session = await getAviguaSession();
+        const headers = {
+            Cookie: `B1SESSION=${session.sessionId}; ROUTEID=${session.routeId}`
+        };
+
+        let filterQuery = "CardType eq 'cCustomer'";
+        if (query && query.trim().length > 0) {
+            const safeQuery = query.replace(/'/g, "''");
+            filterQuery += ` and contains(CardName,'${safeQuery}')`;
+        }
+
+        const url = `${SAP_AVIGUA_URL.replace(/\/$/, '')}/BusinessPartners?` +
+            `$select=CardCode,CardName&$filter=${filterQuery}&$top=20`;
+
+        const response = await axios.get(url, { headers, httpsAgent: agent });
+        return response.data.value || [];
+    };
+
+    try {
+        return await executeRequest();
+    } catch (error) {
+        const isAuthError =
+            error.response?.status === 401 ||
+            error.response?.data?.error?.code === "301" ||
+            error.response?.data?.error?.code === "302" ||
+            error.response?.data?.error?.code === "206";
+
+        if (isAuthError) {
+            delete sapSessions.byEmpresa['avigua'];
+            return await executeRequest();
+        }
+
+        const sapErrorData = error.response?.data?.error;
+        const sapMessage =
+            typeof sapErrorData?.message === 'string' ? sapErrorData.message : sapErrorData?.message?.value;
+
+        throw new Error(sapMessage || error.message);
+    }
+}
+
+// Igual que buscarClientesPollo, pero en la base fija de insumos.
+async function buscarClientesInsumos(query) {
+    const executeRequest = async () => {
+        const session = await getInsumosSession();
+        const headers = {
+            Cookie: `B1SESSION=${session.sessionId}; ROUTEID=${session.routeId}`
+        };
+
+        let filterQuery = "CardType eq 'cCustomer'";
+        if (query && query.trim().length > 0) {
+            const safeQuery = query.replace(/'/g, "''");
+            filterQuery += ` and contains(CardName,'${safeQuery}')`;
+        }
+
+        const url = `${process.env.SAP_URL.replace(/\/$/, '')}/BusinessPartners?` +
+            `$select=CardCode,CardName&$filter=${filterQuery}&$top=20`;
+
+        const response = await axios.get(url, { headers, httpsAgent: agent });
+        return response.data.value || [];
+    };
+
+    try {
+        return await executeRequest();
+    } catch (error) {
+        const isAuthError =
+            error.response?.status === 401 ||
+            error.response?.data?.error?.code === "301" ||
+            error.response?.data?.error?.code === "302" ||
+            error.response?.data?.error?.code === "206";
+
+        if (isAuthError) {
+            delete sapSessions.byEmpresa['insumos'];
+            return await executeRequest();
+        }
+
+        const sapErrorData = error.response?.data?.error;
+        const sapMessage =
+            typeof sapErrorData?.message === 'string' ? sapErrorData.message : sapErrorData?.message?.value;
+
+        throw new Error(sapMessage || error.message);
+    }
+}
+
 module.exports = {
     loginSAP,
     loginSAPGlobal,
@@ -870,5 +1217,11 @@ module.exports = {
     consultarStockPollo,
     consultarStockInsumos,
     crearTransferenciaPollo,
-    crearTransferenciaInsumos
+    crearTransferenciaInsumos,
+    obtenerBodegasCuartoFrioPollo,
+    obtenerBodegasCuartoFrioInsumos,
+    buscarClientesPollo,
+    buscarClientesInsumos,
+    crearEntregaPollo,
+    crearEntregaInsumos
 };
