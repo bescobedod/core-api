@@ -524,10 +524,21 @@ async function consultarStockPollo(codigosArticulo, whsCode) {
                 const infoBodega = (item.ItemWarehouseInfoCollection || [])
                     .find(w => w.WarehouseCode === whsCode);
 
+                // InStock viene en la Unidad de Inventario (ej. Libra), no en la
+                // Unidad de Venta (ej. Bolsa) — se calcula cuántas bolsas
+                // completas hay usando SalesItemsPerUnit como factor de
+                // conversión, para no comparar libras contra bolsas.
+                const stockDisponible = infoBodega ? infoBodega.InStock : 0;
+                const salesItemsPerUnit = item.SalesItemsPerUnit || 1;
+                const bolsasCompletas = Math.floor(stockDisponible / salesItemsPerUnit);
+
                 resultados.push({
                     codigo_articulo: item.ItemCode,
                     nombre_articulo: item.ItemName,
-                    stock_disponible: infoBodega ? infoBodega.InStock : 0
+                    stock_disponible: stockDisponible,
+                    unidad_venta: item.SalesUnit,
+                    sales_items_per_unit: salesItemsPerUnit,
+                    bolsas_completas: bolsasCompletas
                 });
             } catch (err) {
                 if (err.response?.status === 404) {
