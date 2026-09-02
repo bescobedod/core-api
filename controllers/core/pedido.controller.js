@@ -1104,7 +1104,7 @@ async function getComparativoStockPollo(req, res) {
         const comparativo = totales.map(t => {
             const stock = t.codigo_producto ? stockMap.get(t.codigo_producto) : null;
             const cantidadSolicitada = Number(t.cantidad_solicitada_total);
-            const stockDisponible = stock ? Number(stock.stock_disponible) : 0;
+            const stockDisponible = stock ? Number(stock.bolsas_completas ?? stock.stock_disponible) : 0;
 
             return {
                 codigo_producto: t.codigo_producto,
@@ -1188,7 +1188,7 @@ async function getComparativoStockInsumos(req, res) {
         const comparativo = totales.map(t => {
             const stock = t.codigo_producto ? stockMap.get(t.codigo_producto) : null;
             const cantidadSolicitada = Number(t.cantidad_solicitada_total);
-            const stockDisponible = stock ? Number(stock.stock_disponible) : 0;
+            const stockDisponible = stock ? Number(stock.bolsas_completas ?? stock.stock_disponible) : 0;
 
             return {
                 codigo_producto: t.codigo_producto,
