@@ -955,22 +955,11 @@ async function getAsignacionesTransporte(req, res) {
 }
 
 // ------------------------------------------------------------
-// POST: asigna (crea o actualiza) camión + piloto para una ruta en una
-// fecha específica. Las constraints UNIQUE de tbl_despacho_ruta evitan que
-// se repita el mismo camión o piloto en otra ruta ese mismo día.
-// Además propaga camion/piloto a todos los pedidos de esa ruta+fecha.
+// Upsert de tbl_despacho_ruta + propagación a tbl_pedidos_pos_cabecera.
+// Compartido por asignarTransporte (sin restricción de estado, para la
+// asignación inicial) y trasladarPiloto (solo con la ruta EN_TRANSITO).
 // ------------------------------------------------------------
-async function asignarTransporte(req, res) {
-    const { ruta_id, fecha, camion_id, piloto_id } = req.body;
-    const usuario_asigno = (req.user && (req.user.nombre || req.user.id_usuario)) || null;
-
-    if (!ruta_id || !fecha || !camion_id || !piloto_id) {
-        return res.status(400).json({
-            error: 'ruta_id, fecha, camion_id y piloto_id son requeridos',
-            success: false
-        });
-    }
-
+async function actualizarTransporte({ ruta_id, fecha, camion_id, piloto_id, usuario_asigno }) {
     const sequelizeCore = await sequelizeInit.sequelizeInit('CORE');
     const t = await sequelizeCore.transaction();
 
@@ -1025,25 +1014,96 @@ async function asignarTransporte(req, res) {
 
         await t.commit();
 
-        return res.json({ success: true, asignacion });
+        return asignacion;
     } catch (error) {
         await t.rollback();
+        throw error;
+    }
+}
 
-        if (error.name === 'SequelizeUniqueConstraintError') {
-            const campo = (error.errors && error.errors[0] && error.errors[0].path) || '';
-            let mensaje = 'Ese camión o piloto ya está asignado a otra ruta este día';
+function mapearErrorTransporte(error) {
+    if (error.name === 'SequelizeUniqueConstraintError') {
+        const campo = (error.errors && error.errors[0] && error.errors[0].path) || '';
+        let mensaje = 'Ese camión o piloto ya está asignado a otra ruta este día';
 
-            if (campo.includes('camion')) mensaje = 'Ese camión ya está asignado a otra ruta este día';
-            if (campo.includes('piloto')) mensaje = 'Ese piloto ya está asignado a otra ruta este día';
+        if (campo.includes('camion')) mensaje = 'Ese camión ya está asignado a otra ruta este día';
+        if (campo.includes('piloto')) mensaje = 'Ese piloto ya está asignado a otra ruta este día';
 
-            return res.status(409).json({ error: mensaje, success: false });
-        }
+        return { status: 409, mensaje };
+    }
 
-        return res.status(500).json({
-            error: 'Error al asignar transporte',
-            details: error.message,
+    return { status: 500, mensaje: 'Error al asignar transporte', details: error.message };
+}
+
+// ------------------------------------------------------------
+// POST: asigna (crea o actualiza) camión + piloto para una ruta en una
+// fecha específica. Las constraints UNIQUE de tbl_despacho_ruta evitan que
+// se repita el mismo camión o piloto en otra ruta ese mismo día.
+// Además propaga camion/piloto a todos los pedidos de esa ruta+fecha.
+// ------------------------------------------------------------
+async function asignarTransporte(req, res) {
+    const { ruta_id, fecha, camion_id, piloto_id } = req.body;
+    const usuario_asigno = (req.user && (req.user.nombre || req.user.id_usuario)) || null;
+
+    if (!ruta_id || !fecha || !camion_id || !piloto_id) {
+        return res.status(400).json({
+            error: 'ruta_id, fecha, camion_id y piloto_id son requeridos',
             success: false
         });
+    }
+
+    try {
+        const asignacion = await actualizarTransporte({ ruta_id, fecha, camion_id, piloto_id, usuario_asigno });
+        return res.json({ success: true, asignacion });
+    } catch (error) {
+        const { status, mensaje, details } = mapearErrorTransporte(error);
+        return res.status(status).json({ error: mensaje, details, success: false });
+    }
+}
+
+// ------------------------------------------------------------
+// POST: "Trasladar Envío" — cambia el piloto/camión de una ruta que ya
+// está en camino, sin tocar nada más (mismo efecto que asignarTransporte,
+// misma tabla). Solo se permite mientras TODOS los pedidos de esa
+// ruta+fecha sigan en EN_TRANSITO — si alguno ya fue confirmado como
+// recibido por la tienda (RECIBIDO/RECIBIDO_PARCIAL, lo pone la app móvil
+// aparte), ya no se puede cambiar el piloto retroactivamente.
+// ------------------------------------------------------------
+async function trasladarPiloto(req, res) {
+    const { ruta_id, fecha, camion_id, piloto_id } = req.body;
+    const usuario_asigno = (req.user && (req.user.nombre || req.user.id_usuario)) || null;
+
+    if (!ruta_id || !fecha || !camion_id || !piloto_id) {
+        return res.status(400).json({
+            error: 'ruta_id, fecha, camion_id y piloto_id son requeridos',
+            success: false
+        });
+    }
+
+    try {
+        const cabeceras = await PedidoPosCabeceraModel.findAll({
+            where: { ruta_id, fecha_requerida: fecha },
+            attributes: ['estado']
+        });
+
+        if (cabeceras.length === 0) {
+            return res.status(404).json({ error: 'No hay pedidos para esa ruta y fecha', success: false });
+        }
+
+        const estadosUnicos = [...new Set(cabeceras.map(c => c.estado))];
+
+        if (estadosUnicos.length !== 1 || estadosUnicos[0] !== 'EN_TRANSITO') {
+            return res.status(409).json({
+                error: 'Solo se puede trasladar el piloto mientras el envío está en tránsito — ya hay tiendas con la entrega confirmada',
+                success: false
+            });
+        }
+
+        const asignacion = await actualizarTransporte({ ruta_id, fecha, camion_id, piloto_id, usuario_asigno });
+        return res.json({ success: true, asignacion });
+    } catch (error) {
+        const { status, mensaje, details } = mapearErrorTransporte(error);
+        return res.status(status).json({ error: mensaje, details, success: false });
     }
 }
 
@@ -1373,9 +1433,17 @@ async function enviarTransferenciaPollo(req, res) {
             });
         }
 
+        // cantidad_asignada está en bolsas (Unidad de Venta), pero el
+        // StockTransfer de SAP se mueve en la Unidad de Inventario (libras)
+        // — se reconsulta SAP (no se confía en un factor guardado) para
+        // convertir cada línea antes de crear la transferencia.
+        const codigosDetalle = lineasDetalle.map(l => l.codigo_producto);
+        const stockInfo = await consultarStockPollo(codigosDetalle, ruta.whs_code_origen);
+        const factorPorCodigo = new Map(stockInfo.map(s => [s.codigo_articulo, s.sales_items_per_unit || 1]));
+
         const lineasSap = lineasDetalle.map(l => ({
             codigo_producto: l.codigo_producto,
-            cantidad: Number(l.cantidad_total)
+            cantidad: Number(l.cantidad_total) * (factorPorCodigo.get(l.codigo_producto) || 1)
         }));
 
         const cabecerasAfectadas = await PedidoPosCabeceraModel.findAll({
@@ -1525,9 +1593,17 @@ async function enviarTransferenciaInsumos(req, res) {
             });
         }
 
+        // cantidad_asignada está en bolsas (Unidad de Venta), pero el
+        // StockTransfer de SAP se mueve en la Unidad de Inventario — se
+        // reconsulta SAP (no se confía en un factor guardado) para
+        // convertir cada línea antes de crear la transferencia.
+        const codigosDetalle = lineasDetalle.map(l => l.codigo_producto);
+        const stockInfo = await consultarStockInsumos(codigosDetalle, ruta.whs_code_origen);
+        const factorPorCodigo = new Map(stockInfo.map(s => [s.codigo_articulo, s.sales_items_per_unit || 1]));
+
         const lineasSap = lineasDetalle.map(l => ({
             codigo_producto: l.codigo_producto,
-            cantidad: Number(l.cantidad_total)
+            cantidad: Number(l.cantidad_total) * (factorPorCodigo.get(l.codigo_producto) || 1)
         }));
 
         const cabecerasAfectadas = await PedidoPosCabeceraModel.findAll({
@@ -2145,6 +2221,7 @@ module.exports = {
     getPedidosPos,
     getAsignacionesTransporte,
     asignarTransporte,
+    trasladarPiloto,
     getComparativoStockPollo,
     getComparativoStockInsumos,
     enviarTransferenciaPollo,

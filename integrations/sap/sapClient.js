@@ -692,10 +692,20 @@ async function consultarStockInsumos(codigosArticulo, whsCode = WHS_INSUMOS) {
                 const infoBodega = (item.ItemWarehouseInfoCollection || [])
                     .find(w => w.WarehouseCode === whsCode);
 
+                // Igual que en POLLO: InStock viene en la Unidad de Inventario,
+                // no en la Unidad de Venta — se calcula cuántas unidades de
+                // venta completas hay usando SalesItemsPerUnit.
+                const stockDisponible = infoBodega ? infoBodega.InStock : 0;
+                const salesItemsPerUnit = item.SalesItemsPerUnit || 1;
+                const bolsasCompletas = Math.floor(stockDisponible / salesItemsPerUnit);
+
                 resultados.push({
                     codigo_articulo: item.ItemCode,
                     nombre_articulo: item.ItemName,
-                    stock_disponible: infoBodega ? infoBodega.InStock : 0
+                    stock_disponible: stockDisponible,
+                    unidad_venta: item.SalesUnit,
+                    sales_items_per_unit: salesItemsPerUnit,
+                    bolsas_completas: bolsasCompletas
                 });
             } catch (err) {
                 if (err.response?.status === 404) {
