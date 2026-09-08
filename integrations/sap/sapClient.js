@@ -614,8 +614,10 @@ async function getInsumosSession() {
     return session;
 }
 
-// Busca artículos de activo fijo (prefijo "UC" en ItemCode) por nombre,
-// en la misma base fija de insumos. Usada por Pedidos de Activos Fijos.
+// Busca artículos de activo fijo (prefijos "UL"/"UC"/"UA" en ItemCode) por
+// nombre, en la misma base fija de insumos. Usada por Pedidos de Activos Fijos.
+const PREFIJOS_ACTIVO_FIJO = ['UL', 'UC', 'UA', 'RA', 'PR', 'PU'];
+
 async function buscarActivosFijos(req, res) {
     const { page = 1, query } = req.query;
 
@@ -633,10 +635,13 @@ async function buscarActivosFijos(req, res) {
         };
 
         const safeQuery = query.replace(/'/g, "''");
+        const filtroPrefijos = PREFIJOS_ACTIVO_FIJO
+            .map(p => `startswith(ItemCode,'${p}')`)
+            .join(' or ');
 
         const url = `${process.env.SAP_URL.replace(/\/$/, '')}/Items?` +
             `$select=ItemCode,ItemName&` +
-            `$filter=startswith(ItemCode,'UC') and contains(ItemName,'${safeQuery}')&` +
+            `$filter=(${filtroPrefijos}) and contains(ItemName,'${safeQuery}')&` +
             `$top=${pageSize}&$skip=${skip}&$count=true`;
 
         const response = await axios.get(url, { headers, httpsAgent: agent });
@@ -805,6 +810,7 @@ async function crearTransferenciaPollo({ fromWarehouse, toWarehouse, lineas, com
         }
 
         console.log("===== SAP AVIGUA TRANSFERENCIA ERROR =====");
+        console.log(process.env.SAP_AVIGUA_BD)
         console.log("STATUS:", error.response?.status);
         console.log(JSON.stringify(error.response?.data, null, 2));
 
