@@ -19,6 +19,12 @@ const camiones = require('../controllers/core/camion.controller.js');
 const rutasPollo = require('../controllers/core/ruta_pollo.controller.js');
 const rutasInsumos = require('../controllers/core/ruta_insumo.controller.js');
 const vales = require('../controllers/core/vales_combustible.controller.js');
+const camionesRuta = require('../controllers/core/camion_ruta.controller.js');
+const notificacionDestinatarios = require('../controllers/core/notificacion_destinatario.controller.js');
+const notificacionContextos = require('../controllers/core/notificacion_contexto.controller.js');
+const pilotoClienteSap = require('../controllers/core/piloto_cliente_sap.controller.js');
+const roles = require('../controllers/core/rol.controller.js');
+const usuarioMuellePollo = require('../controllers/core/usuario_muelle_pollo.controller.js');
 const auth = require('../middlewares/auth.js');
 const upload = require('../middlewares/upload.js');
 const rateLimit = require('express-rate-limit');
@@ -48,6 +54,17 @@ router.get('/cootragua/getAllEmpleadosCootragua', cootragua.getAllEmpleadosCootr
 //MENUS
 router.get('/menus/getAllMenus', auth, menus.getAllMenus);
 router.get('/menus/getPermiso', auth, menus.getPermiso);
+router.get('/menus/getAllMenusAdmin', auth, menus.getAllMenusAdmin);
+router.post('/menus/crearMenu', auth, menus.crearMenu);
+router.put('/menus/actualizarVisibilidad/:id', auth, menus.actualizarVisibilidadMenu);
+router.get('/menus/getRolesDeMenu', auth, menus.getRolesDeMenu);
+router.post('/menus/asignarRolAMenu', auth, menus.asignarRolAMenu);
+router.delete('/menus/quitarRolDeMenu/:id', auth, menus.quitarRolDeMenu);
+router.get('/roles/getAllRoles', auth, roles.getAllRoles);
+router.get('/usuario-muelle-pollo/getUsuariosPorMuelle', auth, usuarioMuellePollo.getUsuariosPorMuelle);
+router.get('/usuario-muelle-pollo/buscarUsuarios', auth, usuarioMuellePollo.buscarUsuarios);
+router.post('/usuario-muelle-pollo/asignarMuelle', auth, usuarioMuellePollo.asignarMuelle);
+router.delete('/usuario-muelle-pollo/quitarMuelle/:id_usuario', auth, usuarioMuellePollo.quitarMuelle);
 
 //PEDIDOS-ENVIOS
 router.get('/pedido/getAllTipoPedidoEnvio', tiposPedidoEnvio.getAllTipoPedidoEnvio);
@@ -71,8 +88,10 @@ router.post('/pedido/enviarTransferenciaPollo', auth, pedidos.enviarTransferenci
 router.post('/pedido/enviarTransferenciaInsumos', auth, pedidos.enviarTransferenciaInsumos)
 router.get('/pedido/generarTicketPollo', auth, pedidos.generarTicketPollo)
 router.get('/pedido/generarTicketInsumos', auth, pedidos.generarTicketInsumos)
+router.get('/pedido/generarResumenRutaInsumos', auth, pedidos.generarResumenRutaInsumos)
 router.get('/pedido/getAsignacionesTransporte', auth, pedidos.getAsignacionesTransporte)
 router.post('/pedido/asignarTransporte', auth, pedidos.asignarTransporte)
+router.post('/pedido/trasladarPiloto', auth, pedidos.trasladarPiloto)
 router.post('/pedido/firmarTicketPollo', auth, pedidos.firmarTicketPollo)
 router.post('/pedido/firmarTicketInsumos', auth, pedidos.firmarTicketInsumos)
 
@@ -173,5 +192,28 @@ router.post('/rutaInsumos/liberarCandado', auth, rutasInsumos.liberarCandadoInsu
 
 //VALES DE COMBUSTIBLE
 router.get('/vale/getValesCombustible', auth, vales.getValesCombustible)
+
+//CAMIONES EN RUTA
+router.get('/camionesRuta/getRutasActivas', auth, camionesRuta.getRutasActivas);
+router.get('/camionesRuta/getInventarioCamion', auth, camionesRuta.getInventarioCamion);
+router.get('/camionesRuta/getDetalleTiendas', auth, camionesRuta.getDetalleTiendas);
+router.get('/camionesRuta/getBodegasCuartoFrio', auth, camionesRuta.getBodegasCuartoFrio);
+router.post('/camionesRuta/trasladarACuartoFrio', auth, camionesRuta.trasladarACuartoFrio);
+router.get('/camionesRuta/getTrasladosCuartoFrio', auth, camionesRuta.getTrasladosCuartoFrio);
+router.post('/camionesRuta/entregarProducto', auth, camionesRuta.entregarProducto);
+router.get('/camionesRuta/getEntregasProducto', auth, camionesRuta.getEntregasProducto);
+
+//DESTINATARIOS DE NOTIFICACIONES
+router.get('/notificaciones/getDestinatarios', auth, notificacionDestinatarios.getDestinatarios);
+router.post('/notificaciones/crearDestinatario', auth, notificacionDestinatarios.crearDestinatario);
+router.put('/notificaciones/actualizarDestinatario/:id', auth, notificacionDestinatarios.actualizarDestinatario);
+router.delete('/notificaciones/eliminarDestinatario/:id', auth, notificacionDestinatarios.eliminarDestinatario);
+router.get('/notificaciones/getContextos', auth, notificacionContextos.getContextos);
+router.post('/notificaciones/crearContexto', auth, notificacionContextos.crearContexto);
+
+//PILOTO - CLIENTE SAP
+router.get('/pilotoClienteSap/getPilotos', auth, pilotoClienteSap.getPilotos);
+router.post('/pilotoClienteSap/asignarClienteSap', auth, pilotoClienteSap.asignarClienteSap);
+router.get('/pilotoClienteSap/buscarClientes', auth, pilotoClienteSap.buscarClientes);
 
 module.exports = router

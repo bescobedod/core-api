@@ -537,6 +537,7 @@ async function consultarStockPollo(codigosArticulo, whsCode) {
                     nombre_articulo: item.ItemName,
                     stock_disponible: stockDisponible,
                     unidad_venta: item.SalesUnit,
+                    unidad_inventario: item.InventoryUOM || null,
                     sales_items_per_unit: salesItemsPerUnit,
                     bolsas_completas: bolsasCompletas
                 });
@@ -709,6 +710,7 @@ async function consultarStockInsumos(codigosArticulo, whsCode = WHS_INSUMOS) {
                     nombre_articulo: item.ItemName,
                     stock_disponible: stockDisponible,
                     unidad_venta: item.SalesUnit,
+                    unidad_inventario: item.InventoryUOM || null,
                     sales_items_per_unit: salesItemsPerUnit,
                     bolsas_completas: bolsasCompletas
                 });

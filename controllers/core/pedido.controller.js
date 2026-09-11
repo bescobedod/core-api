@@ -208,6 +208,16 @@ async function crearPedidoActivoFijo(req, res) {
         const ruta_id = asignacionRuta?.ruta?.id || null;
         const nombre_ruta = asignacionRuta?.ruta?.nombre_ruta || null;
 
+        // El código de tienda que usan los pedidos de Insumos/Pollo (los que
+        // vienen del archivo/middleware Simphony) es el StoreNumberSimphony
+        // de tTienda, no el código interno de PDV que manda el frontend acá
+        // — hay que guardar el mismo valor, si no getPedidosPos no logra
+        // fusionar en una sola tarjeta los pedidos de la misma tienda.
+        const sequelizePdv = await sequelizeInit.sequelizeInit('PDV');
+        const TiendaPdvModel = initTiendaModel(sequelizePdv);
+        const tiendaPdv = await TiendaPdvModel.findOne({ where: { idTienda: id_tienda } });
+        const codigoTiendaSimphony = tiendaPdv?.StoreNumberSimphony || codigo_tienda || String(id_tienda);
+
         const [{ nextval }] = await sequelizeCore.query(
             "SELECT nextval('logistica.seq_pedido_activo_fijo') as nextval",
             { type: QueryTypes.SELECT, transaction: t }
@@ -219,7 +229,7 @@ async function crearPedidoActivoFijo(req, res) {
 
         const cabecera = await PedidoPosCabeceraModel.create({
             codigo_empresa: codigo_empresa || null,
-            codigo_tienda: codigo_tienda || String(id_tienda),
+            codigo_tienda: codigoTiendaSimphony,
             numero_pedido,
             fecha_pedido: hoy,
             fecha_requerida,
@@ -293,7 +303,16 @@ async function buscarPedidosActivoFijo(req, res) {
         return res.status(400).json({ error: 'codigo_tienda es requerido', success: false });
     }
 
-    const whereCabecera = { tipo_pedido: 'ACTIVO_FIJO', codigo_tienda };
+    // El selector de tienda del frontend manda el código interno de PDV
+    // (vwTiendasModulo.codigo_tienda), pero los pedidos ya se guardan con el
+    // StoreNumberSimphony (ver crearPedidoActivoFijo) — hay que traducirlo
+    // antes de buscar, si no, no encuentra nada.
+    const sequelizePdv = await sequelizeInit.sequelizeInit('PDV');
+    const TiendaPdvModel = initTiendaModel(sequelizePdv);
+    const tiendaPdv = await TiendaPdvModel.findOne({ where: { tienda: codigo_tienda } });
+    const codigoTiendaSimphony = tiendaPdv?.StoreNumberSimphony || codigo_tienda;
+
+    const whereCabecera = { tipo_pedido: 'ACTIVO_FIJO', codigo_tienda: codigoTiendaSimphony };
 
     if (fecha) {
         whereCabecera.fecha_requerida = fecha;
@@ -2037,6 +2056,221 @@ async function generarTicketInsumos(req, res) {
 }
 
 // ------------------------------------------------------------
+// GET: PDF con el detalle de cantidad_asignada por artículo x tienda de
+// una ruta+fecha de Insumos (Insumos + Activo Fijo fusionados, igual que
+// el resto del flujo). A diferencia del ticket, no exige EN_TRANSITO — se
+// puede generar antes de enviar a SAP (con lo ya asignado en el Paso 1) y
+// después también, sin cambios en el criterio.
+// ------------------------------------------------------------
+async function generarResumenRutaInsumos(req, res) {
+    const { ruta_id, fecha } = req.query;
+
+    if (!ruta_id || !fecha) {
+        return res.status(400).json({ error: 'ruta_id y fecha son requeridos', success: false });
+    }
+
+    try {
+        const ruta = await CatalogoRutaInsumosModel.findByPk(ruta_id);
+
+        if (!ruta) {
+            return res.status(404).json({ error: 'Ruta no encontrada', success: false });
+        }
+
+        const cabeceras = await PedidoPosCabeceraModel.findAll({
+            where: { tipo_pedido: { [Op.in]: TIPOS_INSUMOS_Y_ACTIVO_FIJO }, fecha_requerida: fecha, ruta_id },
+            attributes: ['id', 'codigo_tienda', 'nombre_tienda', 'estado']
+        });
+
+        if (cabeceras.length === 0) {
+            return res.status(404).json({ error: 'No hay pedidos para esta ruta y fecha', success: false });
+        }
+
+        // Una tienda puede tener dos cabeceras (Insumos + Activo Fijo) — se
+        // fusionan en una sola columna por codigo_tienda, igual que hace
+        // getPedidosPos al mostrarlas juntas en una tarjeta.
+        const tiendasPorCodigo = new Map();
+        for (const c of cabeceras) {
+            if (!tiendasPorCodigo.has(c.codigo_tienda)) {
+                tiendasPorCodigo.set(c.codigo_tienda, {
+                    codigo_tienda: c.codigo_tienda,
+                    nombre_tienda: c.nombre_tienda || c.codigo_tienda,
+                    pedidoIds: []
+                });
+            }
+            tiendasPorCodigo.get(c.codigo_tienda).pedidoIds.push(c.id);
+        }
+
+        const tiendas = [...tiendasPorCodigo.values()]
+            .sort((a, b) => (a.nombre_tienda || '').localeCompare(b.nombre_tienda || ''));
+
+        const pedidoATienda = new Map();
+        for (const info of tiendasPorCodigo.values()) {
+            for (const pid of info.pedidoIds) pedidoATienda.set(pid, info.codigo_tienda);
+        }
+
+        const idsPedidos = cabeceras.map(c => c.id);
+        const detalles = await PedidoPosDetalleModel.findAll({
+            where: { pedido_id: { [Op.in]: idsPedidos }, cantidad_asignada: { [Op.gt]: 0 } },
+            attributes: ['pedido_id', 'codigo_producto', 'descripcion_producto', 'unidad_medida', 'cantidad_asignada']
+        });
+
+        const articulosPorCodigo = new Map();
+        for (const d of detalles) {
+            const codigoTienda = pedidoATienda.get(d.pedido_id);
+            if (!codigoTienda) continue;
+
+            if (!articulosPorCodigo.has(d.codigo_producto)) {
+                articulosPorCodigo.set(d.codigo_producto, {
+                    codigo_producto: d.codigo_producto,
+                    nombre_producto: d.descripcion_producto,
+                    unidad_medida: d.unidad_medida || 'UND',
+                    cantidadPorTienda: new Map()
+                });
+            }
+
+            const articulo = articulosPorCodigo.get(d.codigo_producto);
+            const actual = articulo.cantidadPorTienda.get(codigoTienda) || 0;
+            articulo.cantidadPorTienda.set(codigoTienda, actual + Number(d.cantidad_asignada));
+        }
+
+        const articulos = [...articulosPorCodigo.values()]
+            .sort((a, b) => (a.codigo_producto || '').localeCompare(b.codigo_producto || ''));
+
+        if (articulos.length === 0) {
+            return res.status(400).json({
+                error: 'No hay artículos con cantidad asignada para esta ruta. Primero calcula el stock y guarda la asignación.',
+                success: false
+            });
+        }
+
+        const yaEnviada = cabeceras.some(c => ['EN_TRANSITO', 'ENTREGADO', 'ENTREGADO_PARCIAL'].includes(c.estado));
+
+        construirPdfResumenRuta(res, {
+            nombreRuta: ruta.nombre_ruta,
+            fecha,
+            preliminar: !yaEnviada,
+            tiendas,
+            articulos,
+            nombreArchivo: `resumen_ruta_insumos_${ruta.nombre_ruta || ruta_id}_${fecha}.pdf`
+        });
+    } catch (error) {
+        return res.status(500).json({
+            error: 'Error al generar el resumen de ruta',
+            details: error.message,
+            success: false
+        });
+    }
+}
+
+// ------------------------------------------------------------
+// Dibuja el PDF de generarResumenRutaInsumos: una tabla en horizontal con
+// un artículo por fila y una tienda por columna (más una columna de
+// Total). Si hay más tiendas de las que caben legibles en una página, se
+// reparten en grupos y cada grupo arranca en una página nueva, repitiendo
+// el encabezado — el total de cada fila siempre suma TODAS las tiendas,
+// no solo las del grupo que se esté mostrando en esa página.
+// ------------------------------------------------------------
+function construirPdfResumenRuta(res, { nombreRuta, fecha, preliminar, tiendas, articulos, nombreArchivo }) {
+    const doc = new PDFDocument({ margin: 30, size: 'LETTER', layout: 'landscape' });
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${nombreArchivo}"`);
+    doc.pipe(res);
+
+    const anchoCodigo = 50;
+    const anchoNombre = 150;
+    const anchoUnidad = 65;
+    const anchoTotal = 45;
+    const anchoFijo = anchoCodigo + anchoNombre + anchoUnidad;
+    const MAX_TIENDAS_POR_PAGINA = 12;
+
+    const grupos = [];
+    for (let i = 0; i < tiendas.length; i += MAX_TIENDAS_POR_PAGINA) {
+        grupos.push(tiendas.slice(i, i + MAX_TIENDAS_POR_PAGINA));
+    }
+    if (grupos.length === 0) grupos.push([]);
+
+    const anchoDisponibleTiendas = doc.page.width - doc.page.margins.left - doc.page.margins.right - anchoFijo - anchoTotal;
+    const startX = doc.page.margins.left;
+
+    const dibujarEncabezado = (grupoTiendas) => {
+        doc.fontSize(14).font('Helvetica-Bold').text(`Resumen de Ruta${preliminar ? ' (Preliminar)' : ''}`, { align: 'center' });
+        doc.fontSize(9).font('Helvetica').fillColor('#555555')
+            .text(`Fecha Entrega: ${fecha}    Ruta: ${nombreRuta || '—'}`, { align: 'center' });
+        doc.fillColor('#000000');
+        doc.moveDown(0.6);
+
+        const anchoTienda = grupoTiendas.length > 0 ? anchoDisponibleTiendas / grupoTiendas.length : anchoDisponibleTiendas;
+        const colCodigo = startX;
+        const colNombre = colCodigo + anchoCodigo;
+        const colUnidad = colNombre + anchoNombre;
+        const colsTiendas = grupoTiendas.map((_, i) => colUnidad + anchoUnidad + i * anchoTienda);
+        const colTotal = colUnidad + anchoUnidad + grupoTiendas.length * anchoTienda;
+
+        const yEncabezado = doc.y;
+        doc.font('Helvetica-Bold').fontSize(8);
+        doc.text('Código', colCodigo, yEncabezado, { width: anchoCodigo });
+        doc.text('Nombre', colNombre, yEncabezado, { width: anchoNombre });
+        doc.text('Unidad', colUnidad, yEncabezado, { width: anchoUnidad });
+        grupoTiendas.forEach((t, i) => {
+            doc.text(t.nombre_tienda, colsTiendas[i], yEncabezado, { width: anchoTienda, align: 'center' });
+        });
+        doc.text('Total', colTotal, yEncabezado, { width: anchoTotal, align: 'center' });
+
+        const alturaEncabezado = Math.max(
+            10,
+            ...grupoTiendas.map(t => doc.heightOfString(t.nombre_tienda, { width: anchoTienda }))
+        );
+        doc.y = yEncabezado + alturaEncabezado + 4;
+        doc.moveTo(startX, doc.y).lineTo(colTotal + anchoTotal, doc.y).strokeColor('#999999').stroke();
+        doc.moveDown(0.3);
+
+        return { colCodigo, colNombre, colUnidad, colsTiendas, colTotal, anchoTienda };
+    };
+
+    grupos.forEach((grupoTiendas, indiceGrupo) => {
+        if (indiceGrupo > 0) doc.addPage();
+
+        let cols = dibujarEncabezado(grupoTiendas);
+        doc.font('Helvetica').fontSize(8);
+
+        articulos.forEach(articulo => {
+            if (doc.y > doc.page.height - doc.page.margins.bottom - 20) {
+                doc.addPage();
+                cols = dibujarEncabezado(grupoTiendas);
+                doc.font('Helvetica').fontSize(8);
+            }
+
+            const y = doc.y;
+            const total = [...articulo.cantidadPorTienda.values()].reduce((a, b) => a + b, 0);
+
+            const alturaFila = Math.max(
+                10,
+                doc.heightOfString(articulo.codigo_producto || '—', { width: anchoCodigo }),
+                doc.heightOfString(articulo.nombre_producto || '—', { width: anchoNombre }),
+                doc.heightOfString(articulo.unidad_medida || '—', { width: anchoUnidad })
+            );
+
+            doc.text(articulo.codigo_producto || '—', cols.colCodigo, y, { width: anchoCodigo });
+            doc.text(articulo.nombre_producto || '—', cols.colNombre, y, { width: anchoNombre });
+            doc.text(articulo.unidad_medida || '—', cols.colUnidad, y, { width: anchoUnidad });
+
+            grupoTiendas.forEach((t, i) => {
+                const cantidad = articulo.cantidadPorTienda.get(t.codigo_tienda) || 0;
+                doc.text(String(cantidad), cols.colsTiendas[i], y, { width: cols.anchoTienda, align: 'center' });
+            });
+
+            doc.font('Helvetica-Bold').text(String(total), cols.colTotal, y, { width: anchoTotal, align: 'center' });
+            doc.font('Helvetica');
+
+            doc.y = y + alturaFila + 4;
+        });
+    });
+
+    doc.end();
+}
+
+// ------------------------------------------------------------
 // Arma el snapshot de líneas (por artículo, sumando entre tiendas) para
 // guardar en el ticket. Mismo criterio que usa el PDF y la transferencia
 // a SAP (solo líneas con cantidad_asignada > 0).
@@ -2228,6 +2462,7 @@ module.exports = {
     enviarTransferenciaInsumos,
     generarTicketPollo,
     generarTicketInsumos,
+    generarResumenRutaInsumos,
     firmarTicketPollo,
     firmarTicketInsumos,
     guardarAsignacionCantidades
