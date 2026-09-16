@@ -107,6 +107,7 @@ router.post('/validateLogin/:email', login.validateLogin);
 router.post('/sap/verificarArticulosSAP', auth, sap.verificarArticulosSAP);
 router.get('/sap/buscarProductosPorNombre', auth, sap.buscarProductosPorNombre);
 router.get('/sap/buscarActivosFijos', auth, sap.buscarActivosFijos);
+router.get('/sap/listarActivosFijos', auth, sap.listarActivosFijos);
 router.get('/sap/getProveedores', auth, sap.getProveedores);
 
 //SOLICITUDES COMPRA

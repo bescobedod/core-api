@@ -642,7 +642,7 @@ async function buscarActivosFijos(req, res) {
 
         const url = `${process.env.SAP_URL.replace(/\/$/, '')}/Items?` +
             `$select=ItemCode,ItemName&` +
-            `$filter=(${filtroPrefijos}) and contains(ItemName,'${safeQuery}')&` +
+            `$filter=(${filtroPrefijos}) and contains(ItemName,'${safeQuery}') and Frozen eq 'N' and Valid eq 'Y'&` +
             `$top=${pageSize}&$skip=${skip}&$count=true`;
 
         const response = await axios.get(url, { headers, httpsAgent: agent });
@@ -659,6 +659,66 @@ async function buscarActivosFijos(req, res) {
 
         return res.status(500).json({
             error: "Error SAP búsqueda de activos fijos",
+            details: error.message
+        });
+    }
+}
+
+// Trae el catálogo COMPLETO de activos fijos (los 6 prefijos), agrupado por
+// su grupo de artículos real en SAP (ItemGroups.GroupName). Una sola llamada
+// a Service Layer con $expand para no golpearlo con una request por grupo o
+// por artículo — la usa Pedidos de Activos Fijos para mostrar todo el
+// catálogo ya agrupado al cargar la vista, sin necesidad de buscar por nombre.
+async function listarActivosFijos(req, res) {
+    try {
+        const session = await getInsumosSession();
+        const headers = {
+            Cookie: `B1SESSION=${session.sessionId}; ROUTEID=${session.routeId}`,
+            Prefer: 'odata.maxpagesize=5000'
+        };
+
+        const filtroPrefijos = PREFIJOS_ACTIVO_FIJO
+            .map(p => `startswith(ItemCode,'${p}')`)
+            .join(' or ');
+
+        const url = `${process.env.SAP_URL.replace(/\/$/, '')}/Items?` +
+            `$select=ItemCode,ItemName,SalesUnit,ItemsGroupCode&` +
+            `$expand=ItemGroups($select=GroupName)&` +
+            `$filter=(${filtroPrefijos}) and Frozen eq 'N' and Valid eq 'Y'&` +
+            `$top=5000`;
+
+        const response = await axios.get(url, { headers, httpsAgent: agent });
+        const items = response.data.value || [];
+
+        const gruposPorCodigo = new Map();
+        for (const item of items) {
+            const codigoGrupo = item.ItemsGroupCode;
+            if (!gruposPorCodigo.has(codigoGrupo)) {
+                gruposPorCodigo.set(codigoGrupo, {
+                    id: String(codigoGrupo),
+                    name: item.ItemGroups?.GroupName || `Grupo ${codigoGrupo}`,
+                    items: []
+                });
+            }
+            gruposPorCodigo.get(codigoGrupo).items.push({
+                ItemCode: item.ItemCode,
+                ItemName: item.ItemName,
+                SalesUnit: item.SalesUnit
+            });
+        }
+
+        const categorias = Array.from(gruposPorCodigo.values())
+            .sort((a, b) => a.name.localeCompare(b.name));
+
+        return res.json({ categorias });
+
+    } catch (error) {
+        if (error.response?.status === 401) {
+            delete sapSessions.byEmpresa['insumos'];
+        }
+
+        return res.status(500).json({
+            error: "Error SAP al listar el catálogo de activos fijos",
             details: error.message
         });
     }
@@ -1240,6 +1300,7 @@ module.exports = {
     sendSolicitudCompra,
     buscarProductosPorNombre,
     buscarActivosFijos,
+    listarActivosFijos,
     getProveedores,
     WHS_INSUMOS,
     obtenerProductosData,
