@@ -5,6 +5,7 @@ const RolModel = require('../../models/core/tbl_rol.model');
 const sequelizeInit = require('../../configuration/db');
 const Op = require('sequelize');
 const ID_ROL_LEGACY = 11;
+const NIVELES_PERMISO_VALIDOS = ['lectura', 'lectura_division', 'escritura'];
 
 async function getAllMenus(req, res) {
     try {
@@ -20,7 +21,16 @@ async function getAllMenus(req, res) {
             order: [["id_menu", "ASC"]]
         });
 
-        return res.json(menus)
+        // El nivel de permiso vive en tbl_menu_rol (por rol+menú), no en
+        // tbl_menu — se agrega aquí en memoria para que el frontend sepa,
+        // por cada menú, si el usuario tiene acceso de lectura/lectura_division/escritura.
+        const nivelPorMenu = new Map(permisos.map(p => [p.id_menu, p.nivel_permiso]));
+        const menusConPermiso = menus.map(m => ({
+            ...m.get({ plain: true }),
+            nivel_permiso: nivelPorMenu.get(m.id_menu) || 'escritura'
+        }));
+
+        return res.json(menusConPermiso)
     } catch (err) {
         return res.status(500).json({
             error: 'Error al obtener los menús',
@@ -152,7 +162,8 @@ async function getRolesDeMenu(req, res) {
         const resultado = asignaciones.map(a => ({
             id_menu_rol: a.id_menu_rol,
             id_rol_core: a.id_rol_core,
-            nombre_rol: rolesPorId.get(a.id_rol_core)?.nombre || null
+            nombre_rol: rolesPorId.get(a.id_rol_core)?.nombre || null,
+            nivel_permiso: a.nivel_permiso
         }));
 
         return res.json({ success: true, roles: resultado });
@@ -165,12 +176,20 @@ async function getRolesDeMenu(req, res) {
     }
 }
 
-// Asigna un rol (config.tbl_rol) a un menú.
+// Asigna un rol (config.tbl_rol) a un menú. nivel_permiso es opcional: si no
+// se manda, el modelo lo deja en 'escritura' (comportamiento actual, sin cambios).
 async function asignarRolAMenu(req, res) {
-    const { id_menu, id_rol_core } = req.body;
+    const { id_menu, id_rol_core, nivel_permiso } = req.body;
 
     if (!id_menu || !id_rol_core) {
         return res.status(400).json({ error: 'id_menu y id_rol_core son requeridos', success: false });
+    }
+
+    if (nivel_permiso && !NIVELES_PERMISO_VALIDOS.includes(nivel_permiso)) {
+        return res.status(400).json({
+            error: `nivel_permiso debe ser uno de: ${NIVELES_PERMISO_VALIDOS.join(', ')}`,
+            success: false
+        });
     }
 
     try {
@@ -183,7 +202,8 @@ async function asignarRolAMenu(req, res) {
         const asignacion = await MenuRolModel.create({
             id_menu,
             id_rol_core,
-            id_rol: ID_ROL_LEGACY
+            id_rol: ID_ROL_LEGACY,
+            ...(nivel_permiso ? { nivel_permiso } : {})
         });
 
         return res.json({ success: true, asignacion });
@@ -194,6 +214,37 @@ async function asignarRolAMenu(req, res) {
 
         return res.status(500).json({
             error: 'Error al asignar el rol al menú',
+            details: error.message,
+            success: false
+        });
+    }
+}
+
+// Cambia el nivel_permiso de una asignación rol-menú ya existente.
+async function actualizarNivelPermiso(req, res) {
+    const { id } = req.params;
+    const { nivel_permiso } = req.body;
+
+    if (!nivel_permiso || !NIVELES_PERMISO_VALIDOS.includes(nivel_permiso)) {
+        return res.status(400).json({
+            error: `nivel_permiso es requerido y debe ser uno de: ${NIVELES_PERMISO_VALIDOS.join(', ')}`,
+            success: false
+        });
+    }
+
+    try {
+        const asignacion = await MenuRolModel.findByPk(id);
+
+        if (!asignacion) {
+            return res.status(404).json({ error: 'Asignación no encontrada', success: false });
+        }
+
+        await asignacion.update({ nivel_permiso });
+
+        return res.json({ success: true, asignacion });
+    } catch (error) {
+        return res.status(500).json({
+            error: 'Error al actualizar el nivel de permiso',
             details: error.message,
             success: false
         });
@@ -225,5 +276,6 @@ module.exports = {
     actualizarVisibilidadMenu,
     getRolesDeMenu,
     asignarRolAMenu,
+    actualizarNivelPermiso,
     quitarRolDeMenu
 }

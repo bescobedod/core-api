@@ -158,7 +158,7 @@ async function updateUser(req, res) {
 // Obtiene usuarios filtrados por id_rol (ej. id_rol=1 para pilotos)
 // ------------------------------------------------------------
 const ROL_PILOTO_LEGACY = 5;
-const ROL_PILOTO_REAL = 1;
+const ROL_PILOTO_REAL = 5;
 
 async function getUsersByRol(req, res) {
     const { id_rol } = req.query;
@@ -183,10 +183,29 @@ async function getUsersByRol(req, res) {
     }
 }
 
+// Devuelve la división del usuario logueado (UsersModel.division, PioApp) —
+// la usan las vistas de Pedidos con nivel_permiso 'lectura_division' para
+// saber a qué división restringir las tiendas, sin que el usuario pueda elegir.
+async function getMiDivision(req, res) {
+    try {
+        const usuario = await UsersModel.findByPk(req.user.id_usuario, {
+            attributes: ['division']
+        });
+
+        return res.json({ division: usuario ? usuario.division : null });
+    } catch (err) {
+        return res.status(500).json({
+            error: 'Error al obtener la división del usuario',
+            details: err.message
+        });
+    }
+}
+
 module.exports = {
     getUsersByDepartamento,
     getUsersByDepartamento2,
     searchUsers,
     updateUser,
-    getUsersByRol
+    getUsersByRol,
+    getMiDivision
 }

@@ -785,6 +785,111 @@ async function subirYProcesarArchivosPedidoPos(req, res) {
 // con filtros opcionales de bodega, tienda, ruta y fecha requerida
 // (si no se manda fecha_requerida, se usa el día siguiente por defecto).
 // ------------------------------------------------------------
+// Agrupa cabeceras de tbl_pedidos_pos_cabecera (ya cargadas con su detalle)
+// en rutas -> tiendas, igual para getPedidosPos y getPedidosPorDivision —
+// ambas hacen la misma transformación, solo cambia cómo llegan filtradas
+// las cabeceras.
+function agruparPedidosPosPorRuta(pedidos, esInsumos) {
+    const mapearPedido = (p) => ({
+        pedido_id: p.id,
+        numero_pedido: p.numero_pedido,
+        fecha_pedido: p.fecha_pedido,
+        hora_pedido: p.hora_pedido,
+        fecha_requerida: p.fecha_requerida,
+        estado: p.estado,
+        sap_docentry: p.sap_docentry,
+        sap_docnum: p.sap_docnum,
+        sap_error: p.sap_error,
+        items: p.detalle.map(d => ({
+            id: d.id,
+            codigo_producto: d.codigo_producto,
+            descripcion_producto: d.descripcion_producto,
+            unidad_medida: d.unidad_medida,
+            fecha_requerida: d.fecha_requerida,
+            cantidad_solicitada: d.cantidad_solicitada,
+            cantidad_asignada: d.cantidad_asignada,
+            estado_linea: d.estado_linea
+        }))
+    });
+
+    // Agrupar por ruta -> tienda (los datos de ruta/camion/piloto ya
+    // vienen "aplanados" en el encabezado, no hace falta otro join)
+    const rutasMap = new Map();
+
+    for (const pedido of pedidos) {
+        const p = pedido.get({ plain: true });
+        const claveRuta = p.ruta_id || 'sin_ruta';
+
+        if (!rutasMap.has(claveRuta)) {
+            rutasMap.set(claveRuta, {
+                ruta_id: p.ruta_id,
+                nombre_ruta: p.nombre_ruta || 'Sin ruta asignada',
+                camion_id: p.camion_id,
+                camion_placa: p.camion_placa,
+                piloto_id: p.piloto_id,
+                piloto_nombre: p.piloto_nombre,
+                tiendas: []
+            });
+        }
+
+        const grupo = rutasMap.get(claveRuta);
+
+        if (!esInsumos) {
+            // POLLO: un registro por pedido, comportamiento original sin fusionar.
+            grupo.tiendas.push({
+                pedido_id: p.id,
+                codigo_tienda: p.codigo_tienda,
+                nombre_tienda: p.nombre_tienda,
+                codigo_empresa: p.codigo_empresa,
+                codigo_bodega: p.codigo_bodega,
+                ...mapearPedido(p)
+            });
+            continue;
+        }
+
+        // INSUMOS: se fusiona con la tarjeta de la misma tienda si ya existe
+        // (puede llegar primero el pedido de insumos o el de activo fijo,
+        // el orden no importa), si no existe se crea con ambos bloques null.
+        let tarjeta = grupo.tiendas.find(tda => tda.codigo_tienda === p.codigo_tienda);
+
+        if (!tarjeta) {
+            tarjeta = {
+                codigo_tienda: p.codigo_tienda,
+                nombre_tienda: p.nombre_tienda,
+                codigo_empresa: p.codigo_empresa,
+                codigo_bodega: p.codigo_bodega,
+                insumos: null,
+                activo_fijo: null
+            };
+            grupo.tiendas.push(tarjeta);
+        }
+
+        if (p.tipo_pedido === 'ACTIVO_FIJO') {
+            tarjeta.activo_fijo = mapearPedido(p);
+        } else {
+            tarjeta.insumos = mapearPedido(p);
+        }
+    }
+
+    return Array.from(rutasMap.values()).map(ruta => {
+        const estadosUnicos = esInsumos
+            ? [...new Set(ruta.tiendas.flatMap(t => [t.insumos?.estado, t.activo_fijo?.estado].filter(Boolean)))]
+            : [...new Set(ruta.tiendas.map(t => t.estado))];
+        const estado_general = estadosUnicos.length === 1 ? estadosUnicos[0] : 'MIXTO';
+
+        // sap_docnum es el mismo documento para toda la ruta (una sola
+        // transferencia por ruta+fecha), así que basta con tomar el
+        // primero que no sea null
+        const docnumDe = (tda) => esInsumos ? (tda.insumos?.sap_docnum || tda.activo_fijo?.sap_docnum) : tda.sap_docnum;
+        const docentryDe = (tda) => esInsumos ? (tda.insumos?.sap_docentry || tda.activo_fijo?.sap_docentry) : tda.sap_docentry;
+        const pedidoConDoc = ruta.tiendas.find(t => docnumDe(t));
+        const sap_docnum = pedidoConDoc ? docnumDe(pedidoConDoc) : null;
+        const sap_docentry = pedidoConDoc ? docentryDe(pedidoConDoc) : null;
+
+        return { ...ruta, estado_general, sap_docnum, sap_docentry };
+    });
+}
+
 async function getPedidosPos(req, res) {
     const { tipo_pedido, codigo_bodega, codigo_tienda, ruta_id } = req.query;
     let { fecha_requerida } = req.query;
@@ -834,112 +939,91 @@ async function getPedidosPos(req, res) {
             ]
         });
 
-        const mapearPedido = (p) => ({
-            pedido_id: p.id,
-            numero_pedido: p.numero_pedido,
-            fecha_pedido: p.fecha_pedido,
-            hora_pedido: p.hora_pedido,
-            fecha_requerida: p.fecha_requerida,
-            estado: p.estado,
-            sap_docentry: p.sap_docentry,
-            sap_docnum: p.sap_docnum,
-            sap_error: p.sap_error,
-            items: p.detalle.map(d => ({
-                id: d.id,
-                codigo_producto: d.codigo_producto,
-                descripcion_producto: d.descripcion_producto,
-                unidad_medida: d.unidad_medida,
-                fecha_requerida: d.fecha_requerida,
-                cantidad_solicitada: d.cantidad_solicitada,
-                cantidad_asignada: d.cantidad_asignada,
-                estado_linea: d.estado_linea
-            }))
-        });
-
-        // Agrupar por ruta -> tienda (los datos de ruta/camion/piloto ya
-        // vienen "aplanados" en el encabezado, no hace falta otro join)
-        const rutasMap = new Map();
-
-        for (const pedido of pedidos) {
-            const p = pedido.get({ plain: true });
-            const claveRuta = p.ruta_id || 'sin_ruta';
-
-            if (!rutasMap.has(claveRuta)) {
-                rutasMap.set(claveRuta, {
-                    ruta_id: p.ruta_id,
-                    nombre_ruta: p.nombre_ruta || 'Sin ruta asignada',
-                    camion_id: p.camion_id,
-                    camion_placa: p.camion_placa,
-                    piloto_id: p.piloto_id,
-                    piloto_nombre: p.piloto_nombre,
-                    tiendas: []
-                });
-            }
-
-            const grupo = rutasMap.get(claveRuta);
-
-            if (!esInsumos) {
-                // POLLO: un registro por pedido, comportamiento original sin fusionar.
-                grupo.tiendas.push({
-                    pedido_id: p.id,
-                    codigo_tienda: p.codigo_tienda,
-                    nombre_tienda: p.nombre_tienda,
-                    codigo_empresa: p.codigo_empresa,
-                    codigo_bodega: p.codigo_bodega,
-                    ...mapearPedido(p)
-                });
-                continue;
-            }
-
-            // INSUMOS: se fusiona con la tarjeta de la misma tienda si ya existe
-            // (puede llegar primero el pedido de insumos o el de activo fijo,
-            // el orden no importa), si no existe se crea con ambos bloques null.
-            let tarjeta = grupo.tiendas.find(tda => tda.codigo_tienda === p.codigo_tienda);
-
-            if (!tarjeta) {
-                tarjeta = {
-                    codigo_tienda: p.codigo_tienda,
-                    nombre_tienda: p.nombre_tienda,
-                    codigo_empresa: p.codigo_empresa,
-                    codigo_bodega: p.codigo_bodega,
-                    insumos: null,
-                    activo_fijo: null
-                };
-                grupo.tiendas.push(tarjeta);
-            }
-
-            if (p.tipo_pedido === 'ACTIVO_FIJO') {
-                tarjeta.activo_fijo = mapearPedido(p);
-            } else {
-                tarjeta.insumos = mapearPedido(p);
-            }
-        }
-
         return res.json({
             success: true,
             tipo_pedido: tipo_pedido,
             fecha_requerida: fecha_requerida,
-            rutas: Array.from(rutasMap.values()).map(ruta => {
-                const estadosUnicos = esInsumos
-                    ? [...new Set(ruta.tiendas.flatMap(t => [t.insumos?.estado, t.activo_fijo?.estado].filter(Boolean)))]
-                    : [...new Set(ruta.tiendas.map(t => t.estado))];
-                const estado_general = estadosUnicos.length === 1 ? estadosUnicos[0] : 'MIXTO';
-
-                // sap_docnum es el mismo documento para toda la ruta (una sola
-                // transferencia por ruta+fecha), así que basta con tomar el
-                // primero que no sea null
-                const docnumDe = (tda) => esInsumos ? (tda.insumos?.sap_docnum || tda.activo_fijo?.sap_docnum) : tda.sap_docnum;
-                const docentryDe = (tda) => esInsumos ? (tda.insumos?.sap_docentry || tda.activo_fijo?.sap_docentry) : tda.sap_docentry;
-                const pedidoConDoc = ruta.tiendas.find(t => docnumDe(t));
-                const sap_docnum = pedidoConDoc ? docnumDe(pedidoConDoc) : null;
-                const sap_docentry = pedidoConDoc ? docentryDe(pedidoConDoc) : null;
-
-                return { ...ruta, estado_general, sap_docnum, sap_docentry };
-            })
+            rutas: agruparPedidosPosPorRuta(pedidos, esInsumos)
         });
     } catch (error) {
         return res.status(500).json({
             error: 'Error al obtener pedidos POS',
+            details: error.message,
+            success: false
+        });
+    }
+}
+
+// GET /pedido/getPedidosPorDivision?tipo_pedido=POLLO&fecha_requerida=...&division=1
+// Usada por las vistas de solo lectura (nivel_permiso lectura/lectura_division):
+// en vez de traer todos los pedidos del día y filtrar por división en el
+// frontend, se filtra directo en la consulta — primero se buscan en
+// dbo.tTienda las tiendas de esa división (por StoreNumberSimphony, el mismo
+// código que usa tbl_pedidos_pos_cabecera.codigo_tienda), y con esa lista ya
+// se filtran los pedidos.
+async function getPedidosPorDivision(req, res) {
+    const { tipo_pedido, fecha_requerida, division } = req.query;
+
+    if (!tipo_pedido || !['POLLO', 'INSUMOS'].includes(tipo_pedido)) {
+        return res.status(400).json({
+            error: "El parámetro tipo_pedido es requerido y debe ser 'POLLO' o 'INSUMOS'",
+            success: false
+        });
+    }
+
+    if (!fecha_requerida) {
+        return res.status(400).json({ error: 'fecha_requerida es requerida', success: false });
+    }
+
+    if (!division || !['1', '2'].includes(String(division))) {
+        return res.status(400).json({ error: "division es requerida y debe ser '1' o '2'", success: false });
+    }
+
+    try {
+        const sequelizePdv = await sequelizeInit.sequelizeInit('PDV');
+        const TiendaPdvModel = initTiendaModel(sequelizePdv);
+
+        const tiendasDivision = await TiendaPdvModel.findAll({
+            attributes: ['StoreNumberSimphony'],
+            where: { division: String(division) },
+            raw: true
+        });
+
+        const codigosTienda = [...new Set(
+            tiendasDivision.map(t => t.StoreNumberSimphony).filter(Boolean)
+        )];
+
+        if (codigosTienda.length === 0) {
+            return res.json({ success: true, tipo_pedido, fecha_requerida, rutas: [] });
+        }
+
+        const esInsumos = tipo_pedido === 'INSUMOS';
+        const tiposConsulta = esInsumos ? TIPOS_INSUMOS_Y_ACTIVO_FIJO : [tipo_pedido];
+
+        const pedidos = await PedidoPosCabeceraModel.findAll({
+            where: {
+                tipo_pedido: { [Op.in]: tiposConsulta },
+                fecha_requerida,
+                codigo_tienda: { [Op.in]: codigosTienda }
+            },
+            include: [
+                { model: PedidoPosDetalleModel, as: 'detalle' }
+            ],
+            order: [
+                ['nombre_ruta', 'ASC'],
+                ['nombre_tienda', 'ASC']
+            ]
+        });
+
+        return res.json({
+            success: true,
+            tipo_pedido,
+            fecha_requerida,
+            rutas: agruparPedidosPosPorRuta(pedidos, esInsumos)
+        });
+    } catch (error) {
+        return res.status(500).json({
+            error: 'Error al obtener pedidos por división',
             details: error.message,
             success: false
         });
@@ -2162,6 +2246,109 @@ async function generarResumenRutaInsumos(req, res) {
     }
 }
 
+// Igual que generarResumenRutaInsumos, pero para Pollo: una sola cabecera
+// por tienda (no hay fusión con Activo Fijo), y usa CatalogoRutaPolloModel
+// en vez de CatalogoRutaInsumosModel. Reutiliza el mismo dibujado de PDF.
+async function generarResumenRutaPollo(req, res) {
+    const { ruta_id, fecha } = req.query;
+
+    if (!ruta_id || !fecha) {
+        return res.status(400).json({ error: 'ruta_id y fecha son requeridos', success: false });
+    }
+
+    try {
+        const ruta = await CatalogoRutaPolloModel.findByPk(ruta_id);
+
+        if (!ruta) {
+            return res.status(404).json({ error: 'Ruta no encontrada', success: false });
+        }
+
+        const cabeceras = await PedidoPosCabeceraModel.findAll({
+            where: { tipo_pedido: 'POLLO', fecha_requerida: fecha, ruta_id },
+            attributes: ['id', 'codigo_tienda', 'nombre_tienda', 'estado']
+        });
+
+        if (cabeceras.length === 0) {
+            return res.status(404).json({ error: 'No hay pedidos para esta ruta y fecha', success: false });
+        }
+
+        // Agrupado defensivo por codigo_tienda, por si alguna vez hay más de
+        // una cabecera de Pollo para la misma tienda (mismo criterio que
+        // usa generarResumenRutaInsumos, aunque aquí lo normal es una sola).
+        const tiendasPorCodigo = new Map();
+        for (const c of cabeceras) {
+            if (!tiendasPorCodigo.has(c.codigo_tienda)) {
+                tiendasPorCodigo.set(c.codigo_tienda, {
+                    codigo_tienda: c.codigo_tienda,
+                    nombre_tienda: c.nombre_tienda || c.codigo_tienda,
+                    pedidoIds: []
+                });
+            }
+            tiendasPorCodigo.get(c.codigo_tienda).pedidoIds.push(c.id);
+        }
+
+        const tiendas = [...tiendasPorCodigo.values()]
+            .sort((a, b) => (a.nombre_tienda || '').localeCompare(b.nombre_tienda || ''));
+
+        const pedidoATienda = new Map();
+        for (const info of tiendasPorCodigo.values()) {
+            for (const pid of info.pedidoIds) pedidoATienda.set(pid, info.codigo_tienda);
+        }
+
+        const idsPedidos = cabeceras.map(c => c.id);
+        const detalles = await PedidoPosDetalleModel.findAll({
+            where: { pedido_id: { [Op.in]: idsPedidos }, cantidad_asignada: { [Op.gt]: 0 } },
+            attributes: ['pedido_id', 'codigo_producto', 'descripcion_producto', 'unidad_medida', 'cantidad_asignada']
+        });
+
+        const articulosPorCodigo = new Map();
+        for (const d of detalles) {
+            const codigoTienda = pedidoATienda.get(d.pedido_id);
+            if (!codigoTienda) continue;
+
+            if (!articulosPorCodigo.has(d.codigo_producto)) {
+                articulosPorCodigo.set(d.codigo_producto, {
+                    codigo_producto: d.codigo_producto,
+                    nombre_producto: d.descripcion_producto,
+                    unidad_medida: d.unidad_medida || 'UND',
+                    cantidadPorTienda: new Map()
+                });
+            }
+
+            const articulo = articulosPorCodigo.get(d.codigo_producto);
+            const actual = articulo.cantidadPorTienda.get(codigoTienda) || 0;
+            articulo.cantidadPorTienda.set(codigoTienda, actual + Number(d.cantidad_asignada));
+        }
+
+        const articulos = [...articulosPorCodigo.values()]
+            .sort((a, b) => (a.codigo_producto || '').localeCompare(b.codigo_producto || ''));
+
+        if (articulos.length === 0) {
+            return res.status(400).json({
+                error: 'No hay artículos con cantidad asignada para esta ruta. Primero calcula el stock y guarda la asignación.',
+                success: false
+            });
+        }
+
+        const yaEnviada = cabeceras.some(c => ['EN_TRANSITO', 'ENTREGADO', 'ENTREGADO_PARCIAL'].includes(c.estado));
+
+        construirPdfResumenRuta(res, {
+            nombreRuta: ruta.nombre_ruta,
+            fecha,
+            preliminar: !yaEnviada,
+            tiendas,
+            articulos,
+            nombreArchivo: `resumen_ruta_pollo_${ruta.nombre_ruta || ruta_id}_${fecha}.pdf`
+        });
+    } catch (error) {
+        return res.status(500).json({
+            error: 'Error al generar el resumen de ruta',
+            details: error.message,
+            success: false
+        });
+    }
+}
+
 // ------------------------------------------------------------
 // Dibuja el PDF de generarResumenRutaInsumos: una tabla en horizontal con
 // un artículo por fila y una tienda por columna (más una columna de
@@ -2453,6 +2640,7 @@ module.exports = {
     guardarPedidoPos,
     agruparLineasPorPedido,
     getPedidosPos,
+    getPedidosPorDivision,
     getAsignacionesTransporte,
     asignarTransporte,
     trasladarPiloto,
@@ -2463,6 +2651,7 @@ module.exports = {
     generarTicketPollo,
     generarTicketInsumos,
     generarResumenRutaInsumos,
+    generarResumenRutaPollo,
     firmarTicketPollo,
     firmarTicketInsumos,
     guardarAsignacionCantidades

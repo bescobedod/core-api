@@ -13,7 +13,8 @@ function initTiendaModel(sequelizeInstance) {
         latitudGps: { type: DataTypes.STRING(100), allowNull: true },
         clienteSAP: { type: DataTypes.STRING(8), allowNull: false },
         whsCode: { type: DataTypes.STRING(32), allowNull: true },
-        StoreNumberSimphony: { type: DataTypes.STRING(50), allowNull: true }
+        StoreNumberSimphony: { type: DataTypes.STRING(50), allowNull: true },
+        division: { type: DataTypes.STRING(64), allowNull: true }
     }, {
         sequelize: sequelizeInstance,
         tableName: 'tTienda',

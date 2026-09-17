@@ -9,7 +9,11 @@ MenuRolModel.init({
     id_menu: { type: DataTypes.INTEGER, allowNull: false },
     fecha_creacion: { type: DataTypes.DATE, allowNull: false, defaultValue: DataTypes.NOW },
     fecha_actualizacion: { type: DataTypes.DATE, allowNull: false, defaultValue: DataTypes.NOW },
-    id_rol_core: { type: DataTypes.INTEGER, allowNull: true }
+    id_rol_core: { type: DataTypes.INTEGER, allowNull: true },
+    // 'lectura': ve todas las tiendas de una división a la vez (puede alternar).
+    // 'lectura_division': ve solo las tiendas de SU división, sin poder alternar.
+    // 'escritura': acceso normal completo (default).
+    nivel_permiso: { type: DataTypes.STRING(20), allowNull: false, defaultValue: 'escritura' }
 }, {
     sequelize: sequelize,
     tableName: 'tbl_menu_rol',

@@ -59,6 +59,7 @@ router.post('/menus/crearMenu', auth, menus.crearMenu);
 router.put('/menus/actualizarVisibilidad/:id', auth, menus.actualizarVisibilidadMenu);
 router.get('/menus/getRolesDeMenu', auth, menus.getRolesDeMenu);
 router.post('/menus/asignarRolAMenu', auth, menus.asignarRolAMenu);
+router.put('/menus/actualizarNivelPermiso/:id', auth, menus.actualizarNivelPermiso);
 router.delete('/menus/quitarRolDeMenu/:id', auth, menus.quitarRolDeMenu);
 router.get('/roles/getAllRoles', auth, roles.getAllRoles);
 router.get('/usuario-muelle-pollo/getUsuariosPorMuelle', auth, usuarioMuellePollo.getUsuariosPorMuelle);
@@ -81,6 +82,7 @@ router.post('/pedido/subirArchivoPedidoPos', limitePedidosPos, upload.uploadPedi
 router.post('/pedido/crearPedidoActivoFijo', auth, pedidos.crearPedidoActivoFijo)
 router.get('/pedido/buscarPedidosActivoFijo', auth, pedidos.buscarPedidosActivoFijo)
 router.get('/pedido/getPedidosPos', auth, pedidos.getPedidosPos)
+router.get('/pedido/getPedidosPorDivision', auth, pedidos.getPedidosPorDivision)
 router.get('/pedido/getComparativoStockPollo', auth, pedidos.getComparativoStockPollo)
 router.get('/pedido/getComparativoStockInsumos', auth, pedidos.getComparativoStockInsumos)
 router.post('/pedido/guardarAsignacionCantidades', auth, pedidos.guardarAsignacionCantidades)
@@ -89,6 +91,7 @@ router.post('/pedido/enviarTransferenciaInsumos', auth, pedidos.enviarTransferen
 router.get('/pedido/generarTicketPollo', auth, pedidos.generarTicketPollo)
 router.get('/pedido/generarTicketInsumos', auth, pedidos.generarTicketInsumos)
 router.get('/pedido/generarResumenRutaInsumos', auth, pedidos.generarResumenRutaInsumos)
+router.get('/pedido/generarResumenRutaPollo', auth, pedidos.generarResumenRutaPollo)
 router.get('/pedido/getAsignacionesTransporte', auth, pedidos.getAsignacionesTransporte)
 router.post('/pedido/asignarTransporte', auth, pedidos.asignarTransporte)
 router.post('/pedido/trasladarPiloto', auth, pedidos.trasladarPiloto)
@@ -149,6 +152,7 @@ router.get('/usuario/getUsersByDepartamento2/:departamento_id', auth, usuarios.g
 router.get('/usuario/searchUsers', auth, usuarios.searchUsers);
 router.put('/usuario/updateUser', auth, usuarios.updateUser);
 router.get('/usuario/getUsersByRol', auth, usuarios.getUsersByRol);
+router.get('/usuario/getMiDivision', auth, usuarios.getMiDivision);
 
 //DEPARTAMENTO
 router.get('/departamento/getDepartamentos', auth, departamentos.getDepartamentos);
