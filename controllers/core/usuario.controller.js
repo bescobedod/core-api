@@ -157,7 +157,7 @@ async function updateUser(req, res) {
 // ------------------------------------------------------------
 // Obtiene usuarios filtrados por id_rol (ej. id_rol=1 para pilotos)
 // ------------------------------------------------------------
-const ROL_PILOTO_LEGACY = 1;
+const ROL_PILOTO_LEGACY = 5;
 const ROL_PILOTO_REAL = 1;
 
 async function getUsersByRol(req, res) {
