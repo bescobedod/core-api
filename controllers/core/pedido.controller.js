@@ -1,5 +1,6 @@
 const initPedidoEncabezadoModel = require('../../models/core/tbl_pedido_encabezado.model');
 const PDFDocument = require('pdfkit');
+const QRCode = require('qrcode');
 const TicketTrasladoModel = require('../../models/core/tbl_tickets_traslado.model');
 const initPedidoDetalleModel = require('../../models/core/tbl_pedido_detalle.model');
 const initTiendaModel = require('../../models/pdv/tTienda.model');
@@ -2458,6 +2459,488 @@ function construirPdfResumenRuta(res, { nombreRuta, fecha, preliminar, tiendas, 
 }
 
 // ------------------------------------------------------------
+// Un bloque por pedido/cabecera (no por tienda: en Insumos una tienda puede
+// tener pedido de Insumos Y de Activo Fijo, cada uno con su propio UUID).
+// Es la base compartida por el reporte con QR (una ruta a la vez) y el
+// reporte de detalle sin QR (todas las rutas de una fecha).
+// ------------------------------------------------------------
+function construirBloquesPedido(cabeceras) {
+    return cabeceras.map(cabecera => {
+        const p = cabecera.get({ plain: true });
+
+        return {
+            id_pedido: p.id,
+            ruta_id: p.ruta_id || 'sin_ruta',
+            nombre_ruta: p.nombre_ruta || 'Sin ruta asignada',
+            nombre_tienda: p.nombre_tienda || p.codigo_tienda,
+            label: p.tipo_pedido === 'ACTIVO_FIJO' ? 'Activo Fijo' : (p.tipo_pedido === 'INSUMOS' ? 'Insumos' : null),
+            numero_pedido: p.numero_pedido,
+            items: p.detalle.map(d => ({
+                codigo_producto: d.codigo_producto,
+                nombre_producto: d.descripcion_producto,
+                unidad_medida: d.unidad_medida || 'UND',
+                cantidad_solicitada: Number(d.cantidad_solicitada) || 0,
+                cantidad_asignada: Number(d.cantidad_asignada) || 0
+            }))
+        };
+    });
+}
+
+// Agrupa bloques (ya armados por construirBloquesPedido) por ruta, para el
+// reporte de detalle de todas las rutas.
+function agruparBloquesPorRuta(bloques) {
+    const mapa = new Map();
+
+    for (const bloque of bloques) {
+        if (!mapa.has(bloque.ruta_id)) {
+            mapa.set(bloque.ruta_id, { ruta_id: bloque.ruta_id, nombre_ruta: bloque.nombre_ruta, bloques: [] });
+        }
+        mapa.get(bloque.ruta_id).bloques.push(bloque);
+    }
+
+    return Array.from(mapa.values());
+}
+
+// QR por pedido para que el piloto lo imprima y lo entregue junto al
+// pedido — una app externa (que no es parte de Core) lo escanea para
+// consultar el pedido por su id_pedido (el UUID de Postgres).
+async function construirBloquesQr(cabeceras) {
+    const bloques = construirBloquesPedido(cabeceras);
+
+    for (const bloque of bloques) {
+        const qrPayload = JSON.stringify({ id_pedido: bloque.id_pedido, serie: bloque.numero_pedido, nombre_tienda: bloque.nombre_tienda });
+        bloque.qrBuffer = await QRCode.toBuffer(qrPayload, { margin: 1, width: 160 });
+    }
+
+    return bloques;
+}
+
+// Dibuja el PDF de generarQrsRutaPollo/generarQrsRutaInsumos: carta vertical,
+// un bloque por pedido apilado uno tras otro (nombre de tienda, tabla simple
+// de artículos, y el QR al final) — nada de matriz ni columnas por tienda,
+// a propósito, para que sea lo más simple posible de leer e imprimir.
+function dibujarPdfQrsRuta(res, { nombreRuta, fecha, bloques, nombreArchivo }) {
+    const doc = new PDFDocument({ margin: 40, size: 'LETTER' });
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${nombreArchivo}"`);
+    doc.pipe(res);
+
+    const anchoUtil = doc.page.width - doc.page.margins.left - doc.page.margins.right;
+    const startX = doc.page.margins.left;
+    const QR_SIZE = 90;
+
+    const anchoCodigo = 60;
+    const anchoPedido = 70;
+    const anchoEnviado = 70;
+    const anchoDif = 70;
+    const anchoNombre = anchoUtil - anchoCodigo - anchoPedido - anchoEnviado - anchoDif;
+
+    doc.fontSize(14).font('Helvetica-Bold').text('Códigos QR de Pedidos', { align: 'center' });
+    doc.fontSize(9).font('Helvetica').fillColor('#555555')
+        .text(`Ruta: ${nombreRuta || '—'}    Fecha Entrega: ${fecha}`, { align: 'center' });
+    doc.fillColor('#000000');
+    doc.moveDown(0.8);
+
+    bloques.forEach((bloque) => {
+        const alturaEstimada = 50 + bloque.items.length * 14 + QR_SIZE + 25;
+
+        if (doc.y + alturaEstimada > doc.page.height - doc.page.margins.bottom) {
+            doc.addPage();
+        }
+
+        doc.moveTo(startX, doc.y).lineTo(startX + anchoUtil, doc.y).strokeColor('#cccccc').stroke();
+        doc.moveDown(0.4);
+
+        doc.font('Helvetica-Bold').fontSize(11).fillColor('#000000');
+        doc.text(bloque.label ? `${bloque.nombre_tienda} — ${bloque.label}` : bloque.nombre_tienda, startX);
+        doc.font('Helvetica').fontSize(8).fillColor('#666666');
+        doc.text(`Pedido: ${bloque.numero_pedido}`, startX);
+        doc.fillColor('#000000');
+        doc.moveDown(0.3);
+
+        const colCodigo = startX;
+        const colNombre = colCodigo + anchoCodigo;
+        const colPedido = colNombre + anchoNombre;
+        const colEnviado = colPedido + anchoPedido;
+        const colDif = colEnviado + anchoEnviado;
+
+        const yEncabezado = doc.y;
+        doc.font('Helvetica-Bold').fontSize(8);
+        doc.text('Código', colCodigo, yEncabezado, { width: anchoCodigo });
+        doc.text('Artículo', colNombre, yEncabezado, { width: anchoNombre });
+        doc.text('Pedido', colPedido, yEncabezado, { width: anchoPedido, align: 'center' });
+        doc.text('Enviado', colEnviado, yEncabezado, { width: anchoEnviado, align: 'center' });
+        doc.text('Diferencia', colDif, yEncabezado, { width: anchoDif, align: 'center' });
+        doc.y = yEncabezado + 12;
+        doc.moveTo(startX, doc.y).lineTo(startX + anchoUtil, doc.y).strokeColor('#999999').stroke();
+        doc.moveDown(0.2);
+
+        doc.font('Helvetica').fontSize(8);
+        bloque.items.forEach((item) => {
+            const diferencia = item.cantidad_solicitada - item.cantidad_asignada;
+            const y = doc.y;
+
+            doc.text(item.codigo_producto || '—', colCodigo, y, { width: anchoCodigo });
+            doc.text(item.nombre_producto || '—', colNombre, y, { width: anchoNombre });
+            doc.text(String(item.cantidad_solicitada), colPedido, y, { width: anchoPedido, align: 'center' });
+            doc.text(String(item.cantidad_asignada), colEnviado, y, { width: anchoEnviado, align: 'center' });
+            doc.text(String(diferencia), colDif, y, { width: anchoDif, align: 'center' });
+
+            doc.y = y + 14;
+        });
+
+        doc.moveDown(0.5);
+        const yQr = doc.y;
+        doc.image(bloque.qrBuffer, startX, yQr, { width: QR_SIZE, height: QR_SIZE });
+
+        // Línea de firma junto al QR, para que quede como comprobante físico
+        // de que la tienda recibió el pedido.
+        const xFirma = startX + QR_SIZE + 25;
+        const anchoFirma = anchoUtil - QR_SIZE - 25;
+        const yLineaFirma = yQr + QR_SIZE - 22;
+
+        doc.moveTo(xFirma, yLineaFirma).lineTo(xFirma + anchoFirma, yLineaFirma).strokeColor('#000000').stroke();
+        doc.font('Helvetica').fontSize(8).fillColor('#000000');
+        doc.text('Firma de Recepción de Tienda', xFirma, yLineaFirma + 4, { width: anchoFirma });
+
+        doc.y = yQr + QR_SIZE + 15;
+    });
+
+    doc.end();
+}
+
+// Suma cantidad_solicitada/cantidad_asignada por código de producto, entre
+// TODAS las rutas/tiendas/pedidos del documento — es el total que hay que
+// despachar ese día para cada artículo, sin importar en qué ruta o tienda
+// vaya cada unidad.
+function calcularResumenGeneral(rutasConBloques) {
+    const totalesPorCodigo = new Map();
+
+    for (const ruta of rutasConBloques) {
+        for (const bloque of ruta.bloques) {
+            for (const item of bloque.items) {
+                const codigo = item.codigo_producto || '—';
+
+                if (!totalesPorCodigo.has(codigo)) {
+                    totalesPorCodigo.set(codigo, {
+                        codigo_producto: codigo,
+                        nombre_producto: item.nombre_producto,
+                        cantidad_solicitada: 0,
+                        cantidad_asignada: 0
+                    });
+                }
+
+                const total = totalesPorCodigo.get(codigo);
+                total.cantidad_solicitada += item.cantidad_solicitada;
+                total.cantidad_asignada += item.cantidad_asignada;
+            }
+        }
+    }
+
+    return Array.from(totalesPorCodigo.values())
+        .sort((a, b) => (a.codigo_producto || '').localeCompare(b.codigo_producto || ''));
+}
+
+// Dibuja el PDF de generarReporteDetallePollo/generarReporteDetalleInsumos:
+// carta vertical. Primero un resumen general con el total pedido/enviado
+// por artículo entre TODAS las rutas (para saber de un vistazo cuánto hay
+// que despachar ese día), y debajo el detalle de siempre: cada ruta como
+// sección, y dentro un bloque por pedido igual que en dibujarPdfQrsRuta
+// pero sin QR ni línea de firma — pensado para poder generarse en
+// cualquier momento (incluso antes de procesar cualquier ruta).
+function dibujarPdfDetallePorRuta(res, { fecha, rutasConBloques, nombreArchivo }) {
+    const doc = new PDFDocument({ margin: 40, size: 'LETTER' });
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${nombreArchivo}"`);
+    doc.pipe(res);
+
+    const anchoUtil = doc.page.width - doc.page.margins.left - doc.page.margins.right;
+    const startX = doc.page.margins.left;
+
+    const anchoCodigo = 60;
+    const anchoPedido = 70;
+    const anchoEnviado = 70;
+    const anchoDif = 70;
+    const anchoNombre = anchoUtil - anchoCodigo - anchoPedido - anchoEnviado - anchoDif;
+
+    doc.fontSize(14).font('Helvetica-Bold').text('Detalle de Pedidos por Tienda', { align: 'center' });
+    doc.fontSize(9).font('Helvetica').fillColor('#555555').text(`Fecha Entrega: ${fecha}`, { align: 'center' });
+    doc.fillColor('#000000');
+    doc.moveDown(0.8);
+
+    // Resumen general: total por artículo entre todas las rutas, para saber
+    // de un vistazo cuánto hay que despachar ese día.
+    const resumenGeneral = calcularResumenGeneral(rutasConBloques);
+
+    doc.font('Helvetica-Bold').fontSize(12).fillColor('#2183AE');
+    doc.text('Resumen General', startX);
+    doc.fillColor('#000000');
+    doc.moveTo(startX, doc.y + 2).lineTo(startX + anchoUtil, doc.y + 2).strokeColor('#2183AE').stroke();
+    doc.moveDown(0.5);
+
+    const colCodigoR = startX;
+    const colNombreR = colCodigoR + anchoCodigo;
+    const colPedidoR = colNombreR + anchoNombre;
+    const colEnviadoR = colPedidoR + anchoPedido;
+    const colDifR = colEnviadoR + anchoEnviado;
+
+    const yEncabezadoR = doc.y;
+    doc.font('Helvetica-Bold').fontSize(8);
+    doc.text('Código', colCodigoR, yEncabezadoR, { width: anchoCodigo });
+    doc.text('Artículo', colNombreR, yEncabezadoR, { width: anchoNombre });
+    doc.text('Pedido', colPedidoR, yEncabezadoR, { width: anchoPedido, align: 'center' });
+    doc.text('Enviado', colEnviadoR, yEncabezadoR, { width: anchoEnviado, align: 'center' });
+    doc.text('Diferencia', colDifR, yEncabezadoR, { width: anchoDif, align: 'center' });
+    doc.y = yEncabezadoR + 12;
+    doc.moveTo(startX, doc.y).lineTo(startX + anchoUtil, doc.y).strokeColor('#999999').stroke();
+    doc.moveDown(0.2);
+
+    doc.font('Helvetica').fontSize(8);
+    resumenGeneral.forEach((total) => {
+        if (doc.y + 14 > doc.page.height - doc.page.margins.bottom) {
+            doc.addPage();
+        }
+
+        const diferencia = total.cantidad_solicitada - total.cantidad_asignada;
+        const y = doc.y;
+
+        doc.text(total.codigo_producto || '—', colCodigoR, y, { width: anchoCodigo });
+        doc.text(total.nombre_producto || '—', colNombreR, y, { width: anchoNombre });
+        doc.font('Helvetica-Bold');
+        doc.text(String(total.cantidad_solicitada), colPedidoR, y, { width: anchoPedido, align: 'center' });
+        doc.font('Helvetica');
+        doc.text(String(total.cantidad_asignada), colEnviadoR, y, { width: anchoEnviado, align: 'center' });
+        doc.text(String(diferencia), colDifR, y, { width: anchoDif, align: 'center' });
+
+        doc.y = y + 14;
+    });
+
+    doc.addPage();
+
+    rutasConBloques.forEach((ruta) => {
+        if (doc.y + 40 > doc.page.height - doc.page.margins.bottom) {
+            doc.addPage();
+        }
+
+        doc.font('Helvetica-Bold').fontSize(12).fillColor('#2183AE');
+        doc.text(ruta.nombre_ruta, startX);
+        doc.fillColor('#000000');
+        doc.moveTo(startX, doc.y + 2).lineTo(startX + anchoUtil, doc.y + 2).strokeColor('#2183AE').stroke();
+        doc.moveDown(0.5);
+
+        ruta.bloques.forEach((bloque) => {
+            const alturaEstimada = 30 + bloque.items.length * 14;
+
+            if (doc.y + alturaEstimada > doc.page.height - doc.page.margins.bottom) {
+                doc.addPage();
+            }
+
+            doc.font('Helvetica-Bold').fontSize(10).fillColor('#000000');
+            doc.text(bloque.label ? `${bloque.nombre_tienda} — ${bloque.label}` : bloque.nombre_tienda, startX);
+            doc.font('Helvetica').fontSize(8).fillColor('#666666');
+            doc.text(`Pedido: ${bloque.numero_pedido}`, startX);
+            doc.fillColor('#000000');
+            doc.moveDown(0.3);
+
+            const colCodigo = startX;
+            const colNombre = colCodigo + anchoCodigo;
+            const colPedido = colNombre + anchoNombre;
+            const colEnviado = colPedido + anchoPedido;
+            const colDif = colEnviado + anchoEnviado;
+
+            const yEncabezado = doc.y;
+            doc.font('Helvetica-Bold').fontSize(8);
+            doc.text('Código', colCodigo, yEncabezado, { width: anchoCodigo });
+            doc.text('Artículo', colNombre, yEncabezado, { width: anchoNombre });
+            doc.text('Pedido', colPedido, yEncabezado, { width: anchoPedido, align: 'center' });
+            doc.text('Enviado', colEnviado, yEncabezado, { width: anchoEnviado, align: 'center' });
+            doc.text('Diferencia', colDif, yEncabezado, { width: anchoDif, align: 'center' });
+            doc.y = yEncabezado + 12;
+            doc.moveTo(startX, doc.y).lineTo(startX + anchoUtil, doc.y).strokeColor('#999999').stroke();
+            doc.moveDown(0.2);
+
+            doc.font('Helvetica').fontSize(8);
+            bloque.items.forEach((item) => {
+                const diferencia = item.cantidad_solicitada - item.cantidad_asignada;
+                const y = doc.y;
+
+                doc.text(item.codigo_producto || '—', colCodigo, y, { width: anchoCodigo });
+                doc.text(item.nombre_producto || '—', colNombre, y, { width: anchoNombre });
+                doc.text(String(item.cantidad_solicitada), colPedido, y, { width: anchoPedido, align: 'center' });
+                doc.text(String(item.cantidad_asignada), colEnviado, y, { width: anchoEnviado, align: 'center' });
+                doc.text(String(diferencia), colDif, y, { width: anchoDif, align: 'center' });
+
+                doc.y = y + 14;
+            });
+
+            doc.moveDown(0.6);
+        });
+    });
+
+    doc.end();
+}
+
+// GET /pedido/generarReporteDetallePollo?fecha=...
+// Reporte de TODAS las rutas de Pollo para una fecha, sin importar el
+// estado ni si ya se procesó algo — solo el detalle de lo que pide cada
+// tienda, agrupado por ruta. Se puede generar en cualquier momento, incluso
+// antes de tomar el candado de cualquier ruta.
+async function generarReporteDetallePollo(req, res) {
+    const { fecha } = req.query;
+
+    if (!fecha) {
+        return res.status(400).json({ error: 'fecha es requerida', success: false });
+    }
+
+    try {
+        const cabeceras = await PedidoPosCabeceraModel.findAll({
+            where: { tipo_pedido: 'POLLO', fecha_requerida: fecha },
+            include: [{ model: PedidoPosDetalleModel, as: 'detalle' }],
+            order: [['nombre_ruta', 'ASC'], ['nombre_tienda', 'ASC']]
+        });
+
+        if (cabeceras.length === 0) {
+            return res.status(404).json({ error: 'No hay pedidos para esta fecha', success: false });
+        }
+
+        const rutasConBloques = agruparBloquesPorRuta(construirBloquesPedido(cabeceras));
+
+        dibujarPdfDetallePorRuta(res, {
+            fecha,
+            rutasConBloques,
+            nombreArchivo: `detalle_pedidos_pollo_${fecha}.pdf`
+        });
+    } catch (error) {
+        return res.status(500).json({
+            error: 'Error al generar el reporte',
+            details: error.message,
+            success: false
+        });
+    }
+}
+
+// GET /pedido/generarReporteDetalleInsumos?fecha=...
+async function generarReporteDetalleInsumos(req, res) {
+    const { fecha } = req.query;
+
+    if (!fecha) {
+        return res.status(400).json({ error: 'fecha es requerida', success: false });
+    }
+
+    try {
+        const cabeceras = await PedidoPosCabeceraModel.findAll({
+            where: { tipo_pedido: { [Op.in]: TIPOS_INSUMOS_Y_ACTIVO_FIJO }, fecha_requerida: fecha },
+            include: [{ model: PedidoPosDetalleModel, as: 'detalle' }],
+            order: [['nombre_ruta', 'ASC'], ['nombre_tienda', 'ASC']]
+        });
+
+        if (cabeceras.length === 0) {
+            return res.status(404).json({ error: 'No hay pedidos para esta fecha', success: false });
+        }
+
+        const rutasConBloques = agruparBloquesPorRuta(construirBloquesPedido(cabeceras));
+
+        dibujarPdfDetallePorRuta(res, {
+            fecha,
+            rutasConBloques,
+            nombreArchivo: `detalle_pedidos_insumos_${fecha}.pdf`
+        });
+    } catch (error) {
+        return res.status(500).json({
+            error: 'Error al generar el reporte',
+            details: error.message,
+            success: false
+        });
+    }
+}
+
+// GET /pedido/generarQrsRutaPollo?ruta_id=...&fecha=...
+async function generarQrsRutaPollo(req, res) {
+    const { ruta_id, fecha } = req.query;
+
+    if (!ruta_id || !fecha) {
+        return res.status(400).json({ error: 'ruta_id y fecha son requeridos', success: false });
+    }
+
+    try {
+        const ruta = await CatalogoRutaPolloModel.findByPk(ruta_id);
+
+        if (!ruta) {
+            return res.status(404).json({ error: 'Ruta no encontrada', success: false });
+        }
+
+        const cabeceras = await PedidoPosCabeceraModel.findAll({
+            where: { tipo_pedido: 'POLLO', fecha_requerida: fecha, ruta_id },
+            include: [{ model: PedidoPosDetalleModel, as: 'detalle' }],
+            order: [['nombre_tienda', 'ASC']]
+        });
+
+        if (cabeceras.length === 0) {
+            return res.status(404).json({ error: 'No hay pedidos para esta ruta y fecha', success: false });
+        }
+
+        const bloques = await construirBloquesQr(cabeceras);
+
+        dibujarPdfQrsRuta(res, {
+            nombreRuta: ruta.nombre_ruta,
+            fecha,
+            bloques,
+            nombreArchivo: `qrs_ruta_pollo_${ruta.nombre_ruta || ruta_id}_${fecha}.pdf`
+        });
+    } catch (error) {
+        return res.status(500).json({
+            error: 'Error al generar los códigos QR',
+            details: error.message,
+            success: false
+        });
+    }
+}
+
+// GET /pedido/generarQrsRutaInsumos?ruta_id=...&fecha=...
+async function generarQrsRutaInsumos(req, res) {
+    const { ruta_id, fecha } = req.query;
+
+    if (!ruta_id || !fecha) {
+        return res.status(400).json({ error: 'ruta_id y fecha son requeridos', success: false });
+    }
+
+    try {
+        const ruta = await CatalogoRutaInsumosModel.findByPk(ruta_id);
+
+        if (!ruta) {
+            return res.status(404).json({ error: 'Ruta no encontrada', success: false });
+        }
+
+        const cabeceras = await PedidoPosCabeceraModel.findAll({
+            where: { tipo_pedido: { [Op.in]: TIPOS_INSUMOS_Y_ACTIVO_FIJO }, fecha_requerida: fecha, ruta_id },
+            include: [{ model: PedidoPosDetalleModel, as: 'detalle' }],
+            order: [['nombre_tienda', 'ASC']]
+        });
+
+        if (cabeceras.length === 0) {
+            return res.status(404).json({ error: 'No hay pedidos para esta ruta y fecha', success: false });
+        }
+
+        const bloques = await construirBloquesQr(cabeceras);
+
+        dibujarPdfQrsRuta(res, {
+            nombreRuta: ruta.nombre_ruta,
+            fecha,
+            bloques,
+            nombreArchivo: `qrs_ruta_insumos_${ruta.nombre_ruta || ruta_id}_${fecha}.pdf`
+        });
+    } catch (error) {
+        return res.status(500).json({
+            error: 'Error al generar los códigos QR',
+            details: error.message,
+            success: false
+        });
+    }
+}
+
+// ------------------------------------------------------------
 // Arma el snapshot de líneas (por artículo, sumando entre tiendas) para
 // guardar en el ticket. Mismo criterio que usa el PDF y la transferencia
 // a SAP (solo líneas con cantidad_asignada > 0).
@@ -2652,6 +3135,10 @@ module.exports = {
     generarTicketInsumos,
     generarResumenRutaInsumos,
     generarResumenRutaPollo,
+    generarQrsRutaPollo,
+    generarQrsRutaInsumos,
+    generarReporteDetallePollo,
+    generarReporteDetalleInsumos,
     firmarTicketPollo,
     firmarTicketInsumos,
     guardarAsignacionCantidades
