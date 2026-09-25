@@ -1,6 +1,7 @@
 const initPedidoEncabezadoModel = require('../../models/core/tbl_pedido_encabezado.model');
 const PDFDocument = require('pdfkit');
 const QRCode = require('qrcode');
+const { MIME_XLSX, construirExcelDetalle, construirExcelEnTransito } = require('../../services/pedidoReportesExcel');
 const TicketTrasladoModel = require('../../models/core/tbl_tickets_traslado.model');
 const initPedidoDetalleModel = require('../../models/core/tbl_pedido_detalle.model');
 const initTiendaModel = require('../../models/pdv/tTienda.model');
@@ -955,6 +956,59 @@ async function getPedidosPos(req, res) {
     }
 }
 
+// Divisiones válidas para los reportes ('1' y '2'; no hay más).
+const DIVISIONES_VALIDAS = ['1', '2'];
+
+// Interpreta el parámetro `division` de un request: una lista separada por
+// comas ("1", "2" o "1,2"). Devuelve null si no se mandó (= sin filtro),
+// o un arreglo de divisiones válidas; lanza si trae algo distinto de 1/2.
+function parsearDivisiones(valor) {
+    if (valor === undefined || valor === null || String(valor).trim() === '') return null;
+
+    const divisiones = [...new Set(String(valor).split(',').map(d => d.trim()).filter(Boolean))];
+
+    if (divisiones.length === 0 || divisiones.some(d => !DIVISIONES_VALIDAS.includes(d))) {
+        throw new Error("division debe ser '1', '2' o '1,2'");
+    }
+
+    return divisiones;
+}
+
+// StoreNumberSimphony de las tiendas de una o varias divisiones, según
+// dbo.tTienda — es el mismo código que usa tbl_pedidos_pos_cabecera.codigo_tienda.
+async function obtenerCodigosTiendaPorDivision(division) {
+    const divisiones = [].concat(division).map(String);
+    const sequelizePdv = await sequelizeInit.sequelizeInit('PDV');
+    const TiendaPdvModel = initTiendaModel(sequelizePdv);
+
+    const tiendasDivision = await TiendaPdvModel.findAll({
+        attributes: ['StoreNumberSimphony'],
+        where: { division: { [Op.in]: divisiones } },
+        raw: true
+    });
+
+    return [...new Set(tiendasDivision.map(t => t.StoreNumberSimphony).filter(Boolean))];
+}
+
+// Mapa StoreNumberSimphony -> división ('1' | '2'), para poder indicar a qué
+// división pertenece cada pedido en los reportes.
+async function obtenerMapaDivisionPorTienda() {
+    const sequelizePdv = await sequelizeInit.sequelizeInit('PDV');
+    const TiendaPdvModel = initTiendaModel(sequelizePdv);
+
+    const tiendas = await TiendaPdvModel.findAll({
+        attributes: ['StoreNumberSimphony', 'division'],
+        where: { division: { [Op.in]: DIVISIONES_VALIDAS } },
+        raw: true
+    });
+
+    return new Map(
+        tiendas
+            .filter(t => t.StoreNumberSimphony)
+            .map(t => [t.StoreNumberSimphony, String(t.division).trim()])
+    );
+}
+
 // GET /pedido/getPedidosPorDivision?tipo_pedido=POLLO&fecha_requerida=...&division=1
 // Usada por las vistas de solo lectura (nivel_permiso lectura/lectura_division):
 // en vez de traer todos los pedidos del día y filtrar por división en el
@@ -981,18 +1035,7 @@ async function getPedidosPorDivision(req, res) {
     }
 
     try {
-        const sequelizePdv = await sequelizeInit.sequelizeInit('PDV');
-        const TiendaPdvModel = initTiendaModel(sequelizePdv);
-
-        const tiendasDivision = await TiendaPdvModel.findAll({
-            attributes: ['StoreNumberSimphony'],
-            where: { division: String(division) },
-            raw: true
-        });
-
-        const codigosTienda = [...new Set(
-            tiendasDivision.map(t => t.StoreNumberSimphony).filter(Boolean)
-        )];
+        const codigosTienda = await obtenerCodigosTiendaPorDivision(division);
 
         if (codigosTienda.length === 0) {
             return res.json({ success: true, tipo_pedido, fecha_requerida, rutas: [] });
@@ -2470,17 +2513,30 @@ function construirBloquesPedido(cabeceras) {
 
         return {
             id_pedido: p.id,
+            codigo_tienda: p.codigo_tienda,
             ruta_id: p.ruta_id || 'sin_ruta',
             nombre_ruta: p.nombre_ruta || 'Sin ruta asignada',
             nombre_tienda: p.nombre_tienda || p.codigo_tienda,
             label: p.tipo_pedido === 'ACTIVO_FIJO' ? 'Activo Fijo' : (p.tipo_pedido === 'INSUMOS' ? 'Insumos' : null),
             numero_pedido: p.numero_pedido,
+            estado: p.estado,
+            fecha_requerida: p.fecha_requerida,
+            camion_placa: p.camion_placa,
+            piloto_nombre: p.piloto_nombre,
+            sap_delivery_docentry: p.sap_delivery_docentry,
+            sap_delivery_docnum: p.sap_delivery_docnum,
+            sap_entry_docentry: p.sap_entry_docentry,
+            sap_entry_docnum: p.sap_entry_docnum,
             items: p.detalle.map(d => ({
                 codigo_producto: d.codigo_producto,
                 nombre_producto: d.descripcion_producto,
                 unidad_medida: d.unidad_medida || 'UND',
                 cantidad_solicitada: Number(d.cantidad_solicitada) || 0,
-                cantidad_asignada: Number(d.cantidad_asignada) || 0
+                cantidad_asignada: Number(d.cantidad_asignada) || 0,
+                // null = la tienda todavía no confirmó recepción de esta línea
+                cantidad_recibida: d.cantidad_recibida === null || d.cantidad_recibida === undefined
+                    ? null
+                    : Number(d.cantidad_recibida)
             }))
         };
     });
@@ -2610,10 +2666,11 @@ function dibujarPdfQrsRuta(res, { nombreRuta, fecha, bloques, nombreArchivo }) {
     doc.end();
 }
 
-// Suma cantidad_solicitada/cantidad_asignada por código de producto, entre
+// Suma cantidad_solicitada/asignada/recibida por código de producto, entre
 // TODAS las rutas/tiendas/pedidos del documento — es el total que hay que
 // despachar ese día para cada artículo, sin importar en qué ruta o tienda
-// vaya cada unidad.
+// vaya cada unidad. cantidad_recibida solo suma las líneas que la tienda ya
+// confirmó (las demás no cuentan); queda null si ninguna se ha confirmado.
 function calcularResumenGeneral(rutasConBloques) {
     const totalesPorCodigo = new Map();
 
@@ -2627,13 +2684,18 @@ function calcularResumenGeneral(rutasConBloques) {
                         codigo_producto: codigo,
                         nombre_producto: item.nombre_producto,
                         cantidad_solicitada: 0,
-                        cantidad_asignada: 0
+                        cantidad_asignada: 0,
+                        cantidad_recibida: null
                     });
                 }
 
                 const total = totalesPorCodigo.get(codigo);
                 total.cantidad_solicitada += item.cantidad_solicitada;
                 total.cantidad_asignada += item.cantidad_asignada;
+
+                if (item.cantidad_recibida !== null && item.cantidad_recibida !== undefined) {
+                    total.cantidad_recibida = (total.cantidad_recibida || 0) + item.cantidad_recibida;
+                }
             }
         }
     }
@@ -2642,31 +2704,198 @@ function calcularResumenGeneral(rutasConBloques) {
         .sort((a, b) => (a.codigo_producto || '').localeCompare(b.codigo_producto || ''));
 }
 
+// ------------------------------------------------------------
+// Helpers de dibujo compartidos por los reportes de detalle y de pedidos en
+// tránsito (tabla de artículos, estado del pedido y documentos SAP).
+// ------------------------------------------------------------
+const ESTADOS_ENTREGADO = ['ENTREGADO', 'ENTREGADO_PARCIAL'];
+
+const ETIQUETAS_ESTADO_PEDIDO = {
+    ENTREGADO: { texto: 'Entregado', color: '#15803d' },
+    ENTREGADO_PARCIAL: { texto: 'Entregado parcial', color: '#c2410c' },
+    EN_TRANSITO: { texto: 'En ruta', color: '#1d4ed8' },
+    RECIBIDO: { texto: 'Sin enviar', color: '#6b7280' },
+    VALIDADO: { texto: 'Sin enviar', color: '#6b7280' },
+    ERROR_ENVIO_SAP: { texto: 'Error de envío a SAP', color: '#b91c1c' }
+};
+
+function etiquetaEstadoPedido(estado) {
+    return ETIQUETAS_ESTADO_PEDIDO[estado] || { texto: estado || '—', color: '#6b7280' };
+}
+
+// Las columnas "Recibido" y los documentos SAP solo salen si al menos un
+// pedido del reporte ya está entregado (total o parcial).
+function reporteTieneEntregas(rutasConBloques) {
+    return rutasConBloques.some(r => r.bloques.some(b => ESTADOS_ENTREGADO.includes(b.estado)));
+}
+
+// "2 Entregado · 1 Entregado parcial · 5 En ruta"
+function resumenEstadosPedidos(rutasConBloques) {
+    const conteo = new Map();
+
+    for (const ruta of rutasConBloques) {
+        for (const bloque of ruta.bloques) {
+            const texto = etiquetaEstadoPedido(bloque.estado).texto;
+            conteo.set(texto, (conteo.get(texto) || 0) + 1);
+        }
+    }
+
+    return [...conteo.entries()].map(([texto, n]) => `${n} ${texto}`).join('   ·   ');
+}
+
+function crearLayoutTabla(doc, mostrarRecibido) {
+    const startX = doc.page.margins.left;
+    const anchoUtil = doc.page.width - doc.page.margins.left - doc.page.margins.right;
+    const anchoCodigo = 60;
+    const anchoNum = mostrarRecibido ? 60 : 70;
+    const columnasNumericas = mostrarRecibido ? 4 : 3;
+    const anchoNombre = anchoUtil - anchoCodigo - anchoNum * columnasNumericas;
+
+    const colCodigo = startX;
+    const colNombre = colCodigo + anchoCodigo;
+    const colPedido = colNombre + anchoNombre;
+    const colEnviado = colPedido + anchoNum;
+    const colRecibido = mostrarRecibido ? colEnviado + anchoNum : null;
+    const colDif = (mostrarRecibido ? colRecibido : colEnviado) + anchoNum;
+
+    return {
+        startX, anchoUtil, anchoCodigo, anchoNombre, anchoNum, mostrarRecibido,
+        colCodigo, colNombre, colPedido, colEnviado, colRecibido, colDif
+    };
+}
+
+function dibujarEncabezadoTabla(doc, L) {
+    const y = doc.y;
+
+    doc.font('Helvetica-Bold').fontSize(8).fillColor('#000000');
+    doc.text('Código', L.colCodigo, y, { width: L.anchoCodigo });
+    doc.text('Artículo', L.colNombre, y, { width: L.anchoNombre });
+    doc.text('Pedido', L.colPedido, y, { width: L.anchoNum, align: 'center' });
+    doc.text('Enviado', L.colEnviado, y, { width: L.anchoNum, align: 'center' });
+    if (L.mostrarRecibido) {
+        doc.text('Recibido', L.colRecibido, y, { width: L.anchoNum, align: 'center' });
+    }
+    doc.text('Diferencia', L.colDif, y, { width: L.anchoNum, align: 'center' });
+
+    doc.y = y + 12;
+    doc.moveTo(L.startX, doc.y).lineTo(L.startX + L.anchoUtil, doc.y).strokeColor('#999999').stroke();
+    doc.moveDown(0.2);
+}
+
+function dibujarFilaTabla(doc, L, { codigo, nombre, pedido, enviado, recibido, negritaPedido }) {
+    const y = doc.y;
+
+    doc.font('Helvetica').fontSize(8).fillColor('#000000');
+    doc.text(codigo || '—', L.colCodigo, y, { width: L.anchoCodigo });
+    doc.text(nombre || '—', L.colNombre, y, { width: L.anchoNombre });
+    doc.font(negritaPedido ? 'Helvetica-Bold' : 'Helvetica');
+    doc.text(String(pedido), L.colPedido, y, { width: L.anchoNum, align: 'center' });
+    doc.font('Helvetica');
+    doc.text(String(enviado), L.colEnviado, y, { width: L.anchoNum, align: 'center' });
+    if (L.mostrarRecibido) {
+        const textoRecibido = recibido === null || recibido === undefined ? '—' : String(recibido);
+        doc.text(textoRecibido, L.colRecibido, y, { width: L.anchoNum, align: 'center' });
+    }
+    doc.text(String(pedido - enviado), L.colDif, y, { width: L.anchoNum, align: 'center' });
+
+    doc.y = y + 14;
+}
+
+function bloqueTieneDocsSap(bloque) {
+    return !!(bloque.sap_delivery_docentry || bloque.sap_delivery_docnum
+        || bloque.sap_entry_docentry || bloque.sap_entry_docnum);
+}
+
+function alturaEstimadaBloque(bloque, { mostrarDocsSap, lineasExtra = 0 }) {
+    const docsSap = mostrarDocsSap && bloqueTieneDocsSap(bloque) ? 30 : 0;
+    return 40 + lineasExtra * 11 + docsSap + bloque.items.length * 14;
+}
+
+// Encabezado de un pedido: tienda (+ tipo), estado a la derecha, número de
+// pedido y, si aplica, un recuadro con los documentos de SAP (Delivery y
+// Entrada) — cada uno con su DocEntry y DocNum en su propia mitad, para que
+// se lea de un vistazo. `detalles` son líneas extra de texto gris chico.
+function dibujarEncabezadoBloque(doc, L, bloque, { mostrarEstado, mostrarDocsSap, detalles = [] }) {
+    const anchoEstado = 120;
+    const yTitulo = doc.y;
+    const textoTitulo = bloque.label ? `${bloque.nombre_tienda} — ${bloque.label}` : bloque.nombre_tienda;
+    const anchoTitulo = mostrarEstado ? L.anchoUtil - anchoEstado - 10 : L.anchoUtil;
+
+    doc.font('Helvetica-Bold').fontSize(10).fillColor('#000000');
+    const altoTitulo = doc.heightOfString(textoTitulo, { width: anchoTitulo });
+    doc.text(textoTitulo, L.startX, yTitulo, { width: anchoTitulo });
+
+    if (mostrarEstado) {
+        const etiqueta = etiquetaEstadoPedido(bloque.estado);
+        doc.font('Helvetica-Bold').fontSize(9).fillColor(etiqueta.color);
+        doc.text(etiqueta.texto, L.startX + L.anchoUtil - anchoEstado, yTitulo, { width: anchoEstado, align: 'right' });
+    }
+
+    doc.y = yTitulo + altoTitulo + 2;
+    doc.font('Helvetica').fontSize(8).fillColor('#666666');
+    doc.text(`Pedido: ${bloque.numero_pedido}`, L.startX, doc.y, { width: L.anchoUtil });
+
+    detalles.forEach((linea) => {
+        doc.text(linea, L.startX, doc.y, { width: L.anchoUtil });
+    });
+
+    if (mostrarDocsSap && bloqueTieneDocsSap(bloque)) {
+        doc.moveDown(0.3);
+        const yBox = doc.y;
+        const altoBox = 26;
+        const mitad = L.anchoUtil / 2;
+
+        doc.rect(L.startX, yBox, L.anchoUtil, altoBox).fillColor('#f3f4f6').fill();
+
+        const dibujarDocumento = (x, titulo, docentry, docnum) => {
+            doc.font('Helvetica-Bold').fontSize(7).fillColor('#374151');
+            doc.text(titulo, x + 8, yBox + 5, { width: mitad - 16 });
+            doc.font('Helvetica').fontSize(8).fillColor('#111827');
+            const valor = docentry || docnum
+                ? `DocEntry ${docentry ?? '—'}    DocNum ${docnum ?? '—'}`
+                : 'Sin registro';
+            doc.text(valor, x + 8, yBox + 14, { width: mitad - 16 });
+        };
+
+        dibujarDocumento(L.startX, 'ENTREGA EN SAP (DELIVERY)', bloque.sap_delivery_docentry, bloque.sap_delivery_docnum);
+        dibujarDocumento(L.startX + mitad, 'ENTRADA EN SAP (ENTRY)', bloque.sap_entry_docentry, bloque.sap_entry_docnum);
+
+        doc.y = yBox + altoBox;
+    }
+
+    doc.fillColor('#000000');
+    doc.moveDown(0.4);
+}
+
 // Dibuja el PDF de generarReporteDetallePollo/generarReporteDetalleInsumos:
 // carta vertical. Primero un resumen general con el total pedido/enviado
 // por artículo entre TODAS las rutas (para saber de un vistazo cuánto hay
-// que despachar ese día), y debajo el detalle de siempre: cada ruta como
-// sección, y dentro un bloque por pedido igual que en dibujarPdfQrsRuta
-// pero sin QR ni línea de firma — pensado para poder generarse en
-// cualquier momento (incluso antes de procesar cualquier ruta).
-function dibujarPdfDetallePorRuta(res, { fecha, rutasConBloques, nombreArchivo }) {
+// que despachar ese día), y debajo el detalle: cada ruta como sección, y
+// dentro un bloque por pedido igual que en dibujarPdfQrsRuta pero sin QR
+// ni línea de firma — pensado para poder generarse en cualquier momento
+// (incluso antes de procesar cualquier ruta).
+// Si al menos un pedido ya está ENTREGADO/ENTREGADO_PARCIAL, se agregan la
+// columna "Recibido", el estado de cada pedido y sus documentos de SAP.
+function dibujarPdfDetallePorRuta(res, { fecha, rutasConBloques, nombreArchivo, descripcionFiltros, faltantes = [] }) {
     const doc = new PDFDocument({ margin: 40, size: 'LETTER' });
 
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="${nombreArchivo}"`);
     doc.pipe(res);
 
-    const anchoUtil = doc.page.width - doc.page.margins.left - doc.page.margins.right;
-    const startX = doc.page.margins.left;
-
-    const anchoCodigo = 60;
-    const anchoPedido = 70;
-    const anchoEnviado = 70;
-    const anchoDif = 70;
-    const anchoNombre = anchoUtil - anchoCodigo - anchoPedido - anchoEnviado - anchoDif;
+    const conEntregas = reporteTieneEntregas(rutasConBloques);
+    const L = crearLayoutTabla(doc, conEntregas);
+    const { startX, anchoUtil } = L;
 
     doc.fontSize(14).font('Helvetica-Bold').text('Detalle de Pedidos por Tienda', { align: 'center' });
     doc.fontSize(9).font('Helvetica').fillColor('#555555').text(`Fecha Entrega: ${fecha}`, { align: 'center' });
+    if (descripcionFiltros) {
+        doc.text(descripcionFiltros, { align: 'center' });
+    }
+    if (conEntregas) {
+        doc.font('Helvetica-Bold').fillColor('#374151')
+            .text(`Estado de los pedidos: ${resumenEstadosPedidos(rutasConBloques)}`, { align: 'center' });
+    }
     doc.fillColor('#000000');
     doc.moveDown(0.8);
 
@@ -2680,42 +2909,28 @@ function dibujarPdfDetallePorRuta(res, { fecha, rutasConBloques, nombreArchivo }
     doc.moveTo(startX, doc.y + 2).lineTo(startX + anchoUtil, doc.y + 2).strokeColor('#2183AE').stroke();
     doc.moveDown(0.5);
 
-    const colCodigoR = startX;
-    const colNombreR = colCodigoR + anchoCodigo;
-    const colPedidoR = colNombreR + anchoNombre;
-    const colEnviadoR = colPedidoR + anchoPedido;
-    const colDifR = colEnviadoR + anchoEnviado;
+    dibujarEncabezadoTabla(doc, L);
 
-    const yEncabezadoR = doc.y;
-    doc.font('Helvetica-Bold').fontSize(8);
-    doc.text('Código', colCodigoR, yEncabezadoR, { width: anchoCodigo });
-    doc.text('Artículo', colNombreR, yEncabezadoR, { width: anchoNombre });
-    doc.text('Pedido', colPedidoR, yEncabezadoR, { width: anchoPedido, align: 'center' });
-    doc.text('Enviado', colEnviadoR, yEncabezadoR, { width: anchoEnviado, align: 'center' });
-    doc.text('Diferencia', colDifR, yEncabezadoR, { width: anchoDif, align: 'center' });
-    doc.y = yEncabezadoR + 12;
-    doc.moveTo(startX, doc.y).lineTo(startX + anchoUtil, doc.y).strokeColor('#999999').stroke();
-    doc.moveDown(0.2);
-
-    doc.font('Helvetica').fontSize(8);
     resumenGeneral.forEach((total) => {
         if (doc.y + 14 > doc.page.height - doc.page.margins.bottom) {
             doc.addPage();
         }
 
-        const diferencia = total.cantidad_solicitada - total.cantidad_asignada;
-        const y = doc.y;
-
-        doc.text(total.codigo_producto || '—', colCodigoR, y, { width: anchoCodigo });
-        doc.text(total.nombre_producto || '—', colNombreR, y, { width: anchoNombre });
-        doc.font('Helvetica-Bold');
-        doc.text(String(total.cantidad_solicitada), colPedidoR, y, { width: anchoPedido, align: 'center' });
-        doc.font('Helvetica');
-        doc.text(String(total.cantidad_asignada), colEnviadoR, y, { width: anchoEnviado, align: 'center' });
-        doc.text(String(diferencia), colDifR, y, { width: anchoDif, align: 'center' });
-
-        doc.y = y + 14;
+        dibujarFilaTabla(doc, L, {
+            codigo: total.codigo_producto,
+            nombre: total.nombre_producto,
+            pedido: total.cantidad_solicitada,
+            enviado: total.cantidad_asignada,
+            recibido: total.cantidad_recibida,
+            negritaPedido: true
+        });
     });
+
+    if (resumenGeneral.length === 0) {
+        doc.font('Helvetica').fontSize(9).fillColor('#6b7280')
+            .text('No hubo pedidos para esta fecha con esos filtros.', startX);
+        doc.fillColor('#000000');
+    }
 
     doc.addPage();
 
@@ -2731,48 +2946,124 @@ function dibujarPdfDetallePorRuta(res, { fecha, rutasConBloques, nombreArchivo }
         doc.moveDown(0.5);
 
         ruta.bloques.forEach((bloque) => {
-            const alturaEstimada = 30 + bloque.items.length * 14;
-
-            if (doc.y + alturaEstimada > doc.page.height - doc.page.margins.bottom) {
+            if (doc.y + alturaEstimadaBloque(bloque, { mostrarDocsSap: conEntregas }) > doc.page.height - doc.page.margins.bottom) {
                 doc.addPage();
             }
 
-            doc.font('Helvetica-Bold').fontSize(10).fillColor('#000000');
-            doc.text(bloque.label ? `${bloque.nombre_tienda} — ${bloque.label}` : bloque.nombre_tienda, startX);
-            doc.font('Helvetica').fontSize(8).fillColor('#666666');
-            doc.text(`Pedido: ${bloque.numero_pedido}`, startX);
-            doc.fillColor('#000000');
-            doc.moveDown(0.3);
+            dibujarEncabezadoBloque(doc, L, bloque, { mostrarEstado: conEntregas, mostrarDocsSap: conEntregas });
+            dibujarEncabezadoTabla(doc, L);
 
-            const colCodigo = startX;
-            const colNombre = colCodigo + anchoCodigo;
-            const colPedido = colNombre + anchoNombre;
-            const colEnviado = colPedido + anchoPedido;
-            const colDif = colEnviado + anchoEnviado;
-
-            const yEncabezado = doc.y;
-            doc.font('Helvetica-Bold').fontSize(8);
-            doc.text('Código', colCodigo, yEncabezado, { width: anchoCodigo });
-            doc.text('Artículo', colNombre, yEncabezado, { width: anchoNombre });
-            doc.text('Pedido', colPedido, yEncabezado, { width: anchoPedido, align: 'center' });
-            doc.text('Enviado', colEnviado, yEncabezado, { width: anchoEnviado, align: 'center' });
-            doc.text('Diferencia', colDif, yEncabezado, { width: anchoDif, align: 'center' });
-            doc.y = yEncabezado + 12;
-            doc.moveTo(startX, doc.y).lineTo(startX + anchoUtil, doc.y).strokeColor('#999999').stroke();
-            doc.moveDown(0.2);
-
-            doc.font('Helvetica').fontSize(8);
             bloque.items.forEach((item) => {
-                const diferencia = item.cantidad_solicitada - item.cantidad_asignada;
-                const y = doc.y;
+                dibujarFilaTabla(doc, L, {
+                    codigo: item.codigo_producto,
+                    nombre: item.nombre_producto,
+                    pedido: item.cantidad_solicitada,
+                    enviado: item.cantidad_asignada,
+                    recibido: item.cantidad_recibida
+                });
+            });
 
-                doc.text(item.codigo_producto || '—', colCodigo, y, { width: anchoCodigo });
-                doc.text(item.nombre_producto || '—', colNombre, y, { width: anchoNombre });
-                doc.text(String(item.cantidad_solicitada), colPedido, y, { width: anchoPedido, align: 'center' });
-                doc.text(String(item.cantidad_asignada), colEnviado, y, { width: anchoEnviado, align: 'center' });
-                doc.text(String(diferencia), colDif, y, { width: anchoDif, align: 'center' });
+            doc.moveDown(0.6);
+        });
+    });
 
-                doc.y = y + 14;
+    // Tiendas asignadas a las rutas del reporte que no hicieron pedido esa
+    // fecha, por división y por ruta. Sin rutas con pedidos ya estamos en una
+    // hoja nueva (la del salto de arriba), así que no se agrega otra.
+    if (rutasConBloques.length > 0) doc.addPage();
+
+    doc.font('Helvetica-Bold').fontSize(12).fillColor('#2183AE');
+    doc.text('Tiendas sin pedido para esta fecha', startX);
+    doc.fillColor('#000000');
+    doc.moveTo(startX, doc.y + 2).lineTo(startX + anchoUtil, doc.y + 2).strokeColor('#2183AE').stroke();
+    doc.moveDown(0.6);
+
+    if (faltantes.length === 0) {
+        doc.font('Helvetica').fontSize(9).fillColor('#6b7280')
+            .text('Todas las tiendas asignadas hicieron pedido para esta fecha.', startX);
+        doc.fillColor('#000000');
+    }
+
+    faltantes.forEach((porDivision) => {
+        if (doc.y + 40 > doc.page.height - doc.page.margins.bottom) doc.addPage();
+
+        doc.font('Helvetica-Bold').fontSize(11).fillColor('#111827');
+        doc.text(`División ${porDivision.division}`, startX);
+        doc.moveDown(0.3);
+
+        porDivision.rutas.forEach((ruta) => {
+            if (doc.y + 30 > doc.page.height - doc.page.margins.bottom) doc.addPage();
+
+            doc.font('Helvetica-Bold').fontSize(9).fillColor('#2183AE');
+            doc.text(`${ruta.nombre_ruta}  (${ruta.tiendas.length})`, startX + 8);
+
+            doc.font('Helvetica').fontSize(9).fillColor('#000000');
+            ruta.tiendas.forEach((tienda) => {
+                if (doc.y + 12 > doc.page.height - doc.page.margins.bottom) doc.addPage();
+                doc.text(`•  ${tienda}`, startX + 20);
+            });
+
+            doc.moveDown(0.4);
+        });
+
+        doc.moveDown(0.4);
+    });
+
+    doc.end();
+}
+
+// Dibuja el PDF de generarReporteEnTransito*: carta vertical, pedidos que ya
+// se enviaron a SAP y siguen en ruta (sin importar la fecha), separados en
+// secciones por división y ordenados por fecha requerida, ruta y tienda.
+function dibujarPdfEnTransito(res, { secciones, tituloTipo, nombreArchivo }) {
+    const doc = new PDFDocument({ margin: 40, size: 'LETTER' });
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${nombreArchivo}"`);
+    doc.pipe(res);
+
+    const L = crearLayoutTabla(doc, false);
+    const totalPedidos = secciones.reduce((acc, s) => acc + s.bloques.length, 0);
+
+    doc.fontSize(14).font('Helvetica-Bold').text(`Pedidos en Tránsito — ${tituloTipo}`, { align: 'center' });
+    doc.fontSize(9).font('Helvetica').fillColor('#555555')
+        .text('Pedidos enviados a SAP que todavía no han sido entregados (todas las fechas)', { align: 'center' });
+    doc.text(`Total: ${totalPedidos} pedido${totalPedidos !== 1 ? 's' : ''}`, { align: 'center' });
+    doc.fillColor('#000000');
+    doc.moveDown(0.8);
+
+    secciones.forEach((seccion, indice) => {
+        // Cada división arranca en hoja nueva para poder separarlas físicamente.
+        if (indice > 0) doc.addPage();
+
+        doc.font('Helvetica-Bold').fontSize(13).fillColor('#2183AE');
+        doc.text(`División ${seccion.division}  (${seccion.bloques.length} pedido${seccion.bloques.length !== 1 ? 's' : ''})`, L.startX);
+        doc.fillColor('#000000');
+        doc.moveTo(L.startX, doc.y + 2).lineTo(L.startX + L.anchoUtil, doc.y + 2).strokeColor('#2183AE').stroke();
+        doc.moveDown(0.6);
+
+        seccion.bloques.forEach((bloque) => {
+            const detalles = [
+                bloque.muelle
+                    ? `Despachado desde el muelle: ${bloque.muelle}   ·   Ruta: ${bloque.nombre_ruta}`
+                    : `Ruta: ${bloque.nombre_ruta}`,
+                `Fecha requerida: ${bloque.fecha_requerida || '—'}   ·   Piloto: ${bloque.piloto_nombre || 'Sin asignar'}   ·   Camión: ${bloque.camion_placa || 'Sin asignar'}`
+            ];
+
+            if (doc.y + alturaEstimadaBloque(bloque, { mostrarDocsSap: false, lineasExtra: detalles.length }) > doc.page.height - doc.page.margins.bottom) {
+                doc.addPage();
+            }
+
+            dibujarEncabezadoBloque(doc, L, bloque, { mostrarEstado: false, mostrarDocsSap: false, detalles });
+            dibujarEncabezadoTabla(doc, L);
+
+            bloque.items.forEach((item) => {
+                dibujarFilaTabla(doc, L, {
+                    codigo: item.codigo_producto,
+                    nombre: item.nombre_producto,
+                    pedido: item.cantidad_solicitada,
+                    enviado: item.cantidad_asignada
+                });
             });
 
             doc.moveDown(0.6);
@@ -2782,11 +3073,182 @@ function dibujarPdfDetallePorRuta(res, { fecha, rutasConBloques, nombreArchivo }
     doc.end();
 }
 
-// GET /pedido/generarReporteDetallePollo?fecha=...
-// Reporte de TODAS las rutas de Pollo para una fecha, sin importar el
-// estado ni si ya se procesó algo — solo el detalle de lo que pide cada
-// tienda, agrupado por ruta. Se puede generar en cualquier momento, incluso
-// antes de tomar el candado de cualquier ruta.
+// Muelles de Pollo (whs_code_origen de tbl_catalogo_rutas_pollo). Insumos no
+// tiene muelles: todas sus rutas salen de la bodega "01".
+const MUELLES_POLLO = { 'RAS-002': 'Central', 'RAS-003': 'Zacapa', 'RAS-004': 'Xela' };
+
+// Interpreta el parámetro `muelles` ("RAS-002,RAS-004"). null = todos.
+function parsearMuelles(valor) {
+    if (valor === undefined || valor === null || String(valor).trim() === '') return null;
+
+    const muelles = [...new Set(String(valor).split(',').map(m => m.trim()).filter(Boolean))];
+
+    if (muelles.length === 0 || muelles.some(m => !MUELLES_POLLO[m])) {
+        throw new Error(`muelles debe ser una lista de: ${Object.keys(MUELLES_POLLO).join(', ')}`);
+    }
+
+    return muelles;
+}
+
+function describirFiltrosReporte(divisiones, muelles) {
+    const partes = [];
+
+    partes.push(divisiones ? `División ${divisiones.join(' y ')}` : 'Todas las divisiones');
+
+    if (muelles) {
+        partes.push(`Muelle${muelles.length !== 1 ? 's' : ''}: ${muelles.map(m => MUELLES_POLLO[m]).join(', ')}`);
+    }
+
+    return partes.join('   ·   ');
+}
+
+function parsearFormato(valor) {
+    const formato = String(valor || 'pdf').trim().toLowerCase();
+
+    if (!['pdf', 'excel'].includes(formato)) {
+        throw new Error("formato debe ser 'pdf' o 'excel'");
+    }
+
+    return formato;
+}
+
+async function enviarLibroExcel(res, libro, nombreArchivo) {
+    res.setHeader('Content-Type', MIME_XLSX);
+    res.setHeader('Content-Disposition', `attachment; filename="${nombreArchivo}"`);
+    await libro.xlsx.write(res);
+    res.end();
+}
+
+// Tiendas asignadas a las rutas del reporte (activas y con la tienda vigente
+// en esa fecha), dentro de la división y muelle pedidos, que NO tienen ningún
+// pedido para la fecha. Devuelve [{ division, rutas: [{ nombre_ruta, tiendas }] }].
+// Un pedido de cualquier tipo del reporte cuenta (en Insumos, Insumos o
+// Activo Fijo): la tienda sale en la lista solo si no aparece en el reporte.
+async function calcularTiendasSinPedido({ esPollo, fecha, divisiones, muelles }) {
+    const CatalogoRutaModel = esPollo ? CatalogoRutaPolloModel : CatalogoRutaInsumosModel;
+    const TiendaRutaModel = esPollo ? TiendaRutaPolloModel : TiendaRutaInsumosModel;
+    const tiposPedido = esPollo ? ['POLLO'] : TIPOS_INSUMOS_Y_ACTIVO_FIJO;
+    const divisionesAlcance = divisiones || DIVISIONES_VALIDAS;
+
+    const whereRutas = { activo: true };
+
+    if (esPollo && muelles) {
+        whereRutas.whs_code_origen = { [Op.in]: muelles };
+    }
+
+    const rutas = await CatalogoRutaModel.findAll({
+        where: whereRutas,
+        attributes: ['id', 'nombre_ruta'],
+        raw: true
+    });
+
+    if (rutas.length === 0) return [];
+
+    const inicioDia = new Date(`${fecha}T00:00:00`);
+    const finDia = new Date(`${fecha}T23:59:59.999`);
+
+    const asignaciones = await TiendaRutaModel.findAll({
+        where: {
+            ruta_id: { [Op.in]: rutas.map(r => r.id) },
+            fecha_asignacion: { [Op.lte]: finDia },
+            [Op.or]: [{ fecha_fin_asignacion: null }, { fecha_fin_asignacion: { [Op.gte]: inicioDia } }]
+        },
+        attributes: ['ruta_id', 'id_tienda_simphony', 'nombre_tienda'],
+        raw: true
+    });
+
+    const divisionPorTienda = await obtenerMapaDivisionPorTienda();
+    const enAlcance = asignaciones.filter(a => divisionesAlcance.includes(divisionPorTienda.get(a.id_tienda_simphony)));
+
+    if (enAlcance.length === 0) return [];
+
+    const conPedido = await PedidoPosCabeceraModel.findAll({
+        where: {
+            tipo_pedido: { [Op.in]: tiposPedido },
+            fecha_requerida: fecha,
+            codigo_tienda: { [Op.in]: [...new Set(enAlcance.map(a => a.id_tienda_simphony))] }
+        },
+        attributes: ['codigo_tienda'],
+        raw: true
+    });
+
+    const codigosConPedido = new Set(conPedido.map(c => c.codigo_tienda));
+    const nombreRuta = new Map(rutas.map(r => [r.id, r.nombre_ruta]));
+    const porDivision = new Map();
+    const vistos = new Set();
+
+    for (const a of enAlcance) {
+        if (codigosConPedido.has(a.id_tienda_simphony)) continue;
+
+        const clave = `${a.ruta_id}::${a.id_tienda_simphony}`;
+        if (vistos.has(clave)) continue;
+        vistos.add(clave);
+
+        const division = divisionPorTienda.get(a.id_tienda_simphony);
+        if (!porDivision.has(division)) porDivision.set(division, new Map());
+
+        const porRuta = porDivision.get(division);
+        if (!porRuta.has(a.ruta_id)) porRuta.set(a.ruta_id, []);
+        porRuta.get(a.ruta_id).push(a.nombre_tienda || a.id_tienda_simphony);
+    }
+
+    return [...porDivision.entries()]
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([division, porRuta]) => ({
+            division,
+            rutas: [...porRuta.entries()]
+                .map(([rutaId, tiendas]) => ({
+                    nombre_ruta: nombreRuta.get(rutaId) || 'Sin nombre',
+                    tiendas: tiendas.sort((x, y) => x.localeCompare(y))
+                }))
+                .sort((x, y) => x.nombre_ruta.localeCompare(y.nombre_ruta))
+        }));
+}
+
+// Arma la respuesta del reporte de pedidos por fecha, en PDF o Excel: mismos
+// datos (resumen general, detalle y tiendas sin pedido) en los dos formatos.
+async function responderReporteDetalle(res, { formato, fecha, cabeceras, faltantes, descripcionFiltros, nombreBase }) {
+    if (cabeceras.length === 0 && faltantes.length === 0) {
+        return res.status(404).json({
+            error: 'No hay pedidos ni tiendas asignadas para esos filtros y esta fecha',
+            success: false
+        });
+    }
+
+    const rutasConBloques = agruparBloquesPorRuta(construirBloquesPedido(cabeceras));
+
+    if (formato === 'excel') {
+        const libro = construirExcelDetalle({
+            fecha,
+            descripcionFiltros,
+            rutasConBloques,
+            faltantes,
+            resumenGeneral: calcularResumenGeneral(rutasConBloques),
+            conEntregas: reporteTieneEntregas(rutasConBloques),
+            resumenEstados: resumenEstadosPedidos(rutasConBloques),
+            etiquetaEstado: etiquetaEstadoPedido
+        });
+
+        return enviarLibroExcel(res, libro, `${nombreBase}.xlsx`);
+    }
+
+    return dibujarPdfDetallePorRuta(res, {
+        fecha,
+        rutasConBloques,
+        descripcionFiltros,
+        faltantes,
+        nombreArchivo: `${nombreBase}.pdf`
+    });
+}
+
+// GET /pedido/generarReporteDetallePollo?fecha=...&division=1,2&muelles=RAS-002,RAS-003&formato=pdf|excel
+// Reporte de las rutas de Pollo para una fecha, sin importar el estado ni
+// si ya se procesó algo — solo el detalle de lo que pide cada tienda,
+// agrupado por ruta. Se puede generar en cualquier momento, incluso antes de
+// tomar el candado de cualquier ruta.
+// division (opcional, "1", "2" o "1,2") filtra por división de la tienda;
+// muelles (opcional) filtra por el muelle de la ruta — si se manda, los
+// pedidos que aún no tienen ruta quedan fuera porque no tienen muelle.
 async function generarReporteDetallePollo(req, res) {
     const { fecha } = req.query;
 
@@ -2794,23 +3256,50 @@ async function generarReporteDetallePollo(req, res) {
         return res.status(400).json({ error: 'fecha es requerida', success: false });
     }
 
+    let divisiones;
+    let muelles;
+    let formato;
+
     try {
+        divisiones = parsearDivisiones(req.query.division);
+        muelles = parsearMuelles(req.query.muelles);
+        formato = parsearFormato(req.query.formato);
+    } catch (error) {
+        return res.status(400).json({ error: error.message, success: false });
+    }
+
+    try {
+        const where = { tipo_pedido: 'POLLO', fecha_requerida: fecha };
+
+        if (divisiones) {
+            where.codigo_tienda = { [Op.in]: await obtenerCodigosTiendaPorDivision(divisiones) };
+        }
+
+        if (muelles) {
+            const rutasDeMuelles = await CatalogoRutaPolloModel.findAll({
+                where: { whs_code_origen: { [Op.in]: muelles } },
+                attributes: ['id'],
+                raw: true
+            });
+
+            where.ruta_id = { [Op.in]: rutasDeMuelles.map(r => r.id) };
+        }
+
         const cabeceras = await PedidoPosCabeceraModel.findAll({
-            where: { tipo_pedido: 'POLLO', fecha_requerida: fecha },
+            where,
             include: [{ model: PedidoPosDetalleModel, as: 'detalle' }],
             order: [['nombre_ruta', 'ASC'], ['nombre_tienda', 'ASC']]
         });
 
-        if (cabeceras.length === 0) {
-            return res.status(404).json({ error: 'No hay pedidos para esta fecha', success: false });
-        }
+        const faltantes = await calcularTiendasSinPedido({ esPollo: true, fecha, divisiones, muelles });
 
-        const rutasConBloques = agruparBloquesPorRuta(construirBloquesPedido(cabeceras));
-
-        dibujarPdfDetallePorRuta(res, {
+        return await responderReporteDetalle(res, {
+            formato,
             fecha,
-            rutasConBloques,
-            nombreArchivo: `detalle_pedidos_pollo_${fecha}.pdf`
+            cabeceras,
+            faltantes,
+            descripcionFiltros: describirFiltrosReporte(divisiones, muelles),
+            nombreBase: `detalle_pedidos_pollo_${fecha}`
         });
     } catch (error) {
         return res.status(500).json({
@@ -2821,7 +3310,8 @@ async function generarReporteDetallePollo(req, res) {
     }
 }
 
-// GET /pedido/generarReporteDetalleInsumos?fecha=...
+// GET /pedido/generarReporteDetalleInsumos?fecha=...&division=1,2
+// Igual que el de Pollo, pero sin muelles (Insumos no tiene).
 async function generarReporteDetalleInsumos(req, res) {
     const { fecha } = req.query;
 
@@ -2829,23 +3319,38 @@ async function generarReporteDetalleInsumos(req, res) {
         return res.status(400).json({ error: 'fecha es requerida', success: false });
     }
 
+    let divisiones;
+    let formato;
+
     try {
+        divisiones = parsearDivisiones(req.query.division);
+        formato = parsearFormato(req.query.formato);
+    } catch (error) {
+        return res.status(400).json({ error: error.message, success: false });
+    }
+
+    try {
+        const where = { tipo_pedido: { [Op.in]: TIPOS_INSUMOS_Y_ACTIVO_FIJO }, fecha_requerida: fecha };
+
+        if (divisiones) {
+            where.codigo_tienda = { [Op.in]: await obtenerCodigosTiendaPorDivision(divisiones) };
+        }
+
         const cabeceras = await PedidoPosCabeceraModel.findAll({
-            where: { tipo_pedido: { [Op.in]: TIPOS_INSUMOS_Y_ACTIVO_FIJO }, fecha_requerida: fecha },
+            where,
             include: [{ model: PedidoPosDetalleModel, as: 'detalle' }],
             order: [['nombre_ruta', 'ASC'], ['nombre_tienda', 'ASC']]
         });
 
-        if (cabeceras.length === 0) {
-            return res.status(404).json({ error: 'No hay pedidos para esta fecha', success: false });
-        }
+        const faltantes = await calcularTiendasSinPedido({ esPollo: false, fecha, divisiones, muelles: null });
 
-        const rutasConBloques = agruparBloquesPorRuta(construirBloquesPedido(cabeceras));
-
-        dibujarPdfDetallePorRuta(res, {
+        return await responderReporteDetalle(res, {
+            formato,
             fecha,
-            rutasConBloques,
-            nombreArchivo: `detalle_pedidos_insumos_${fecha}.pdf`
+            cabeceras,
+            faltantes,
+            descripcionFiltros: describirFiltrosReporte(divisiones, null),
+            nombreBase: `detalle_pedidos_insumos_${fecha}`
         });
     } catch (error) {
         return res.status(500).json({
@@ -2854,6 +3359,119 @@ async function generarReporteDetalleInsumos(req, res) {
             success: false
         });
     }
+}
+
+// Pedidos EN_TRANSITO (enviados a SAP, aún sin entregar) de cualquier fecha,
+// separados por división. Si se manda `division` (una sola, p. ej. para un
+// usuario lectura_division) solo salen las tiendas de esa división; si no,
+// salen las divisiones 1 y 2, cada una en su sección y en ese orden.
+async function generarReporteEnTransito(req, res, { tiposPedido, tituloTipo, prefijoArchivo, conMuelle = false }) {
+    let divisiones;
+    let formato;
+
+    try {
+        divisiones = parsearDivisiones(req.query.division) || DIVISIONES_VALIDAS;
+        formato = parsearFormato(req.query.formato);
+    } catch (error) {
+        return res.status(400).json({ error: error.message, success: false });
+    }
+
+    try {
+        const [codigosTienda, divisionPorTienda] = await Promise.all([
+            obtenerCodigosTiendaPorDivision(divisiones),
+            obtenerMapaDivisionPorTienda()
+        ]);
+
+        const cabeceras = await PedidoPosCabeceraModel.findAll({
+            where: {
+                tipo_pedido: { [Op.in]: tiposPedido },
+                estado: 'EN_TRANSITO',
+                codigo_tienda: { [Op.in]: codigosTienda }
+            },
+            include: [{ model: PedidoPosDetalleModel, as: 'detalle' }],
+            order: [['fecha_requerida', 'ASC'], ['nombre_ruta', 'ASC'], ['nombre_tienda', 'ASC']]
+        });
+
+        if (cabeceras.length === 0) {
+            return res.status(404).json({ error: 'No hay pedidos en tránsito', success: false });
+        }
+
+        // El muelle que despachó el pedido es el de su ruta (solo Pollo tiene
+        // muelles; en Insumos todo sale de la bodega "01").
+        const muellePorRuta = new Map();
+
+        if (conMuelle) {
+            const rutaIds = [...new Set(cabeceras.map(c => c.ruta_id).filter(Boolean))];
+            const rutas = await CatalogoRutaPolloModel.findAll({
+                where: { id: { [Op.in]: rutaIds } },
+                attributes: ['id', 'whs_code_origen'],
+                raw: true
+            });
+
+            rutas.forEach(r => muellePorRuta.set(r.id, r.whs_code_origen));
+        }
+
+        const bloquesPorDivision = new Map(divisiones.map(d => [d, []]));
+
+        for (const bloque of construirBloquesPedido(cabeceras)) {
+            if (conMuelle) {
+                const codigoMuelle = muellePorRuta.get(bloque.ruta_id);
+                bloque.muelle = codigoMuelle
+                    ? `${MUELLES_POLLO[codigoMuelle] || codigoMuelle} (${codigoMuelle})`
+                    : 'Sin muelle';
+            }
+
+            const division = divisionPorTienda.get(bloque.codigo_tienda);
+            if (bloquesPorDivision.has(division)) {
+                bloquesPorDivision.get(division).push(bloque);
+            }
+        }
+
+        const secciones = [...bloquesPorDivision.entries()]
+            .filter(([, bloques]) => bloques.length > 0)
+            .sort(([a], [b]) => a.localeCompare(b))
+            .map(([division, bloques]) => ({ division, bloques }));
+
+        if (secciones.length === 0) {
+            return res.status(404).json({ error: 'No hay pedidos en tránsito', success: false });
+        }
+
+        if (formato === 'excel') {
+            const libro = construirExcelEnTransito({ secciones, tituloTipo, conMuelle });
+            return await enviarLibroExcel(res, libro, `${prefijoArchivo}_en_transito.xlsx`);
+        }
+
+        dibujarPdfEnTransito(res, {
+            secciones,
+            tituloTipo,
+            nombreArchivo: `${prefijoArchivo}_en_transito.pdf`
+        });
+    } catch (error) {
+        return res.status(500).json({
+            error: 'Error al generar el reporte de pedidos en tránsito',
+            details: error.message,
+            success: false
+        });
+    }
+}
+
+// GET /pedido/generarReporteEnTransitoPollo?division=1
+function generarReporteEnTransitoPollo(req, res) {
+    return generarReporteEnTransito(req, res, {
+        tiposPedido: ['POLLO'],
+        tituloTipo: 'Pollo',
+        prefijoArchivo: 'pedidos_pollo',
+        conMuelle: true
+    });
+}
+
+// GET /pedido/generarReporteEnTransitoInsumos?division=1
+function generarReporteEnTransitoInsumos(req, res) {
+    return generarReporteEnTransito(req, res, {
+        tiposPedido: TIPOS_INSUMOS_Y_ACTIVO_FIJO,
+        tituloTipo: 'Insumos y Activo Fijo',
+        prefijoArchivo: 'pedidos_insumos'
+    });
 }
 
 // GET /pedido/generarQrsRutaPollo?ruta_id=...&fecha=...
@@ -3139,6 +3757,8 @@ module.exports = {
     generarQrsRutaInsumos,
     generarReporteDetallePollo,
     generarReporteDetalleInsumos,
+    generarReporteEnTransitoPollo,
+    generarReporteEnTransitoInsumos,
     firmarTicketPollo,
     firmarTicketInsumos,
     guardarAsignacionCantidades

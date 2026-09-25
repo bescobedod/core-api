@@ -36,7 +36,13 @@ PedidoPosCabeceraModel.init({
     camion_id: { type: DataTypes.UUID, allowNull: true },
     camion_placa: { type: DataTypes.STRING(20), allowNull: true },
     piloto_id: { type: DataTypes.BIGINT, allowNull: true },
-    piloto_nombre: { type: DataTypes.STRING(500), allowNull: true }
+    piloto_nombre: { type: DataTypes.STRING(500), allowNull: true },
+    // Los llena un sistema externo (no Core) al crear el Delivery/Entrada en
+    // SAP cuando la tienda confirma la recepción — Core solo los lee.
+    sap_delivery_docentry: { type: DataTypes.INTEGER, allowNull: true },
+    sap_delivery_docnum: { type: DataTypes.INTEGER, allowNull: true },
+    sap_entry_docentry: { type: DataTypes.INTEGER, allowNull: true },
+    sap_entry_docnum: { type: DataTypes.INTEGER, allowNull: true }
 }, {
     sequelize: sequelize,
     tableName: 'tbl_pedidos_pos_cabecera',
