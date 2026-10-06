@@ -2,6 +2,7 @@ const initPedidoEncabezadoModel = require('../../models/core/tbl_pedido_encabeza
 const PDFDocument = require('pdfkit');
 const QRCode = require('qrcode');
 const { MIME_XLSX, construirExcelDetalle, construirExcelEnTransito } = require('../../services/pedidoReportesExcel');
+const { calcularCarga, cargaDeBloques, describirCarga, formatearToneladas, viajesConCarga } = require('../../services/canastasPollo');
 const TicketTrasladoModel = require('../../models/core/tbl_tickets_traslado.model');
 const initPedidoDetalleModel = require('../../models/core/tbl_pedido_detalle.model');
 const initTiendaModel = require('../../models/pdv/tTienda.model');
@@ -213,8 +214,8 @@ async function crearPedidoActivoFijo(req, res) {
         // El código de tienda que usan los pedidos de Insumos/Pollo (los que
         // vienen del archivo/middleware Simphony) es el StoreNumberSimphony
         // de tTienda, no el código interno de PDV que manda el frontend acá
-        // — hay que guardar el mismo valor, si no getPedidosPos no logra
-        // fusionar en una sola tarjeta los pedidos de la misma tienda.
+        // — hay que guardar el mismo valor, si no el pedido no coincide con
+        // los de esa tienda (filtro por división, reportes).
         const sequelizePdv = await sequelizeInit.sequelizeInit('PDV');
         const TiendaPdvModel = initTiendaModel(sequelizePdv);
         const tiendaPdv = await TiendaPdvModel.findOne({ where: { idTienda: id_tienda } });
@@ -849,28 +850,17 @@ function agruparPedidosPosPorRuta(pedidos, esInsumos) {
             continue;
         }
 
-        // INSUMOS: se fusiona con la tarjeta de la misma tienda si ya existe
-        // (puede llegar primero el pedido de insumos o el de activo fijo,
-        // el orden no importa), si no existe se crea con ambos bloques null.
-        let tarjeta = grupo.tiendas.find(tda => tda.codigo_tienda === p.codigo_tienda);
-
-        if (!tarjeta) {
-            tarjeta = {
-                codigo_tienda: p.codigo_tienda,
-                nombre_tienda: p.nombre_tienda,
-                codigo_empresa: p.codigo_empresa,
-                codigo_bodega: p.codigo_bodega,
-                insumos: null,
-                activo_fijo: null
-            };
-            grupo.tiendas.push(tarjeta);
-        }
-
-        if (p.tipo_pedido === 'ACTIVO_FIJO') {
-            tarjeta.activo_fijo = mapearPedido(p);
-        } else {
-            tarjeta.insumos = mapearPedido(p);
-        }
+        // INSUMOS: una tarjeta por pedido (Insumos y Activo Fijo también van
+        // separados). Cada tarjeta trae solo uno de los dos bloques; el otro
+        // queda null.
+        grupo.tiendas.push({
+            codigo_tienda: p.codigo_tienda,
+            nombre_tienda: p.nombre_tienda,
+            codigo_empresa: p.codigo_empresa,
+            codigo_bodega: p.codigo_bodega,
+            insumos: p.tipo_pedido === 'ACTIVO_FIJO' ? null : mapearPedido(p),
+            activo_fijo: p.tipo_pedido === 'ACTIVO_FIJO' ? mapearPedido(p) : null
+        });
     }
 
     return Array.from(rutasMap.values()).map(ruta => {
@@ -1843,7 +1833,7 @@ async function enviarTransferenciaInsumos(req, res) {
 // ruta, totales por artículo, y líneas de firma. Se comparte entre
 // POLLO e INSUMOS, solo cambia de dónde saca los datos cada wrapper.
 // ------------------------------------------------------------
-function construirPdfTicket(res, { nombreRuta, tipoPedido, fecha, whsOrigen, whsDestino, camionPlaca, pilotoNombre, sapDocnum, lineas, nombreArchivo, firmaAdmin, firmaPiloto }) {
+function construirPdfTicket(res, { nombreRuta, tipoPedido, fecha, whsOrigen, whsDestino, camionPlaca, pilotoNombre, sapDocnum, carga = null, lineas, nombreArchivo, firmaAdmin, firmaPiloto }) {
     const doc = new PDFDocument({ margin: 40, size: 'LETTER' });
 
     res.setHeader('Content-Type', 'application/pdf');
@@ -1865,7 +1855,10 @@ function construirPdfTicket(res, { nombreRuta, tipoPedido, fecha, whsOrigen, whs
         ['Bodega destino', whsDestino || '—'],
         ['Camión', camionPlaca || '—'],
         ['Piloto', pilotoNombre || '—'],
-        ['Documento SAP', sapDocnum ? String(sapDocnum) : '—']
+        ['Documento SAP', sapDocnum ? String(sapDocnum) : '—'],
+        ...(carga && carga.canastas > 0
+            ? [['Canastas', String(carga.canastas)], ['Toneladas', formatearToneladas(carga)]]
+            : [])
     ];
 
     doc.fontSize(10);
@@ -2008,9 +2001,16 @@ function formatearFechaHoraTicket(fecha) {
     return d.toLocaleString('es-GT', { dateStyle: 'short', timeStyle: 'short' });
 }
 
+// Estados en los que se puede VER el ticket ya generado (solo lectura).
+// Firmarlo sigue exigiendo EN_TRANSITO, eso se valida aparte en
+// firmarTicketPollo/firmarTicketInsumos.
+const ESTADOS_TICKET_VISIBLE = ['EN_TRANSITO', 'ENTREGADO', 'ENTREGADO_PARCIAL', 'MIXTO'];
+
 // ------------------------------------------------------------
-// GET: genera y descarga el ticket PDF de la transferencia de POLLO
-// para una ruta+fecha ya EN_TRANSITO.
+// GET: genera y descarga el ticket PDF de la transferencia de POLLO.
+// Se puede VER (no firmar) mientras la ruta esté en tránsito o ya
+// haya sido entregada/mixta — firmarlo sigue exigiendo EN_TRANSITO,
+// eso se valida aparte en firmarTicketPollo.
 // ------------------------------------------------------------
 async function generarTicketPollo(req, res) {
     const { ruta_id, fecha } = req.query;
@@ -2027,12 +2027,12 @@ async function generarTicketPollo(req, res) {
         }
 
         const cabecera = await PedidoPosCabeceraModel.findOne({
-            where: { tipo_pedido: 'POLLO', fecha_requerida: fecha, ruta_id, estado: 'EN_TRANSITO' }
+            where: { tipo_pedido: 'POLLO', fecha_requerida: fecha, ruta_id, estado: { [Op.in]: ESTADOS_TICKET_VISIBLE } }
         });
 
         if (!cabecera) {
             return res.status(400).json({
-                error: 'Esta ruta no está en tránsito para esta fecha, no se puede generar el ticket',
+                error: 'Esta ruta no está en tránsito ni entregada para esta fecha, no se puede ver el ticket',
                 success: false
             });
         }
@@ -2082,6 +2082,7 @@ async function generarTicketPollo(req, res) {
             camionPlaca: cabecera.camion_placa,
             pilotoNombre: cabecera.piloto_nombre,
             sapDocnum: cabecera.sap_docnum,
+            carga: calcularCarga(lineas),
             lineas,
             firmaAdmin,
             firmaPiloto,
@@ -2114,12 +2115,12 @@ async function generarTicketInsumos(req, res) {
         }
 
         const cabecera = await PedidoPosCabeceraModel.findOne({
-            where: { tipo_pedido: { [Op.in]: TIPOS_INSUMOS_Y_ACTIVO_FIJO }, fecha_requerida: fecha, ruta_id, estado: 'EN_TRANSITO' }
+            where: { tipo_pedido: { [Op.in]: TIPOS_INSUMOS_Y_ACTIVO_FIJO }, fecha_requerida: fecha, ruta_id, estado: { [Op.in]: ESTADOS_TICKET_VISIBLE } }
         });
 
         if (!cabecera) {
             return res.status(400).json({
-                error: 'Esta ruta no está en tránsito para esta fecha, no se puede generar el ticket',
+                error: 'Esta ruta no está en tránsito ni entregada para esta fecha, no se puede ver el ticket',
                 success: false
             });
         }
@@ -2376,10 +2377,16 @@ async function generarResumenRutaPollo(req, res) {
 
         const yaEnviada = cabeceras.some(c => ['EN_TRANSITO', 'ENTREGADO', 'ENTREGADO_PARCIAL'].includes(c.estado));
 
+        const carga = calcularCarga(articulos.map(a => ({
+            codigo_producto: a.codigo_producto,
+            cantidad: [...a.cantidadPorTienda.values()].reduce((suma, c) => suma + c, 0)
+        })));
+
         construirPdfResumenRuta(res, {
             nombreRuta: ruta.nombre_ruta,
             fecha,
             preliminar: !yaEnviada,
+            carga,
             tiendas,
             articulos,
             nombreArchivo: `resumen_ruta_pollo_${ruta.nombre_ruta || ruta_id}_${fecha}.pdf`
@@ -2401,7 +2408,7 @@ async function generarResumenRutaPollo(req, res) {
 // el encabezado — el total de cada fila siempre suma TODAS las tiendas,
 // no solo las del grupo que se esté mostrando en esa página.
 // ------------------------------------------------------------
-function construirPdfResumenRuta(res, { nombreRuta, fecha, preliminar, tiendas, articulos, nombreArchivo }) {
+function construirPdfResumenRuta(res, { nombreRuta, fecha, preliminar, carga = null, tiendas, articulos, nombreArchivo }) {
     const doc = new PDFDocument({ margin: 30, size: 'LETTER', layout: 'landscape' });
 
     res.setHeader('Content-Type', 'application/pdf');
@@ -2427,7 +2434,7 @@ function construirPdfResumenRuta(res, { nombreRuta, fecha, preliminar, tiendas, 
     const dibujarEncabezado = (grupoTiendas) => {
         doc.fontSize(14).font('Helvetica-Bold').text(`Resumen de Ruta${preliminar ? ' (Preliminar)' : ''}`, { align: 'center' });
         doc.fontSize(9).font('Helvetica').fillColor('#555555')
-            .text(`Fecha Entrega: ${fecha}    Ruta: ${nombreRuta || '—'}`, { align: 'center' });
+            .text(`Fecha Entrega: ${fecha}    Ruta: ${nombreRuta || '—'}${carga && carga.canastas > 0 ? `    ${describirCarga(carga)}` : ''}`, { align: 'center' });
         doc.fillColor('#000000');
         doc.moveDown(0.6);
 
@@ -2575,7 +2582,7 @@ async function construirBloquesQr(cabeceras) {
 // un bloque por pedido apilado uno tras otro (nombre de tienda, tabla simple
 // de artículos, y el QR al final) — nada de matriz ni columnas por tienda,
 // a propósito, para que sea lo más simple posible de leer e imprimir.
-function dibujarPdfQrsRuta(res, { nombreRuta, fecha, bloques, nombreArchivo }) {
+function dibujarPdfQrsRuta(res, { nombreRuta, fecha, bloques, carga = null, nombreArchivo }) {
     const doc = new PDFDocument({ margin: 40, size: 'LETTER' });
 
     res.setHeader('Content-Type', 'application/pdf');
@@ -2594,7 +2601,7 @@ function dibujarPdfQrsRuta(res, { nombreRuta, fecha, bloques, nombreArchivo }) {
 
     doc.fontSize(14).font('Helvetica-Bold').text('Códigos QR de Pedidos', { align: 'center' });
     doc.fontSize(9).font('Helvetica').fillColor('#555555')
-        .text(`Ruta: ${nombreRuta || '—'}    Fecha Entrega: ${fecha}`, { align: 'center' });
+        .text(`Ruta: ${nombreRuta || '—'}    Fecha Entrega: ${fecha}${carga && carga.canastas > 0 ? `    ${describirCarga(carga)}` : ''}`, { align: 'center' });
     doc.fillColor('#000000');
     doc.moveDown(0.8);
 
@@ -2876,7 +2883,7 @@ function dibujarEncabezadoBloque(doc, L, bloque, { mostrarEstado, mostrarDocsSap
 // (incluso antes de procesar cualquier ruta).
 // Si al menos un pedido ya está ENTREGADO/ENTREGADO_PARCIAL, se agregan la
 // columna "Recibido", el estado de cada pedido y sus documentos de SAP.
-function dibujarPdfDetallePorRuta(res, { fecha, rutasConBloques, nombreArchivo, descripcionFiltros, faltantes = [] }) {
+function dibujarPdfDetallePorRuta(res, { fecha, rutasConBloques, nombreArchivo, descripcionFiltros, faltantes = [], conCarga = false }) {
     const doc = new PDFDocument({ margin: 40, size: 'LETTER' });
 
     res.setHeader('Content-Type', 'application/pdf');
@@ -2944,6 +2951,14 @@ function dibujarPdfDetallePorRuta(res, { fecha, rutasConBloques, nombreArchivo, 
         doc.fillColor('#000000');
         doc.moveTo(startX, doc.y + 2).lineTo(startX + anchoUtil, doc.y + 2).strokeColor('#2183AE').stroke();
         doc.moveDown(0.5);
+
+        const cargaRuta = conCarga ? cargaDeBloques(ruta.bloques) : null;
+        if (cargaRuta && cargaRuta.canastas > 0) {
+            doc.font('Helvetica-Bold').fontSize(9).fillColor('#374151')
+                .text(describirCarga(cargaRuta), startX);
+            doc.fillColor('#000000');
+            doc.moveDown(0.4);
+        }
 
         ruta.bloques.forEach((bloque) => {
             if (doc.y + alturaEstimadaBloque(bloque, { mostrarDocsSap: conEntregas }) > doc.page.height - doc.page.margins.bottom) {
@@ -3015,7 +3030,7 @@ function dibujarPdfDetallePorRuta(res, { fecha, rutasConBloques, nombreArchivo, 
 // Dibuja el PDF de generarReporteEnTransito*: carta vertical, pedidos que ya
 // se enviaron a SAP y siguen en ruta (sin importar la fecha), separados en
 // secciones por división y ordenados por fecha requerida, ruta y tienda.
-function dibujarPdfEnTransito(res, { secciones, tituloTipo, nombreArchivo }) {
+function dibujarPdfEnTransito(res, { secciones, viajes = [], tituloTipo, nombreArchivo }) {
     const doc = new PDFDocument({ margin: 40, size: 'LETTER' });
 
     res.setHeader('Content-Type', 'application/pdf');
@@ -3041,6 +3056,21 @@ function dibujarPdfEnTransito(res, { secciones, tituloTipo, nombreArchivo }) {
         doc.fillColor('#000000');
         doc.moveTo(L.startX, doc.y + 2).lineTo(L.startX + L.anchoUtil, doc.y + 2).strokeColor('#2183AE').stroke();
         doc.moveDown(0.6);
+
+        // Canastas y toneladas por viaje (ruta + fecha) de esta sección.
+        const viajesDeLaSeccion = viajes.filter(v =>
+            seccion.bloques.some(b => b.ruta_id === v.ruta_id && b.fecha_requerida === v.fecha_requerida));
+
+        if (viajesDeLaSeccion.length > 0) {
+            doc.font('Helvetica-Bold').fontSize(9).fillColor('#374151').text('Carga por ruta', L.startX);
+            doc.font('Helvetica').fontSize(9);
+            viajesDeLaSeccion.forEach((v) => {
+                if (doc.y + 12 > doc.page.height - doc.page.margins.bottom) doc.addPage();
+                doc.text(`•  ${v.nombre_ruta} (${v.fecha_requerida || '—'}): ${v.canastas} canasta${v.canastas !== 1 ? 's' : ''}  ·  ${formatearToneladas(v)} toneladas`, L.startX + 8);
+            });
+            doc.fillColor('#000000');
+            doc.moveDown(0.6);
+        }
 
         seccion.bloques.forEach((bloque) => {
             const detalles = [
@@ -3207,7 +3237,7 @@ async function calcularTiendasSinPedido({ esPollo, fecha, divisiones, muelles })
 
 // Arma la respuesta del reporte de pedidos por fecha, en PDF o Excel: mismos
 // datos (resumen general, detalle y tiendas sin pedido) en los dos formatos.
-async function responderReporteDetalle(res, { formato, fecha, cabeceras, faltantes, descripcionFiltros, nombreBase }) {
+async function responderReporteDetalle(res, { formato, fecha, cabeceras, faltantes, descripcionFiltros, nombreBase, conCarga = false }) {
     if (cabeceras.length === 0 && faltantes.length === 0) {
         return res.status(404).json({
             error: 'No hay pedidos ni tiendas asignadas para esos filtros y esta fecha',
@@ -3226,7 +3256,8 @@ async function responderReporteDetalle(res, { formato, fecha, cabeceras, faltant
             resumenGeneral: calcularResumenGeneral(rutasConBloques),
             conEntregas: reporteTieneEntregas(rutasConBloques),
             resumenEstados: resumenEstadosPedidos(rutasConBloques),
-            etiquetaEstado: etiquetaEstadoPedido
+            etiquetaEstado: etiquetaEstadoPedido,
+            conCarga
         });
 
         return enviarLibroExcel(res, libro, `${nombreBase}.xlsx`);
@@ -3237,6 +3268,7 @@ async function responderReporteDetalle(res, { formato, fecha, cabeceras, faltant
         rutasConBloques,
         descripcionFiltros,
         faltantes,
+        conCarga,
         nombreArchivo: `${nombreBase}.pdf`
     });
 }
@@ -3299,7 +3331,8 @@ async function generarReporteDetallePollo(req, res) {
             cabeceras,
             faltantes,
             descripcionFiltros: describirFiltrosReporte(divisiones, muelles),
-            nombreBase: `detalle_pedidos_pollo_${fecha}`
+            nombreBase: `detalle_pedidos_pollo_${fecha}`,
+            conCarga: true
         });
     } catch (error) {
         return res.status(500).json({
@@ -3365,7 +3398,7 @@ async function generarReporteDetalleInsumos(req, res) {
 // separados por división. Si se manda `division` (una sola, p. ej. para un
 // usuario lectura_division) solo salen las tiendas de esa división; si no,
 // salen las divisiones 1 y 2, cada una en su sección y en ese orden.
-async function generarReporteEnTransito(req, res, { tiposPedido, tituloTipo, prefijoArchivo, conMuelle = false }) {
+async function generarReporteEnTransito(req, res, { tiposPedido, tituloTipo, prefijoArchivo, conMuelle = false, conCarga = false }) {
     let divisiones;
     let formato;
 
@@ -3436,13 +3469,18 @@ async function generarReporteEnTransito(req, res, { tiposPedido, tituloTipo, pre
             return res.status(404).json({ error: 'No hay pedidos en tránsito', success: false });
         }
 
+        // Se calcula con todos los pedidos del reporte (no por sección): una
+        // ruta con tiendas de ambas divisiones es un solo camión.
+        const viajes = conCarga ? viajesConCarga(secciones.flatMap(s => s.bloques)) : [];
+
         if (formato === 'excel') {
-            const libro = construirExcelEnTransito({ secciones, tituloTipo, conMuelle });
+            const libro = construirExcelEnTransito({ secciones, viajes, tituloTipo, conMuelle });
             return await enviarLibroExcel(res, libro, `${prefijoArchivo}_en_transito.xlsx`);
         }
 
         dibujarPdfEnTransito(res, {
             secciones,
+            viajes,
             tituloTipo,
             nombreArchivo: `${prefijoArchivo}_en_transito.pdf`
         });
@@ -3461,7 +3499,8 @@ function generarReporteEnTransitoPollo(req, res) {
         tiposPedido: ['POLLO'],
         tituloTipo: 'Pollo',
         prefijoArchivo: 'pedidos_pollo',
-        conMuelle: true
+        conMuelle: true,
+        conCarga: true
     });
 }
 
@@ -3505,6 +3544,7 @@ async function generarQrsRutaPollo(req, res) {
             nombreRuta: ruta.nombre_ruta,
             fecha,
             bloques,
+            carga: cargaDeBloques(bloques),
             nombreArchivo: `qrs_ruta_pollo_${ruta.nombre_ruta || ruta_id}_${fecha}.pdf`
         });
     } catch (error) {

@@ -1,4 +1,5 @@
 const ExcelJS = require('exceljs');
+const { cargaDeBloques } = require('./canastasPollo');
 
 // Versiones en Excel de los reportes PDF de pedidos. Llevan exactamente la
 // misma información que el PDF, pero en tablas planas (una fila por artículo)
@@ -61,7 +62,8 @@ function agregarTabla(hoja, columnas, filas) {
 // resumenGeneral / conEntregas / resumenEstados / etiquetaEstado los calcula
 // el controlador con los mismos helpers del PDF, para que no puedan diferir.
 function construirExcelDetalle({
-    fecha, descripcionFiltros, rutasConBloques, resumenGeneral, conEntregas, resumenEstados, faltantes, etiquetaEstado
+    fecha, descripcionFiltros, rutasConBloques, resumenGeneral, conEntregas, resumenEstados, faltantes, etiquetaEstado,
+    conCarga = false
 }) {
     const libro = nuevoLibro();
 
@@ -143,6 +145,23 @@ function construirExcelDetalle({
 
     agregarTabla(hojaDetalle, columnasDetalle, filasDetalle);
 
+    // ---- Carga por ruta (solo Pollo) ----
+    const filasCarga = (conCarga ? rutasConBloques : [])
+        .map(ruta => ({ ruta: ruta.nombre_ruta, ...cargaDeBloques(ruta.bloques) }))
+        .filter(f => f.canastas > 0)
+        .map(f => ({ ...f, toneladas: Number(f.toneladas.toFixed(2)) }));
+
+    if (filasCarga.length > 0) {
+        const hojaCarga = libro.addWorksheet('Carga por ruta');
+        agregarTitulo(hojaCarga, 'Carga por ruta (canastas y toneladas)', [`Fecha Entrega: ${fecha}`, descripcionFiltros]);
+        agregarTabla(hojaCarga, [
+            { header: 'Ruta', key: 'ruta', width: 30 },
+            { header: 'Canastas', key: 'canastas', width: 12, centrada: true },
+            { header: 'Libras', key: 'libras', width: 12, centrada: true },
+            { header: 'Toneladas', key: 'toneladas', width: 12, centrada: true }
+        ], filasCarga);
+    }
+
     // ---- Tiendas sin pedido ----
     const hojaFaltantes = libro.addWorksheet('Tiendas sin pedido');
     agregarTitulo(hojaFaltantes, 'Tiendas que no hicieron pedido para esta fecha', [`Fecha Entrega: ${fecha}`, descripcionFiltros]);
@@ -171,7 +190,7 @@ function construirExcelDetalle({
 
 // secciones: [{ division, bloques }] (mismo formato que el PDF de pedidos en
 // tránsito); una hoja por división.
-function construirExcelEnTransito({ secciones, tituloTipo, conMuelle }) {
+function construirExcelEnTransito({ secciones, viajes = [], tituloTipo, conMuelle }) {
     const libro = nuevoLibro();
 
     secciones.forEach((seccion) => {
@@ -221,6 +240,33 @@ function construirExcelEnTransito({ secciones, tituloTipo, conMuelle }) {
 
         agregarTabla(hoja, columnas, filas);
     });
+
+    // ---- Carga por ruta y fecha (un camión = una ruta en una fecha) ----
+    if (viajes.length > 0) {
+        const hojaCarga = libro.addWorksheet('Carga por ruta');
+        agregarTitulo(hojaCarga, `Carga por ruta (canastas y toneladas) — ${tituloTipo}`, [
+            'Pedidos en tránsito, agrupados por ruta y fecha requerida'
+        ]);
+        agregarTabla(hojaCarga, [
+            { header: 'Fecha requerida', key: 'fecha', width: 16, centrada: true },
+            { header: 'Ruta', key: 'ruta', width: 24 },
+            ...(conMuelle ? [{ header: 'Muelle', key: 'muelle', width: 22 }] : []),
+            { header: 'Piloto', key: 'piloto', width: 30 },
+            { header: 'Camión', key: 'camion', width: 12 },
+            { header: 'Canastas', key: 'canastas', width: 12, centrada: true },
+            { header: 'Libras', key: 'libras', width: 12, centrada: true },
+            { header: 'Toneladas', key: 'toneladas', width: 12, centrada: true }
+        ], viajes.map(v => ({
+            fecha: v.fecha_requerida,
+            ruta: v.nombre_ruta,
+            muelle: v.muelle,
+            piloto: v.piloto_nombre || 'Sin asignar',
+            camion: v.camion_placa || 'Sin asignar',
+            canastas: v.canastas,
+            libras: v.libras,
+            toneladas: Number(v.toneladas.toFixed(2))
+        })));
+    }
 
     return libro;
 }

@@ -25,6 +25,7 @@ const notificacionContextos = require('../controllers/core/notificacion_contexto
 const pilotoClienteSap = require('../controllers/core/piloto_cliente_sap.controller.js');
 const roles = require('../controllers/core/rol.controller.js');
 const usuarioMuellePollo = require('../controllers/core/usuario_muelle_pollo.controller.js');
+const visitas = require('../controllers/core/visita.controller.js');
 const auth = require('../middlewares/auth.js');
 const upload = require('../middlewares/upload.js');
 const rateLimit = require('express-rate-limit');
@@ -66,6 +67,12 @@ router.get('/usuario-muelle-pollo/getUsuariosPorMuelle', auth, usuarioMuellePoll
 router.get('/usuario-muelle-pollo/buscarUsuarios', auth, usuarioMuellePollo.buscarUsuarios);
 router.post('/usuario-muelle-pollo/asignarMuelle', auth, usuarioMuellePollo.asignarMuelle);
 router.delete('/usuario-muelle-pollo/quitarMuelle/:id_usuario', auth, usuarioMuellePollo.quitarMuelle);
+
+//VISITAS A AVICOLAS
+router.get('/visita/getUsuarios', auth, visitas.getUsuariosConVisitas);
+router.get('/visita/buscarVisitas', auth, visitas.buscarVisitas);
+router.get('/visita/getVisita', auth, visitas.getVisita);
+router.get('/visita/exportarVisitas', auth, visitas.exportarVisitas);
 
 //PEDIDOS-ENVIOS
 router.get('/pedido/getAllTipoPedidoEnvio', tiposPedidoEnvio.getAllTipoPedidoEnvio);
