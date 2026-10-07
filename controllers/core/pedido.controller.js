@@ -1,7 +1,7 @@
 const initPedidoEncabezadoModel = require('../../models/core/tbl_pedido_encabezado.model');
 const PDFDocument = require('pdfkit');
 const QRCode = require('qrcode');
-const { MIME_XLSX, construirExcelDetalle, construirExcelEnTransito } = require('../../services/pedidoReportesExcel');
+const { MIME_XLSX, construirExcelDetalle, construirExcelDetalleRango, construirExcelEnTransito } = require('../../services/pedidoReportesExcel');
 const { calcularCarga, cargaDeBloques, describirCarga, formatearToneladas, viajesConCarga } = require('../../services/canastasPollo');
 const TicketTrasladoModel = require('../../models/core/tbl_tickets_traslado.model');
 const initPedidoDetalleModel = require('../../models/core/tbl_pedido_detalle.model');
@@ -2874,41 +2874,9 @@ function dibujarEncabezadoBloque(doc, L, bloque, { mostrarEstado, mostrarDocsSap
     doc.moveDown(0.4);
 }
 
-// Dibuja el PDF de generarReporteDetallePollo/generarReporteDetalleInsumos:
-// carta vertical. Primero un resumen general con el total pedido/enviado
-// por artículo entre TODAS las rutas (para saber de un vistazo cuánto hay
-// que despachar ese día), y debajo el detalle: cada ruta como sección, y
-// dentro un bloque por pedido igual que en dibujarPdfQrsRuta pero sin QR
-// ni línea de firma — pensado para poder generarse en cualquier momento
-// (incluso antes de procesar cualquier ruta).
-// Si al menos un pedido ya está ENTREGADO/ENTREGADO_PARCIAL, se agregan la
-// columna "Recibido", el estado de cada pedido y sus documentos de SAP.
-function dibujarPdfDetallePorRuta(res, { fecha, rutasConBloques, nombreArchivo, descripcionFiltros, faltantes = [], conCarga = false }) {
-    const doc = new PDFDocument({ margin: 40, size: 'LETTER' });
-
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename="${nombreArchivo}"`);
-    doc.pipe(res);
-
-    const conEntregas = reporteTieneEntregas(rutasConBloques);
-    const L = crearLayoutTabla(doc, conEntregas);
+// Resumen general (total por artículo) de los reportes de detalle.
+function dibujarResumenGeneral(doc, L, resumenGeneral, mensajeVacio) {
     const { startX, anchoUtil } = L;
-
-    doc.fontSize(14).font('Helvetica-Bold').text('Detalle de Pedidos por Tienda', { align: 'center' });
-    doc.fontSize(9).font('Helvetica').fillColor('#555555').text(`Fecha Entrega: ${fecha}`, { align: 'center' });
-    if (descripcionFiltros) {
-        doc.text(descripcionFiltros, { align: 'center' });
-    }
-    if (conEntregas) {
-        doc.font('Helvetica-Bold').fillColor('#374151')
-            .text(`Estado de los pedidos: ${resumenEstadosPedidos(rutasConBloques)}`, { align: 'center' });
-    }
-    doc.fillColor('#000000');
-    doc.moveDown(0.8);
-
-    // Resumen general: total por artículo entre todas las rutas, para saber
-    // de un vistazo cuánto hay que despachar ese día.
-    const resumenGeneral = calcularResumenGeneral(rutasConBloques);
 
     doc.font('Helvetica-Bold').fontSize(12).fillColor('#2183AE');
     doc.text('Resumen General', startX);
@@ -2934,12 +2902,15 @@ function dibujarPdfDetallePorRuta(res, { fecha, rutasConBloques, nombreArchivo, 
     });
 
     if (resumenGeneral.length === 0) {
-        doc.font('Helvetica').fontSize(9).fillColor('#6b7280')
-            .text('No hubo pedidos para esta fecha con esos filtros.', startX);
+        doc.font('Helvetica').fontSize(9).fillColor('#6b7280').text(mensajeVacio, startX);
         doc.fillColor('#000000');
     }
+}
 
-    doc.addPage();
+// Cada ruta como sección (con su carga en Pollo) y, dentro, un bloque por
+// pedido con su tabla de artículos.
+function dibujarRutasConBloques(doc, L, rutasConBloques, { conEntregas, conCarga }) {
+    const { startX, anchoUtil } = L;
 
     rutasConBloques.forEach((ruta) => {
         if (doc.y + 40 > doc.page.height - doc.page.margins.bottom) {
@@ -2981,6 +2952,101 @@ function dibujarPdfDetallePorRuta(res, { fecha, rutasConBloques, nombreArchivo, 
             doc.moveDown(0.6);
         });
     });
+}
+
+// Dibuja el PDF del reporte de pedidos por RANGO de fechas (búsqueda
+// avanzada). Es un documento distinto al de una sola fecha: primero un
+// resumen general de todo el rango y luego una sección por fecha de entrega,
+// cada una en hoja nueva, con sus rutas y pedidos. No lleva "tiendas sin
+// pedido" (esa sección solo tiene sentido para un día).
+// fechas: [{ fecha, rutasConBloques }] ordenadas por fecha.
+function dibujarPdfDetalleRango(res, { fechaDesde, fechaHasta, fechas, nombreArchivo, descripcionFiltros, conCarga = false }) {
+    const doc = new PDFDocument({ margin: 40, size: 'LETTER' });
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${nombreArchivo}"`);
+    doc.pipe(res);
+
+    const todasLasRutas = fechas.flatMap(f => f.rutasConBloques);
+    const conEntregas = reporteTieneEntregas(todasLasRutas);
+    const L = crearLayoutTabla(doc, conEntregas);
+    const { startX, anchoUtil } = L;
+
+    doc.fontSize(14).font('Helvetica-Bold').text('Detalle de Pedidos por Rango de Fechas', { align: 'center' });
+    doc.fontSize(9).font('Helvetica').fillColor('#555555')
+        .text(`Fechas de entrega: ${fechaDesde} al ${fechaHasta}   ·   ${fechas.length} día${fechas.length !== 1 ? 's' : ''} con pedidos`, { align: 'center' });
+    if (descripcionFiltros) {
+        doc.text(descripcionFiltros, { align: 'center' });
+    }
+    if (conEntregas) {
+        doc.font('Helvetica-Bold').fillColor('#374151')
+            .text(`Estado de los pedidos: ${resumenEstadosPedidos(todasLasRutas)}`, { align: 'center' });
+    }
+    doc.fillColor('#000000');
+    doc.moveDown(0.8);
+
+    dibujarResumenGeneral(doc, L, calcularResumenGeneral(todasLasRutas), 'No hubo pedidos en este rango con esos filtros.');
+
+    fechas.forEach(({ fecha, rutasConBloques }) => {
+        doc.addPage();
+
+        doc.font('Helvetica-Bold').fontSize(13).fillColor('#111827');
+        doc.text(`Fecha de entrega: ${fecha}`, startX);
+        doc.fillColor('#000000');
+        doc.moveTo(startX, doc.y + 2).lineTo(startX + anchoUtil, doc.y + 2).strokeColor('#111827').stroke();
+        doc.moveDown(0.8);
+
+        dibujarRutasConBloques(doc, L, rutasConBloques, { conEntregas, conCarga });
+    });
+
+    doc.end();
+}
+
+// Dibuja el PDF de generarReporteDetallePollo/generarReporteDetalleInsumos:
+// carta vertical. Primero un resumen general con el total pedido/enviado
+// por artículo entre TODAS las rutas (para saber de un vistazo cuánto hay
+// que despachar ese día), y debajo el detalle: cada ruta como sección, y
+// dentro un bloque por pedido igual que en dibujarPdfQrsRuta pero sin QR
+// ni línea de firma — pensado para poder generarse en cualquier momento
+// (incluso antes de procesar cualquier ruta).
+// Si al menos un pedido ya está ENTREGADO/ENTREGADO_PARCIAL, se agregan la
+// columna "Recibido", el estado de cada pedido y sus documentos de SAP.
+function dibujarPdfDetallePorRuta(res, { fecha, rutasConBloques, nombreArchivo, descripcionFiltros, faltantes = [], conCarga = false }) {
+    const doc = new PDFDocument({ margin: 40, size: 'LETTER' });
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${nombreArchivo}"`);
+    doc.pipe(res);
+
+    const conEntregas = reporteTieneEntregas(rutasConBloques);
+    const L = crearLayoutTabla(doc, conEntregas);
+    const { startX, anchoUtil } = L;
+
+    doc.fontSize(14).font('Helvetica-Bold').text('Detalle de Pedidos por Tienda', { align: 'center' });
+    doc.fontSize(9).font('Helvetica').fillColor('#555555').text(`Fecha Entrega: ${fecha}`, { align: 'center' });
+    if (descripcionFiltros) {
+        doc.text(descripcionFiltros, { align: 'center' });
+    }
+    if (conEntregas) {
+        doc.font('Helvetica-Bold').fillColor('#374151')
+            .text(`Estado de los pedidos: ${resumenEstadosPedidos(rutasConBloques)}`, { align: 'center' });
+    }
+    doc.fillColor('#000000');
+    doc.moveDown(0.8);
+
+    // Resumen general: total por artículo entre todas las rutas, para saber
+    // de un vistazo cuánto hay que despachar ese día.
+    dibujarResumenGeneral(doc, L, calcularResumenGeneral(rutasConBloques), 'No hubo pedidos para esta fecha con esos filtros.');
+
+    doc.addPage();
+
+    dibujarRutasConBloques(doc, L, rutasConBloques, { conEntregas, conCarga });
+
+    // Con filtro de producto la sección de tiendas sin pedido no aplica.
+    if (faltantes === null) {
+        doc.end();
+        return;
+    }
 
     // Tiendas asignadas a las rutas del reporte que no hicieron pedido esa
     // fecha, por división y por ruta. Sin rutas con pedidos ya estamos en una
@@ -3235,10 +3301,128 @@ async function calcularTiendasSinPedido({ esPollo, fecha, divisiones, muelles })
         }));
 }
 
+// Búsqueda avanzada del reporte de detalle: rango de fechas (`fecha` es el
+// inicio y `fecha_hasta` el fin) y filtro de productos (`productos`, códigos
+// separados por coma). Sin ninguno de los dos, el reporte es el de siempre.
+// Un rango con la misma fecha en ambos extremos cuenta como un solo día.
+const MAX_DIAS_RANGO_REPORTE = 31;
+const REGEX_FECHA_REPORTE = /^\d{4}-\d{2}-\d{2}$/;
+
+function parsearBusquedaAvanzada(query) {
+    const fecha = String(query.fecha || '').trim();
+    const fechaHasta = String(query.fecha_hasta || '').trim();
+    let esRango = false;
+
+    if (fechaHasta) {
+        if (!REGEX_FECHA_REPORTE.test(fecha) || !REGEX_FECHA_REPORTE.test(fechaHasta)) {
+            throw new Error('fecha y fecha_hasta deben tener el formato YYYY-MM-DD');
+        }
+
+        if (fechaHasta < fecha) {
+            throw new Error('fecha_hasta no puede ser anterior a fecha');
+        }
+
+        const dias = (Date.parse(fechaHasta) - Date.parse(fecha)) / 86400000 + 1;
+
+        if (dias > MAX_DIAS_RANGO_REPORTE) {
+            throw new Error(`El rango de fechas no puede pasar de ${MAX_DIAS_RANGO_REPORTE} días`);
+        }
+
+        esRango = dias > 1;
+    }
+
+    const productos = [...new Set(String(query.productos || '').split(',').map(p => p.trim()).filter(Boolean))];
+
+    return { esRango, fechaHasta: esRango ? fechaHasta : null, productos: productos.length > 0 ? productos : null };
+}
+
+// Filtros de fecha y de productos para la consulta de cabeceras. Con productos,
+// el include de detalle solo trae esas líneas, y los pedidos sin ninguna de
+// ellas quedan fuera (el where del include lo vuelve un inner join).
+function aplicarBusquedaAvanzada(where, { fecha, esRango, fechaHasta, productos }) {
+    where.fecha_requerida = esRango ? { [Op.between]: [fecha, fechaHasta] } : fecha;
+
+    return [{
+        model: PedidoPosDetalleModel,
+        as: 'detalle',
+        ...(productos ? { where: { codigo_producto: { [Op.in]: productos } } } : {})
+    }];
+}
+
+// "Productos: A, B, C (+2 más)" con los nombres de lo que trae el reporte.
+function describirProductos(productos, cabeceras) {
+    const nombres = new Map();
+
+    cabeceras.forEach(c => c.detalle.forEach(d => {
+        if (!nombres.has(d.codigo_producto)) nombres.set(d.codigo_producto, d.descripcion_producto);
+    }));
+
+    const etiquetas = productos.map(codigo => nombres.get(codigo) || codigo);
+    const visibles = etiquetas.slice(0, 5).join(', ');
+
+    return `Productos: ${visibles}${etiquetas.length > 5 ? ` (+${etiquetas.length - 5} más)` : ''}`;
+}
+
+// Agrupa bloques por fecha de entrega y, dentro de cada fecha, por ruta.
+function agruparBloquesPorFecha(bloques) {
+    const porFecha = new Map();
+
+    for (const bloque of bloques) {
+        const fecha = String(bloque.fecha_requerida);
+        if (!porFecha.has(fecha)) porFecha.set(fecha, []);
+        porFecha.get(fecha).push(bloque);
+    }
+
+    return [...porFecha.entries()]
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([fecha, delDia]) => ({ fecha, rutasConBloques: agruparBloquesPorRuta(delDia) }));
+}
+
+// Respuesta del reporte por RANGO de fechas (PDF o Excel): documento distinto
+// al de una sola fecha, agrupado por fecha y luego por ruta.
+async function responderReporteDetalleRango(res, { formato, fecha, fechaHasta, cabeceras, descripcionFiltros, nombreBase, conCarga = false }) {
+    if (cabeceras.length === 0) {
+        return res.status(404).json({
+            error: 'No hay pedidos para esos filtros en el rango de fechas',
+            success: false
+        });
+    }
+
+    const fechas = agruparBloquesPorFecha(construirBloquesPedido(cabeceras));
+    const todasLasRutas = fechas.flatMap(f => f.rutasConBloques);
+
+    if (formato === 'excel') {
+        const libro = construirExcelDetalleRango({
+            fechaDesde: fecha,
+            fechaHasta,
+            descripcionFiltros,
+            fechas,
+            resumenGeneral: calcularResumenGeneral(todasLasRutas),
+            conEntregas: reporteTieneEntregas(todasLasRutas),
+            resumenEstados: resumenEstadosPedidos(todasLasRutas),
+            etiquetaEstado: etiquetaEstadoPedido,
+            conCarga
+        });
+
+        return enviarLibroExcel(res, libro, `${nombreBase}.xlsx`);
+    }
+
+    return dibujarPdfDetalleRango(res, {
+        fechaDesde: fecha,
+        fechaHasta,
+        fechas,
+        descripcionFiltros,
+        conCarga,
+        nombreArchivo: `${nombreBase}.pdf`
+    });
+}
+
 // Arma la respuesta del reporte de pedidos por fecha, en PDF o Excel: mismos
 // datos (resumen general, detalle y tiendas sin pedido) en los dos formatos.
+// faltantes === null significa "sin sección de tiendas sin pedido" (filtro de
+// productos activo).
 async function responderReporteDetalle(res, { formato, fecha, cabeceras, faltantes, descripcionFiltros, nombreBase, conCarga = false }) {
-    if (cabeceras.length === 0 && faltantes.length === 0) {
+    if (cabeceras.length === 0 && (faltantes === null || faltantes.length === 0)) {
         return res.status(404).json({
             error: 'No hay pedidos ni tiendas asignadas para esos filtros y esta fecha',
             success: false
@@ -3273,7 +3457,125 @@ async function responderReporteDetalle(res, { formato, fecha, cabeceras, faltant
     });
 }
 
+// Elige entre el reporte de una sola fecha (el de siempre) y el de rango de
+// fechas. `faltantes` es null cuando la búsqueda avanzada no lo permite (rango
+// o filtro de productos).
+function responderReporteDetalleAvanzado(res, { formato, fecha, busqueda, cabeceras, faltantes, descripcionFiltros, nombreBase, conCarga }) {
+    const descripcion = busqueda.productos
+        ? `${descripcionFiltros}   ·   ${describirProductos(busqueda.productos, cabeceras)}`
+        : descripcionFiltros;
+
+    if (busqueda.esRango) {
+        return responderReporteDetalleRango(res, {
+            formato,
+            fecha,
+            fechaHasta: busqueda.fechaHasta,
+            cabeceras,
+            descripcionFiltros: descripcion,
+            nombreBase: `${nombreBase}_a_${busqueda.fechaHasta}`,
+            conCarga
+        });
+    }
+
+    return responderReporteDetalle(res, {
+        formato,
+        fecha,
+        cabeceras,
+        faltantes,
+        descripcionFiltros: descripcion,
+        nombreBase,
+        conCarga
+    });
+}
+
+// La lista de productos del reporte solo considera pedidos de los últimos
+// 12 meses (por fecha requerida) y se guarda en memoria unos minutos, por tipo.
+const MESES_PRODUCTOS_REPORTE = 12;
+const TTL_PRODUCTOS_REPORTE_MS = 10 * 60 * 1000;
+const cacheProductosReporte = new Map();
+
+async function consultarProductosReporte(tipo_pedido) {
+    const tipos = tipo_pedido === 'INSUMOS' ? TIPOS_INSUMOS_Y_ACTIVO_FIJO : ['POLLO'];
+
+    const desde = new Date();
+    desde.setMonth(desde.getMonth() - MESES_PRODUCTOS_REPORTE);
+
+    // Un mismo código puede venir con distinta descripción o unidad en pedidos
+    // distintos: se agrupa por las tres y luego se queda la más reciente.
+    const filas = await PedidoPosDetalleModel.findAll({
+        attributes: [
+            'codigo_producto',
+            'descripcion_producto',
+            'unidad_medida',
+            [fn('MAX', col('cabecera.fecha_requerida')), 'ultima_fecha']
+        ],
+        include: [{
+            model: PedidoPosCabeceraModel,
+            as: 'cabecera',
+            attributes: [],
+            where: {
+                tipo_pedido: { [Op.in]: tipos },
+                fecha_requerida: { [Op.gte]: desde.toISOString().slice(0, 10) }
+            }
+        }],
+        where: { codigo_producto: { [Op.ne]: null } },
+        group: ['codigo_producto', 'descripcion_producto', 'unidad_medida'],
+        raw: true
+    });
+
+    const masReciente = new Map();
+
+    for (const f of filas) {
+        const actual = masReciente.get(f.codigo_producto);
+        if (!actual || String(f.ultima_fecha) > String(actual.ultima_fecha)) {
+            masReciente.set(f.codigo_producto, f);
+        }
+    }
+
+    return [...masReciente.values()]
+        .map(f => ({
+            codigo_producto: f.codigo_producto,
+            descripcion_producto: f.descripcion_producto || f.codigo_producto,
+            unidad_medida: f.unidad_medida || null
+        }))
+        .sort((a, b) => a.descripcion_producto.localeCompare(b.descripcion_producto));
+}
+
+// GET /pedido/getProductosReporte?tipo_pedido=POLLO|INSUMOS
+// Productos que han aparecido en pedidos de ese tipo en los últimos 12 meses
+// (INSUMOS incluye Activo Fijo), para elegir cuáles incluir en el reporte con
+// búsqueda avanzada.
+async function getProductosReporte(req, res) {
+    const { tipo_pedido } = req.query;
+
+    if (!['POLLO', 'INSUMOS'].includes(tipo_pedido)) {
+        return res.status(400).json({ error: "tipo_pedido debe ser 'POLLO' o 'INSUMOS'", success: false });
+    }
+
+    try {
+        const enCache = cacheProductosReporte.get(tipo_pedido);
+
+        if (enCache && enCache.expira > Date.now()) {
+            return res.json({ success: true, productos: enCache.productos });
+        }
+
+        const productos = await consultarProductosReporte(tipo_pedido);
+        cacheProductosReporte.set(tipo_pedido, { productos, expira: Date.now() + TTL_PRODUCTOS_REPORTE_MS });
+
+        return res.json({ success: true, productos });
+    } catch (error) {
+        return res.status(500).json({
+            error: 'Error al obtener los productos',
+            details: error.message,
+            success: false
+        });
+    }
+}
+
 // GET /pedido/generarReporteDetallePollo?fecha=...&division=1,2&muelles=RAS-002,RAS-003&formato=pdf|excel
+// Búsqueda avanzada (opcional): fecha_hasta=... (rango de fechas, genera un
+// reporte distinto al de una sola fecha) y productos=COD1,COD2 (solo esos
+// artículos). Sin esos parámetros el reporte es exactamente el de siempre.
 // Reporte de las rutas de Pollo para una fecha, sin importar el estado ni
 // si ya se procesó algo — solo el detalle de lo que pide cada tienda,
 // agrupado por ruta. Se puede generar en cualquier momento, incluso antes de
@@ -3291,17 +3593,20 @@ async function generarReporteDetallePollo(req, res) {
     let divisiones;
     let muelles;
     let formato;
+    let busqueda;
 
     try {
         divisiones = parsearDivisiones(req.query.division);
         muelles = parsearMuelles(req.query.muelles);
         formato = parsearFormato(req.query.formato);
+        busqueda = parsearBusquedaAvanzada(req.query);
     } catch (error) {
         return res.status(400).json({ error: error.message, success: false });
     }
 
     try {
-        const where = { tipo_pedido: 'POLLO', fecha_requerida: fecha };
+        const where = { tipo_pedido: 'POLLO' };
+        const include = aplicarBusquedaAvanzada(where, { fecha, ...busqueda });
 
         if (divisiones) {
             where.codigo_tienda = { [Op.in]: await obtenerCodigosTiendaPorDivision(divisiones) };
@@ -3319,15 +3624,18 @@ async function generarReporteDetallePollo(req, res) {
 
         const cabeceras = await PedidoPosCabeceraModel.findAll({
             where,
-            include: [{ model: PedidoPosDetalleModel, as: 'detalle' }],
-            order: [['nombre_ruta', 'ASC'], ['nombre_tienda', 'ASC']]
+            include,
+            order: [['fecha_requerida', 'ASC'], ['nombre_ruta', 'ASC'], ['nombre_tienda', 'ASC']]
         });
 
-        const faltantes = await calcularTiendasSinPedido({ esPollo: true, fecha, divisiones, muelles });
+        const faltantes = busqueda.esRango || busqueda.productos
+            ? null
+            : await calcularTiendasSinPedido({ esPollo: true, fecha, divisiones, muelles });
 
-        return await responderReporteDetalle(res, {
+        return await responderReporteDetalleAvanzado(res, {
             formato,
             fecha,
+            busqueda,
             cabeceras,
             faltantes,
             descripcionFiltros: describirFiltrosReporte(divisiones, muelles),
@@ -3354,16 +3662,19 @@ async function generarReporteDetalleInsumos(req, res) {
 
     let divisiones;
     let formato;
+    let busqueda;
 
     try {
         divisiones = parsearDivisiones(req.query.division);
         formato = parsearFormato(req.query.formato);
+        busqueda = parsearBusquedaAvanzada(req.query);
     } catch (error) {
         return res.status(400).json({ error: error.message, success: false });
     }
 
     try {
-        const where = { tipo_pedido: { [Op.in]: TIPOS_INSUMOS_Y_ACTIVO_FIJO }, fecha_requerida: fecha };
+        const where = { tipo_pedido: { [Op.in]: TIPOS_INSUMOS_Y_ACTIVO_FIJO } };
+        const include = aplicarBusquedaAvanzada(where, { fecha, ...busqueda });
 
         if (divisiones) {
             where.codigo_tienda = { [Op.in]: await obtenerCodigosTiendaPorDivision(divisiones) };
@@ -3371,15 +3682,18 @@ async function generarReporteDetalleInsumos(req, res) {
 
         const cabeceras = await PedidoPosCabeceraModel.findAll({
             where,
-            include: [{ model: PedidoPosDetalleModel, as: 'detalle' }],
-            order: [['nombre_ruta', 'ASC'], ['nombre_tienda', 'ASC']]
+            include,
+            order: [['fecha_requerida', 'ASC'], ['nombre_ruta', 'ASC'], ['nombre_tienda', 'ASC']]
         });
 
-        const faltantes = await calcularTiendasSinPedido({ esPollo: false, fecha, divisiones, muelles: null });
+        const faltantes = busqueda.esRango || busqueda.productos
+            ? null
+            : await calcularTiendasSinPedido({ esPollo: false, fecha, divisiones, muelles: null });
 
-        return await responderReporteDetalle(res, {
+        return await responderReporteDetalleAvanzado(res, {
             formato,
             fecha,
+            busqueda,
             cabeceras,
             faltantes,
             descripcionFiltros: describirFiltrosReporte(divisiones, null),
@@ -3795,6 +4109,7 @@ module.exports = {
     generarResumenRutaPollo,
     generarQrsRutaPollo,
     generarQrsRutaInsumos,
+    getProductosReporte,
     generarReporteDetallePollo,
     generarReporteDetalleInsumos,
     generarReporteEnTransitoPollo,

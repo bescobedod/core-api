@@ -101,6 +101,7 @@ router.get('/pedido/generarResumenRutaInsumos', auth, pedidos.generarResumenRuta
 router.get('/pedido/generarResumenRutaPollo', auth, pedidos.generarResumenRutaPollo)
 router.get('/pedido/generarQrsRutaPollo', auth, pedidos.generarQrsRutaPollo)
 router.get('/pedido/generarQrsRutaInsumos', auth, pedidos.generarQrsRutaInsumos)
+router.get('/pedido/getProductosReporte', auth, pedidos.getProductosReporte)
 router.get('/pedido/generarReporteDetallePollo', auth, pedidos.generarReporteDetallePollo)
 router.get('/pedido/generarReporteDetalleInsumos', auth, pedidos.generarReporteDetalleInsumos)
 router.get('/pedido/generarReporteEnTransitoPollo', auth, pedidos.generarReporteEnTransitoPollo)

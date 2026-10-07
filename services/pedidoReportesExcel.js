@@ -58,24 +58,8 @@ function agregarTabla(hoja, columnas, filas) {
     }
 }
 
-// rutasConBloques: [{ nombre_ruta, bloques: [...] }] (mismo formato que el PDF).
-// resumenGeneral / conEntregas / resumenEstados / etiquetaEstado los calcula
-// el controlador con los mismos helpers del PDF, para que no puedan diferir.
-function construirExcelDetalle({
-    fecha, descripcionFiltros, rutasConBloques, resumenGeneral, conEntregas, resumenEstados, faltantes, etiquetaEstado,
-    conCarga = false
-}) {
-    const libro = nuevoLibro();
-
-    // ---- Resumen General ----
-    const hojaResumen = libro.addWorksheet('Resumen General');
-    agregarTitulo(hojaResumen, 'Detalle de Pedidos por Tienda — Resumen General', [
-        `Fecha Entrega: ${fecha}`,
-        descripcionFiltros,
-        conEntregas ? `Estado de los pedidos: ${resumenEstados}` : null
-    ]);
-
-    const columnasResumen = [
+function columnasResumenGeneral(conEntregas) {
+    return [
         { header: 'Código', key: 'codigo', width: 14 },
         { header: 'Artículo', key: 'nombre', width: 48 },
         { header: 'Pedido', key: 'pedido', width: 12, centrada: true },
@@ -83,21 +67,23 @@ function construirExcelDetalle({
         ...(conEntregas ? [{ header: 'Recibido', key: 'recibido', width: 12, centrada: true }] : []),
         { header: 'Diferencia', key: 'diferencia', width: 12, centrada: true }
     ];
+}
 
-    agregarTabla(hojaResumen, columnasResumen, resumenGeneral.map(t => ({
+function filasResumenGeneral(resumenGeneral) {
+    return resumenGeneral.map(t => ({
         codigo: t.codigo_producto,
         nombre: t.nombre_producto,
         pedido: t.cantidad_solicitada,
         enviado: t.cantidad_asignada,
         recibido: t.cantidad_recibida,
         diferencia: t.cantidad_solicitada - t.cantidad_asignada
-    })));
+    }));
+}
 
-    // ---- Detalle (una fila por artículo de cada pedido) ----
-    const hojaDetalle = libro.addWorksheet('Detalle');
-    agregarTitulo(hojaDetalle, 'Detalle de Pedidos por Tienda', [`Fecha Entrega: ${fecha}`, descripcionFiltros]);
-
-    const columnasDetalle = [
+// conFecha agrega la columna "Fecha de entrega" (reporte por rango).
+function columnasDetalle(conEntregas, conFecha) {
+    return [
+        ...(conFecha ? [{ header: 'Fecha de entrega', key: 'fecha', width: 16, centrada: true }] : []),
         { header: 'Ruta', key: 'ruta', width: 22 },
         { header: 'Tienda', key: 'tienda', width: 32 },
         { header: 'Tipo', key: 'tipo', width: 14 },
@@ -116,13 +102,17 @@ function construirExcelDetalle({
             { header: 'Entrada DocNum', key: 'entry_docnum', width: 18, centrada: true }
         ] : [])
     ];
+}
 
-    const filasDetalle = [];
+// Una fila por artículo de cada pedido. `fecha` (opcional) se repite en cada fila.
+function filasDetalle(rutasConBloques, etiquetaEstado, fecha) {
+    const filas = [];
 
     rutasConBloques.forEach((ruta) => {
         ruta.bloques.forEach((bloque) => {
             bloque.items.forEach((item) => {
-                filasDetalle.push({
+                filas.push({
+                    fecha,
                     ruta: ruta.nombre_ruta,
                     tienda: bloque.nombre_tienda,
                     tipo: bloque.label || 'Pedido',
@@ -143,7 +133,37 @@ function construirExcelDetalle({
         });
     });
 
-    agregarTabla(hojaDetalle, columnasDetalle, filasDetalle);
+    return filas;
+}
+
+// rutasConBloques: [{ nombre_ruta, bloques: [...] }] (mismo formato que el PDF).
+// resumenGeneral / conEntregas / resumenEstados / etiquetaEstado los calcula
+// el controlador con los mismos helpers del PDF, para que no puedan diferir.
+function construirExcelDetalle({
+    fecha, descripcionFiltros, rutasConBloques, resumenGeneral, conEntregas, resumenEstados, faltantes, etiquetaEstado,
+    conCarga = false
+}) {
+    const libro = nuevoLibro();
+
+    // ---- Resumen General ----
+    const hojaResumen = libro.addWorksheet('Resumen General');
+    agregarTitulo(hojaResumen, 'Detalle de Pedidos por Tienda — Resumen General', [
+        `Fecha Entrega: ${fecha}`,
+        descripcionFiltros,
+        conEntregas ? `Estado de los pedidos: ${resumenEstados}` : null
+    ]);
+
+    agregarTabla(hojaResumen, columnasResumenGeneral(conEntregas), filasResumenGeneral(resumenGeneral));
+
+    // ---- Detalle (una fila por artículo de cada pedido) ----
+    const hojaDetalle = libro.addWorksheet('Detalle');
+    agregarTitulo(hojaDetalle, 'Detalle de Pedidos por Tienda', [`Fecha Entrega: ${fecha}`, descripcionFiltros]);
+
+    agregarTabla(
+        hojaDetalle,
+        columnasDetalle(conEntregas, false),
+        filasDetalle(rutasConBloques, etiquetaEstado, null)
+    );
 
     // ---- Carga por ruta (solo Pollo) ----
     const filasCarga = (conCarga ? rutasConBloques : [])
@@ -161,6 +181,9 @@ function construirExcelDetalle({
             { header: 'Toneladas', key: 'toneladas', width: 12, centrada: true }
         ], filasCarga);
     }
+
+    // Con filtro de producto la hoja de tiendas sin pedido no aplica.
+    if (faltantes === null) return libro;
 
     // ---- Tiendas sin pedido ----
     const hojaFaltantes = libro.addWorksheet('Tiendas sin pedido');
@@ -183,6 +206,60 @@ function construirExcelDetalle({
             { header: 'Ruta', key: 'ruta', width: 26 },
             { header: 'Tienda', key: 'tienda', width: 40 }
         ], filasFaltantes);
+    }
+
+    return libro;
+}
+
+// Excel del reporte por RANGO de fechas (búsqueda avanzada): documento
+// distinto al de una sola fecha. fechas: [{ fecha, rutasConBloques }]
+// ordenadas por fecha. No lleva hoja de tiendas sin pedido.
+function construirExcelDetalleRango({
+    fechaDesde, fechaHasta, descripcionFiltros, fechas, resumenGeneral, conEntregas, resumenEstados, etiquetaEstado,
+    conCarga = false
+}) {
+    const libro = nuevoLibro();
+    const lineaRango = `Fechas de entrega: ${fechaDesde} al ${fechaHasta}`;
+
+    // ---- Resumen General (todo el rango) ----
+    const hojaResumen = libro.addWorksheet('Resumen General');
+    agregarTitulo(hojaResumen, 'Detalle de Pedidos por Rango de Fechas — Resumen General', [
+        lineaRango,
+        descripcionFiltros,
+        conEntregas ? `Estado de los pedidos: ${resumenEstados}` : null
+    ]);
+    agregarTabla(hojaResumen, columnasResumenGeneral(conEntregas), filasResumenGeneral(resumenGeneral));
+
+    // ---- Detalle (una fila por artículo de cada pedido, con su fecha) ----
+    const hojaDetalle = libro.addWorksheet('Detalle');
+    agregarTitulo(hojaDetalle, 'Detalle de Pedidos por Rango de Fechas', [lineaRango, descripcionFiltros]);
+    agregarTabla(
+        hojaDetalle,
+        columnasDetalle(conEntregas, true),
+        fechas.flatMap(f => filasDetalle(f.rutasConBloques, etiquetaEstado, f.fecha))
+    );
+
+    // ---- Carga por ruta y fecha (solo Pollo) ----
+    const filasCarga = conCarga
+        ? fechas.flatMap(f => f.rutasConBloques.map(ruta => ({
+            fecha: f.fecha,
+            ruta: ruta.nombre_ruta,
+            ...cargaDeBloques(ruta.bloques)
+        })))
+            .filter(f => f.canastas > 0)
+            .map(f => ({ ...f, toneladas: Number(f.toneladas.toFixed(2)) }))
+        : [];
+
+    if (filasCarga.length > 0) {
+        const hojaCarga = libro.addWorksheet('Carga por ruta');
+        agregarTitulo(hojaCarga, 'Carga por ruta y fecha (canastas y toneladas)', [lineaRango, descripcionFiltros]);
+        agregarTabla(hojaCarga, [
+            { header: 'Fecha de entrega', key: 'fecha', width: 16, centrada: true },
+            { header: 'Ruta', key: 'ruta', width: 30 },
+            { header: 'Canastas', key: 'canastas', width: 12, centrada: true },
+            { header: 'Libras', key: 'libras', width: 12, centrada: true },
+            { header: 'Toneladas', key: 'toneladas', width: 12, centrada: true }
+        ], filasCarga);
     }
 
     return libro;
@@ -271,4 +348,4 @@ function construirExcelEnTransito({ secciones, viajes = [], tituloTipo, conMuell
     return libro;
 }
 
-module.exports = { MIME_XLSX, construirExcelDetalle, construirExcelEnTransito };
+module.exports = { MIME_XLSX, construirExcelDetalle, construirExcelDetalleRango, construirExcelEnTransito };
