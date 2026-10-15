@@ -21,12 +21,28 @@ function fechaSapHoy() {
     return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Guatemala' }).format(new Date());
 }
 
+// OWTR/ODLN.Comments es NVARCHAR(254): SAP rechaza el documento completo si
+// se pasa. Se corta en el último ", " que quepa y se indica cuántos quedaron fuera.
+const SAP_COMMENTS_MAX = 254;
+
+function ajustarComentariosSap(texto) {
+    if (!texto || texto.length <= SAP_COMMENTS_MAX) return texto;
+
+    const reserva = 14; // espacio para "… (+999 más)"
+    const corte = texto.lastIndexOf(', ', SAP_COMMENTS_MAX - reserva);
+    const visible = corte > 0 ? texto.slice(0, corte) : texto.slice(0, SAP_COMMENTS_MAX - reserva);
+    const omitidos = texto.slice(visible.length).split(', ').filter(Boolean).length;
+
+    return `${visible}… (+${omitidos} más)`;
+}
+
 // ------------------------------------------------------------
 // Conexión a la base de AVIGUA (pollo) — servidor/base distintos
 // a los de las demás empresas, por eso loginSAP acepta un baseUrl
 // aparte en vez de usar siempre process.env.SAP_URL.
 // ------------------------------------------------------------
 const SAP_AVIGUA_URL = process.env.SAP_AVIGUA_URL;
+const SAP_AVIGUA_BD = process.env.SAP_AVIGUA_BD
 // El whsCode ya no es fijo: viene del maestro de rutas de pollo (cada ruta
 // pertenece a un muelle — RAS-002/003/004), se recibe como parámetro.
 
@@ -548,7 +564,7 @@ async function consultarStockPollo(codigosArticulo, whsCode) {
                 throw err; // otros errores (ej. sesión expirada) sí deben propagarse
             }
         }
-
+        console.log(SAP_AVIGUA_BD)
         return resultados;
     };
 
@@ -842,7 +858,7 @@ async function crearTransferenciaPollo({ fromWarehouse, toWarehouse, lineas, com
             DocDate: fechaSapHoy(),
             FromWarehouse: fromWarehouse,
             ToWarehouse: toWarehouse,
-            Comments: comentarios || undefined,
+            Comments: ajustarComentariosSap(comentarios) || undefined,
             StockTransferLines: lineas.map(l => ({
                 ItemCode: l.codigo_producto,
                 Quantity: Number(l.cantidad),
@@ -912,7 +928,7 @@ async function crearTransferenciaInsumos({ fromWarehouse, toWarehouse, lineas, c
             DocDate: fechaSapHoy(),
             FromWarehouse: fromWarehouse,
             ToWarehouse: toWarehouse,
-            Comments: comentarios || undefined,
+            Comments: ajustarComentariosSap(comentarios) || undefined,
             StockTransferLines: lineas.map(l => ({
                 ItemCode: l.codigo_producto,
                 Quantity: Number(l.cantidad),
@@ -984,7 +1000,7 @@ async function crearEntregaPollo({ cardCode, whsCode, lineas, comentarios }) {
         const payload = {
             CardCode: cardCode,
             DocDate: fechaSapHoy(),
-            Comments: comentarios || undefined,
+            Comments: ajustarComentariosSap(comentarios) || undefined,
             DocumentLines: lineas.map(l => ({
                 ItemCode: l.codigo_producto,
                 Quantity: Number(l.cantidad),
@@ -1050,7 +1066,7 @@ async function crearEntregaInsumos({ cardCode, whsCode, lineas, comentarios }) {
         const payload = {
             CardCode: cardCode,
             DocDate: fechaSapHoy(),
-            Comments: comentarios || undefined,
+            Comments: ajustarComentariosSap(comentarios) || undefined,
             DocumentLines: lineas.map(l => ({
                 ItemCode: l.codigo_producto,
                 Quantity: Number(l.cantidad),
@@ -1292,6 +1308,71 @@ async function buscarClientesInsumos(query) {
     }
 }
 
+// Código antiguo de los artículos (OITM.SWW, "Identificador adicional") para
+// una lista de códigos, en la base de Pollo (AVIGUA) o en la de insumos.
+// Devuelve Map(ItemCode -> SWW); los artículos que no existen o no tienen
+// SWW no vienen en el mapa. Se consulta en grupos con $filter para no hacer
+// una petición por artículo ni armar URLs demasiado largas.
+const CODIGOS_POR_CONSULTA_SWW = 20;
+
+async function consultarCodigosAntiguos(codigosArticulo, tipo) {
+    const codigosUnicos = [...new Set((codigosArticulo || []).filter(Boolean))];
+    const resultado = new Map();
+
+    if (codigosUnicos.length === 0) {
+        return resultado;
+    }
+
+    const esPollo = tipo === 'POLLO';
+    const claveSesion = esPollo ? 'avigua' : 'insumos';
+    const baseUrl = (esPollo ? SAP_AVIGUA_URL : process.env.SAP_URL).replace(/\/$/, '');
+
+    const executeRequest = async () => {
+        const session = esPollo ? await getAviguaSession() : await getInsumosSession();
+        const headers = {
+            Cookie: `B1SESSION=${session.sessionId}; ROUTEID=${session.routeId}`
+        };
+
+        for (let i = 0; i < codigosUnicos.length; i += CODIGOS_POR_CONSULTA_SWW) {
+            const grupo = codigosUnicos.slice(i, i + CODIGOS_POR_CONSULTA_SWW);
+            const filtro = grupo
+                .map(c => `ItemCode eq '${String(c).replace(/'/g, "''")}'`)
+                .join(' or ');
+
+            const url = `${baseUrl}/Items?$select=ItemCode,SWW&$filter=${encodeURIComponent(filtro)}&$top=${grupo.length}`;
+            const response = await axios.get(url, { headers, httpsAgent: agent });
+
+            for (const item of response.data.value || []) {
+                if (item.SWW) resultado.set(item.ItemCode, item.SWW);
+            }
+        }
+
+        return resultado;
+    };
+
+    try {
+        return await executeRequest();
+    } catch (error) {
+        const isAuthError =
+            error.response?.status === 401 ||
+            error.response?.data?.error?.code === "301" ||
+            error.response?.data?.error?.code === "302" ||
+            error.response?.data?.error?.code === "206";
+
+        if (isAuthError) {
+            delete sapSessions.byEmpresa[claveSesion];
+            resultado.clear();
+            return await executeRequest();
+        }
+
+        const sapErrorData = error.response?.data?.error;
+        const sapMessage =
+            typeof sapErrorData?.message === 'string' ? sapErrorData.message : sapErrorData?.message?.value;
+
+        throw new Error(sapMessage || error.message);
+    }
+}
+
 module.exports = {
     loginSAP,
     loginSAPGlobal,
@@ -1313,5 +1394,6 @@ module.exports = {
     buscarClientesPollo,
     buscarClientesInsumos,
     crearEntregaPollo,
-    crearEntregaInsumos
+    crearEntregaInsumos,
+    consultarCodigosAntiguos
 };

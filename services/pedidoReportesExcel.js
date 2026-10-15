@@ -27,7 +27,20 @@ function agregarTitulo(hoja, titulo, lineas = []) {
     hoja.addRow([]);
 }
 
-// columnas: [{ header, key, width, centrada }]; filas: objetos con esas keys.
+// "2026-10-12" -> fecha de Excel (formato dd/mm/aaaa vía numFmt). Se arma en
+// UTC porque ExcelJS escribe las fechas en UTC; así no se corre un día.
+function fechaExcel(fechaIso) {
+    const [anio, mes, dia] = String(fechaIso || '').split('-').map(Number);
+    return anio && mes && dia ? new Date(Date.UTC(anio, mes - 1, dia)) : fechaIso;
+}
+
+// "2026-10-12" -> "12/10/2026", para los títulos de las hojas.
+function fechaTexto(fechaIso) {
+    const [anio, mes, dia] = String(fechaIso || '').split('-');
+    return anio && mes && dia ? `${dia}/${mes}/${anio}` : fechaIso;
+}
+
+// columnas: [{ header, key, width, centrada, numFmt }]; filas: objetos con esas keys.
 function agregarTabla(hoja, columnas, filas) {
     const filaEncabezado = hoja.addRow(columnas.map(c => c.header));
     filaEncabezado.font = { bold: true, color: { argb: 'FFFFFFFF' } };
@@ -45,6 +58,7 @@ function agregarTabla(hoja, columnas, filas) {
         const nueva = hoja.addRow(columnas.map(c => fila[c.key] ?? ''));
         columnas.forEach((c, i) => {
             if (c.centrada) nueva.getCell(i + 1).alignment = { horizontal: 'center' };
+            if (c.numFmt) nueva.getCell(i + 1).numFmt = c.numFmt;
         });
     });
 
@@ -61,6 +75,7 @@ function agregarTabla(hoja, columnas, filas) {
 function columnasResumenGeneral(conEntregas) {
     return [
         { header: 'Código', key: 'codigo', width: 14 },
+        { header: 'Código antiguo', key: 'codigo_antiguo', width: 16 },
         { header: 'Artículo', key: 'nombre', width: 48 },
         { header: 'Pedido', key: 'pedido', width: 12, centrada: true },
         { header: 'Enviado', key: 'enviado', width: 12, centrada: true },
@@ -69,9 +84,11 @@ function columnasResumenGeneral(conEntregas) {
     ];
 }
 
-function filasResumenGeneral(resumenGeneral) {
+// codigosAntiguos: Map(codigo_producto -> SWW de SAP).
+function filasResumenGeneral(resumenGeneral, codigosAntiguos = new Map()) {
     return resumenGeneral.map(t => ({
         codigo: t.codigo_producto,
+        codigo_antiguo: codigosAntiguos.get(t.codigo_producto),
         nombre: t.nombre_producto,
         pedido: t.cantidad_solicitada,
         enviado: t.cantidad_asignada,
@@ -83,13 +100,15 @@ function filasResumenGeneral(resumenGeneral) {
 // conFecha agrega la columna "Fecha de entrega" (reporte por rango).
 function columnasDetalle(conEntregas, conFecha) {
     return [
-        ...(conFecha ? [{ header: 'Fecha de entrega', key: 'fecha', width: 16, centrada: true }] : []),
+        ...(conFecha ? [{ header: 'Fecha de entrega', key: 'fecha', width: 16, centrada: true, numFmt: 'dd/mm/yyyy' }] : []),
         { header: 'Ruta', key: 'ruta', width: 22 },
+        { header: 'Código empresa', key: 'codigo_empresa', width: 16, centrada: true },
         { header: 'Tienda', key: 'tienda', width: 32 },
         { header: 'Tipo', key: 'tipo', width: 14 },
         { header: 'N° Pedido', key: 'numero_pedido', width: 18 },
         ...(conEntregas ? [{ header: 'Estado', key: 'estado', width: 18 }] : []),
         { header: 'Código', key: 'codigo', width: 14 },
+        { header: 'Código antiguo', key: 'codigo_antiguo', width: 16 },
         { header: 'Artículo', key: 'nombre', width: 44 },
         { header: 'Pedido', key: 'pedido', width: 12, centrada: true },
         { header: 'Enviado', key: 'enviado', width: 12, centrada: true },
@@ -105,20 +124,25 @@ function columnasDetalle(conEntregas, conFecha) {
 }
 
 // Una fila por artículo de cada pedido. `fecha` (opcional) se repite en cada fila.
-function filasDetalle(rutasConBloques, etiquetaEstado, fecha) {
+// extras.codigosEmpresa: Map(id_pedido -> "empresa-tienda" de tTienda);
+// extras.codigosAntiguos: Map(codigo_producto -> SWW de SAP).
+function filasDetalle(rutasConBloques, etiquetaEstado, fecha, extras = {}) {
+    const { codigosEmpresa = new Map(), codigosAntiguos = new Map() } = extras;
     const filas = [];
 
     rutasConBloques.forEach((ruta) => {
         ruta.bloques.forEach((bloque) => {
             bloque.items.forEach((item) => {
                 filas.push({
-                    fecha,
+                    fecha: fecha ? fechaExcel(fecha) : fecha,
                     ruta: ruta.nombre_ruta,
+                    codigo_empresa: codigosEmpresa.get(bloque.id_pedido),
                     tienda: bloque.nombre_tienda,
                     tipo: bloque.label || 'Pedido',
                     numero_pedido: bloque.numero_pedido,
                     estado: etiquetaEstado(bloque.estado).texto,
                     codigo: item.codigo_producto,
+                    codigo_antiguo: codigosAntiguos.get(item.codigo_producto),
                     nombre: item.nombre_producto,
                     pedido: item.cantidad_solicitada,
                     enviado: item.cantidad_asignada,
@@ -141,28 +165,28 @@ function filasDetalle(rutasConBloques, etiquetaEstado, fecha) {
 // el controlador con los mismos helpers del PDF, para que no puedan diferir.
 function construirExcelDetalle({
     fecha, descripcionFiltros, rutasConBloques, resumenGeneral, conEntregas, resumenEstados, faltantes, etiquetaEstado,
-    conCarga = false
+    conCarga = false, codigosEmpresa, codigosAntiguos
 }) {
     const libro = nuevoLibro();
 
     // ---- Resumen General ----
     const hojaResumen = libro.addWorksheet('Resumen General');
     agregarTitulo(hojaResumen, 'Detalle de Pedidos por Tienda — Resumen General', [
-        `Fecha Entrega: ${fecha}`,
+        `Fecha Entrega: ${fechaTexto(fecha)}`,
         descripcionFiltros,
         conEntregas ? `Estado de los pedidos: ${resumenEstados}` : null
     ]);
 
-    agregarTabla(hojaResumen, columnasResumenGeneral(conEntregas), filasResumenGeneral(resumenGeneral));
+    agregarTabla(hojaResumen, columnasResumenGeneral(conEntregas), filasResumenGeneral(resumenGeneral, codigosAntiguos));
 
     // ---- Detalle (una fila por artículo de cada pedido) ----
     const hojaDetalle = libro.addWorksheet('Detalle');
-    agregarTitulo(hojaDetalle, 'Detalle de Pedidos por Tienda', [`Fecha Entrega: ${fecha}`, descripcionFiltros]);
+    agregarTitulo(hojaDetalle, 'Detalle de Pedidos por Tienda', [`Fecha Entrega: ${fechaTexto(fecha)}`, descripcionFiltros]);
 
     agregarTabla(
         hojaDetalle,
         columnasDetalle(conEntregas, false),
-        filasDetalle(rutasConBloques, etiquetaEstado, null)
+        filasDetalle(rutasConBloques, etiquetaEstado, null, { codigosEmpresa, codigosAntiguos })
     );
 
     // ---- Carga por ruta (solo Pollo) ----
@@ -173,7 +197,7 @@ function construirExcelDetalle({
 
     if (filasCarga.length > 0) {
         const hojaCarga = libro.addWorksheet('Carga por ruta');
-        agregarTitulo(hojaCarga, 'Carga por ruta (canastas y toneladas)', [`Fecha Entrega: ${fecha}`, descripcionFiltros]);
+        agregarTitulo(hojaCarga, 'Carga por ruta (canastas y toneladas)', [`Fecha Entrega: ${fechaTexto(fecha)}`, descripcionFiltros]);
         agregarTabla(hojaCarga, [
             { header: 'Ruta', key: 'ruta', width: 30 },
             { header: 'Canastas', key: 'canastas', width: 12, centrada: true },
@@ -187,7 +211,7 @@ function construirExcelDetalle({
 
     // ---- Tiendas sin pedido ----
     const hojaFaltantes = libro.addWorksheet('Tiendas sin pedido');
-    agregarTitulo(hojaFaltantes, 'Tiendas que no hicieron pedido para esta fecha', [`Fecha Entrega: ${fecha}`, descripcionFiltros]);
+    agregarTitulo(hojaFaltantes, 'Tiendas que no hicieron pedido para esta fecha', [`Fecha Entrega: ${fechaTexto(fecha)}`, descripcionFiltros]);
 
     const filasFaltantes = [];
     faltantes.forEach((porDivision) => {
@@ -216,10 +240,10 @@ function construirExcelDetalle({
 // ordenadas por fecha. No lleva hoja de tiendas sin pedido.
 function construirExcelDetalleRango({
     fechaDesde, fechaHasta, descripcionFiltros, fechas, resumenGeneral, conEntregas, resumenEstados, etiquetaEstado,
-    conCarga = false
+    conCarga = false, codigosEmpresa, codigosAntiguos
 }) {
     const libro = nuevoLibro();
-    const lineaRango = `Fechas de entrega: ${fechaDesde} al ${fechaHasta}`;
+    const lineaRango = `Fechas de entrega: ${fechaTexto(fechaDesde)} al ${fechaTexto(fechaHasta)}`;
 
     // ---- Resumen General (todo el rango) ----
     const hojaResumen = libro.addWorksheet('Resumen General');
@@ -228,7 +252,7 @@ function construirExcelDetalleRango({
         descripcionFiltros,
         conEntregas ? `Estado de los pedidos: ${resumenEstados}` : null
     ]);
-    agregarTabla(hojaResumen, columnasResumenGeneral(conEntregas), filasResumenGeneral(resumenGeneral));
+    agregarTabla(hojaResumen, columnasResumenGeneral(conEntregas), filasResumenGeneral(resumenGeneral, codigosAntiguos));
 
     // ---- Detalle (una fila por artículo de cada pedido, con su fecha) ----
     const hojaDetalle = libro.addWorksheet('Detalle');
@@ -236,13 +260,13 @@ function construirExcelDetalleRango({
     agregarTabla(
         hojaDetalle,
         columnasDetalle(conEntregas, true),
-        fechas.flatMap(f => filasDetalle(f.rutasConBloques, etiquetaEstado, f.fecha))
+        fechas.flatMap(f => filasDetalle(f.rutasConBloques, etiquetaEstado, f.fecha, { codigosEmpresa, codigosAntiguos }))
     );
 
     // ---- Carga por ruta y fecha (solo Pollo) ----
     const filasCarga = conCarga
         ? fechas.flatMap(f => f.rutasConBloques.map(ruta => ({
-            fecha: f.fecha,
+            fecha: fechaExcel(f.fecha),
             ruta: ruta.nombre_ruta,
             ...cargaDeBloques(ruta.bloques)
         })))
@@ -254,7 +278,7 @@ function construirExcelDetalleRango({
         const hojaCarga = libro.addWorksheet('Carga por ruta');
         agregarTitulo(hojaCarga, 'Carga por ruta y fecha (canastas y toneladas)', [lineaRango, descripcionFiltros]);
         agregarTabla(hojaCarga, [
-            { header: 'Fecha de entrega', key: 'fecha', width: 16, centrada: true },
+            { header: 'Fecha de entrega', key: 'fecha', width: 16, centrada: true, numFmt: 'dd/mm/yyyy' },
             { header: 'Ruta', key: 'ruta', width: 30 },
             { header: 'Canastas', key: 'canastas', width: 12, centrada: true },
             { header: 'Libras', key: 'libras', width: 12, centrada: true },

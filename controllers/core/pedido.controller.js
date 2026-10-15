@@ -7,7 +7,7 @@ const TicketTrasladoModel = require('../../models/core/tbl_tickets_traslado.mode
 const initPedidoDetalleModel = require('../../models/core/tbl_pedido_detalle.model');
 const initTiendaModel = require('../../models/pdv/tTienda.model');
 const UsersModel = require('../../models/pioapp/users.model');
-const { obtenerProductosData, consultarStockPollo, consultarStockInsumos, crearTransferenciaPollo, crearTransferenciaInsumos, WHS_INSUMOS } = require('../../integrations/sap/sapClient');
+const { obtenerProductosData, consultarStockPollo, consultarStockInsumos, crearTransferenciaPollo, crearTransferenciaInsumos, consultarCodigosAntiguos, WHS_INSUMOS } = require('../../integrations/sap/sapClient');
 const CatalogoRutaPolloModel = require('../../models/core/tbl_catalogo_rutas_pollo.model');
 const BloqueoRutaPolloModel = require('../../models/core/tbl_bloqueo_ruta_pollo.model');
 const CatalogoRutaInsumosModel = require('../../models/core/tbl_catalogo_rutas_insumos.model');
@@ -298,21 +298,25 @@ async function crearPedidoActivoFijo(req, res) {
 // fecha_requerida; si no se manda ninguna, trae todas las fechas.
 // ------------------------------------------------------------
 async function buscarPedidosActivoFijo(req, res) {
-    const { codigo_tienda, fecha, fecha_inicio, fecha_fin } = req.query;
+    const { id_tienda, codigo_tienda, fecha, fecha_inicio, fecha_fin } = req.query;
     const page = parseInt(req.query.page, 10) || 1;
     const pageSize = parseInt(req.query.pageSize, 10) || 9;
 
-    if (!codigo_tienda) {
-        return res.status(400).json({ error: 'codigo_tienda es requerido', success: false });
+    if (!id_tienda && !codigo_tienda) {
+        return res.status(400).json({ error: 'id_tienda o codigo_tienda es requerido', success: false });
     }
 
     // El selector de tienda del frontend manda el código interno de PDV
     // (vwTiendasModulo.codigo_tienda), pero los pedidos ya se guardan con el
     // StoreNumberSimphony (ver crearPedidoActivoFijo) — hay que traducirlo
-    // antes de buscar, si no, no encuentra nada.
+    // antes de buscar, si no, no encuentra nada. Se resuelve por idTienda
+    // (igual que al crear) porque el código interno se repite entre
+    // empresas; codigo_tienda queda solo como respaldo.
     const sequelizePdv = await sequelizeInit.sequelizeInit('PDV');
     const TiendaPdvModel = initTiendaModel(sequelizePdv);
-    const tiendaPdv = await TiendaPdvModel.findOne({ where: { tienda: codigo_tienda } });
+    const tiendaPdv = await TiendaPdvModel.findOne({
+        where: id_tienda ? { idTienda: id_tienda } : { tienda: codigo_tienda }
+    });
     const codigoTiendaSimphony = tiendaPdv?.StoreNumberSimphony || codigo_tienda;
 
     const whereCabecera = { tipo_pedido: 'ACTIVO_FIJO', codigo_tienda: codigoTiendaSimphony };
@@ -3378,9 +3382,55 @@ function agruparBloquesPorFecha(bloques) {
         .map(([fecha, delDia]) => ({ fecha, rutasConBloques: agruparBloquesPorRuta(delDia) }));
 }
 
+// Columnas extra que solo lleva el Excel del reporte de detalle:
+// - codigosEmpresa: Map(id_pedido -> "empresa-tienda") desde tTienda, buscando
+//   por StoreNumberSimphony (el codigo_tienda del pedido). Si ese número se
+//   repite en tTienda, se prefiere la fila de la misma empresa del pedido.
+// - codigosAntiguos: Map(codigo_producto -> SWW) desde SAP (OITM), en la base
+//   que corresponde al tipo (Pollo = AVIGUA, Insumos = base de insumos).
+// Si alguna de las dos consultas falla, el reporte sale igual con esa
+// columna vacía (se registra el error en el log).
+async function obtenerColumnasExtraExcel(cabeceras, tipo) {
+    const pedidos = cabeceras.map(c => c.get({ plain: true }));
+    const codigosEmpresa = new Map();
+    let codigosAntiguos = new Map();
+
+    try {
+        const codigosTienda = [...new Set(pedidos.map(p => p.codigo_tienda).filter(Boolean))];
+
+        if (codigosTienda.length > 0) {
+            const sequelizePdv = await sequelizeInit.sequelizeInit(PDV_CONNECTION);
+            const TiendaModel = initTiendaModel(sequelizePdv);
+            const tiendas = await TiendaModel.findAll({
+                where: { StoreNumberSimphony: { [Op.in]: codigosTienda } },
+                attributes: ['empresa', 'tienda', 'StoreNumberSimphony'],
+                raw: true
+            });
+
+            for (const p of pedidos) {
+                const candidatas = tiendas.filter(t => t.StoreNumberSimphony === p.codigo_tienda);
+                const tienda = candidatas.find(t => t.empresa === p.codigo_empresa) || candidatas[0];
+
+                if (tienda) codigosEmpresa.set(p.id, `${tienda.empresa}-${tienda.tienda}`);
+            }
+        }
+    } catch (error) {
+        console.error('Reporte de detalle: no se pudo obtener el código de empresa desde tTienda:', error.message);
+    }
+
+    try {
+        const codigosProducto = pedidos.flatMap(p => (p.detalle || []).map(d => d.codigo_producto));
+        codigosAntiguos = await consultarCodigosAntiguos(codigosProducto, tipo);
+    } catch (error) {
+        console.error('Reporte de detalle: no se pudo obtener el código antiguo (SWW) desde SAP:', error.message);
+    }
+
+    return { codigosEmpresa, codigosAntiguos };
+}
+
 // Respuesta del reporte por RANGO de fechas (PDF o Excel): documento distinto
 // al de una sola fecha, agrupado por fecha y luego por ruta.
-async function responderReporteDetalleRango(res, { formato, fecha, fechaHasta, cabeceras, descripcionFiltros, nombreBase, conCarga = false }) {
+async function responderReporteDetalleRango(res, { tipo, formato, fecha, fechaHasta, cabeceras, descripcionFiltros, nombreBase, conCarga = false }) {
     if (cabeceras.length === 0) {
         return res.status(404).json({
             error: 'No hay pedidos para esos filtros en el rango de fechas',
@@ -3393,6 +3443,7 @@ async function responderReporteDetalleRango(res, { formato, fecha, fechaHasta, c
 
     if (formato === 'excel') {
         const libro = construirExcelDetalleRango({
+            ...(await obtenerColumnasExtraExcel(cabeceras, tipo)),
             fechaDesde: fecha,
             fechaHasta,
             descripcionFiltros,
@@ -3421,7 +3472,7 @@ async function responderReporteDetalleRango(res, { formato, fecha, fechaHasta, c
 // datos (resumen general, detalle y tiendas sin pedido) en los dos formatos.
 // faltantes === null significa "sin sección de tiendas sin pedido" (filtro de
 // productos activo).
-async function responderReporteDetalle(res, { formato, fecha, cabeceras, faltantes, descripcionFiltros, nombreBase, conCarga = false }) {
+async function responderReporteDetalle(res, { tipo, formato, fecha, cabeceras, faltantes, descripcionFiltros, nombreBase, conCarga = false }) {
     if (cabeceras.length === 0 && (faltantes === null || faltantes.length === 0)) {
         return res.status(404).json({
             error: 'No hay pedidos ni tiendas asignadas para esos filtros y esta fecha',
@@ -3433,6 +3484,7 @@ async function responderReporteDetalle(res, { formato, fecha, cabeceras, faltant
 
     if (formato === 'excel') {
         const libro = construirExcelDetalle({
+            ...(await obtenerColumnasExtraExcel(cabeceras, tipo)),
             fecha,
             descripcionFiltros,
             rutasConBloques,
@@ -3460,13 +3512,14 @@ async function responderReporteDetalle(res, { formato, fecha, cabeceras, faltant
 // Elige entre el reporte de una sola fecha (el de siempre) y el de rango de
 // fechas. `faltantes` es null cuando la búsqueda avanzada no lo permite (rango
 // o filtro de productos).
-function responderReporteDetalleAvanzado(res, { formato, fecha, busqueda, cabeceras, faltantes, descripcionFiltros, nombreBase, conCarga }) {
+function responderReporteDetalleAvanzado(res, { tipo, formato, fecha, busqueda, cabeceras, faltantes, descripcionFiltros, nombreBase, conCarga }) {
     const descripcion = busqueda.productos
         ? `${descripcionFiltros}   ·   ${describirProductos(busqueda.productos, cabeceras)}`
         : descripcionFiltros;
 
     if (busqueda.esRango) {
         return responderReporteDetalleRango(res, {
+            tipo,
             formato,
             fecha,
             fechaHasta: busqueda.fechaHasta,
@@ -3478,6 +3531,7 @@ function responderReporteDetalleAvanzado(res, { formato, fecha, busqueda, cabece
     }
 
     return responderReporteDetalle(res, {
+        tipo,
         formato,
         fecha,
         cabeceras,
@@ -3633,6 +3687,7 @@ async function generarReporteDetallePollo(req, res) {
             : await calcularTiendasSinPedido({ esPollo: true, fecha, divisiones, muelles });
 
         return await responderReporteDetalleAvanzado(res, {
+            tipo: 'POLLO',
             formato,
             fecha,
             busqueda,
@@ -3691,6 +3746,7 @@ async function generarReporteDetalleInsumos(req, res) {
             : await calcularTiendasSinPedido({ esPollo: false, fecha, divisiones, muelles: null });
 
         return await responderReporteDetalleAvanzado(res, {
+            tipo: 'INSUMOS',
             formato,
             fecha,
             busqueda,
