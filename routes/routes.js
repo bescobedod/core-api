@@ -87,6 +87,7 @@ router.post('/pedido/createPedido', auth, pedidos.createPedido)
 // Acepta uno o más archivos .txt en la misma petición (form-data, campo repetible).
 router.post('/pedido/subirArchivoPedidoPos', limitePedidosPos, upload.uploadPedidosPos.any(), pedidos.subirYProcesarArchivosPedidoPos)
 router.post('/pedido/crearPedidoActivoFijo', auth, pedidos.crearPedidoActivoFijo)
+router.post('/pedido/cambiarFechaRequerida', auth, pedidos.cambiarFechaRequeridaPedido)
 router.get('/pedido/buscarPedidosActivoFijo', auth, pedidos.buscarPedidosActivoFijo)
 router.get('/pedido/getPedidosPos', auth, pedidos.getPedidosPos)
 router.get('/pedido/getPedidosPorDivision', auth, pedidos.getPedidosPorDivision)

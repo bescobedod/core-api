@@ -5,10 +5,64 @@ const EmpresaModel = require('../../models/core/tbl_empresa.model');
 const initvwTiendasModulo = require('../../models/pdv/views/vwTiendasModulo.view');
 const sequelizeInit = require('../../configuration/db');
 
+// ------------------------------------------------------------
+// Sesiones del Service Layer
+//
+// Cada base/credencial tiene UNA sesión guardada en memoria, por clave:
+// 'insumos', 'avigua', 'global' o el id de la empresa (EmpresaModel). La
+// sesión se reutiliza entre llamadas y solo se inicia otra cuando no hay o
+// cuando SAP la rechaza: el Service Layer cierra las sesiones inactivas
+// (30 min por defecto) y la siguiente llamada recibe 401 / código 301.
+//
+// REGLA para toda llamada a SAP (incluidas las nuevas): obtener la sesión con
+// uno de los get*Session de abajo DENTRO de la función de la petición, y
+// ejecutarla con conReintentoSesion(clave, peticion). Así, si la sesión
+// venció, se inicia sesión otra vez y se reintenta una vez sin que el
+// usuario vea el error. No manejar el 401 a mano en cada función.
+// ------------------------------------------------------------
 const sapSessions = {
-    global: null,
     byEmpresa: {}
 };
+
+function esErrorDeSesionSap(error) {
+    const status = error?.response?.status;
+    const code = error?.response?.data?.error?.code;
+
+    return status === 401 || code === "301" || code === "302" || code === "206"
+        || code === 301 || code === 302 || code === 206;
+}
+
+// Ejecuta peticion(); si SAP responde que la sesión de `clave` no es válida,
+// la descarta y reintenta UNA vez (la petición vuelve a pedir la sesión y,
+// al no haber, se inicia una nueva). Cualquier otro error se propaga igual.
+async function conReintentoSesion(clave, peticion) {
+    try {
+        return await peticion();
+    } catch (error) {
+        if (!esErrorDeSesionSap(error)) throw error;
+
+        delete sapSessions.byEmpresa[clave];
+        return await peticion();
+    }
+}
+
+async function obtenerSesion(clave, login) {
+    let session = sapSessions.byEmpresa[clave];
+
+    if (!session || !session.sessionId) {
+        session = await login();
+        sapSessions.byEmpresa[clave] = session;
+    }
+
+    return session;
+}
+
+function headersSesion(session, extra = {}) {
+    return {
+        Cookie: `B1SESSION=${session.sessionId}; ROUTEID=${session.routeId}`,
+        ...extra
+    };
+}
 
 // ------------------------------------------------------------
 // Fecha de hoy en horario de Guatemala, formato YYYY-MM-DD. No usar
@@ -154,17 +208,19 @@ async function loginSAPGlobal() {
 
     const session = await loginSAP(mapped);
 
-    sapSessions.global = session;
+    sapSessions.byEmpresa['global'] = session;
 
     return session;
 }
-async function getGlobalSession() {
 
-    if (!sapSessions.global) {
-        await loginSAPGlobal();
-    }
+function getGlobalSession() {
+    return obtenerSesion('global', loginSAPGlobal);
+}
 
-    return sapSessions.global;
+// Sesión de una empresa de EmpresaModel (lo que devuelven obtenerEmpresaSAP /
+// obtenerEmpresaSAPPorTienda). Clave = empresa.id.
+function getSesionEmpresa(empresa) {
+    return obtenerSesion(empresa.id, () => loginSAP(empresa));
 }
 
 async function verificarArticulosSAP(req, res) {
@@ -175,17 +231,15 @@ async function verificarArticulosSAP(req, res) {
     }
 
     try {
-        const session = await getGlobalSession();
-        const headers = {
-            Cookie: `B1SESSION=${session.sessionId}; ROUTEID=${session.routeId}`
-        };
-
         const filterQuery = items
             .map(i => `ItemCode eq '${String(i.codigo_articulo || "").replace(/'/g, "''")}'`)
             .join(' or ');
 
         const url = `${process.env.SAP_URL.replace(/\/$/, '')}/Items?$select=ItemCode,ItemName&$filter=${filterQuery}`;
-        const response = await axios.get(url, { headers, httpsAgent: agent });
+        const response = await conReintentoSesion('global', async () => {
+            const session = await getGlobalSession();
+            return axios.get(url, { headers: headersSesion(session), httpsAgent: agent });
+        });
         const productosSAP = response.data.value || [];
         const encontrados = [];
         const noEncontrados = [];
@@ -212,8 +266,6 @@ async function verificarArticulosSAP(req, res) {
         });
 
     } catch (error) {
-        sapSessions.global = null;
-
         return res.status(500).json({
             error: "Error SAP al validar artículos",
             details: error.message
@@ -223,17 +275,8 @@ async function verificarArticulosSAP(req, res) {
 
 async function sendSolicitudCompra(solicitud, empresa) {
     const execute = async () => {
-        let session = sapSessions[empresa.id];
-
-        if (!session || !session.sessionId) {
-            session = await loginSAP(empresa);
-            sapSessions[empresa.id] = session;
-        }
-
-        const headers = {
-            Cookie: `B1SESSION=${session.sessionId}; ROUTEID=${session.routeId}`,
-            "Content-Type": "application/json"
-        };
+        const session = await getSesionEmpresa(empresa);
+        const headers = headersSesion(session, { "Content-Type": "application/json" });
 
         const payload = {
             DocDate: fechaSapHoy(),
@@ -262,7 +305,7 @@ async function sendSolicitudCompra(solicitud, empresa) {
     };
 
     try {
-        return await execute();
+        return await conReintentoSesion(empresa.id, execute);
     } catch (error) {
 
         console.log("===== SAP ERROR =====");
@@ -272,19 +315,6 @@ async function sendSolicitudCompra(solicitud, empresa) {
         const sapErrorData = error.response?.data?.error;
         const code = sapErrorData?.code;
         const status = error.response?.status;
-
-        const isAuthError =
-            code === "301" ||
-            code === "302" ||
-            code === "206" ||
-            status === 401;
-
-        if (isAuthError) {
-            delete sapSessions[empresa.id];
-            const newSession = await loginSAP(empresa);
-            sapSessions[empresa.id] = newSession;
-            return await execute();
-        }
 
         // SAP a veces manda el mensaje como string plano,
         // a veces como { lang, value } — cubrimos ambos casos.
@@ -317,17 +347,6 @@ async function buscarProductosPorNombre(req, res) {
 
     try {
         const empresa = await obtenerEmpresaSAP(empresa_id);
-        let session = sapSessions.byEmpresa[empresa.id];
-
-        if (!session || !session.sessionId) {
-            session = await loginSAP(empresa);
-            sapSessions.byEmpresa[empresa.id] = session;
-        }
-
-        const headers = {
-            Cookie: `B1SESSION=${session.sessionId}; ROUTEID=${session.routeId}`
-        };
-
         const safeQuery = query.replace(/'/g, "''");
 
         const url = `${process.env.SAP_URL.replace(/\/$/, '')}/Items?` +
@@ -335,7 +354,10 @@ async function buscarProductosPorNombre(req, res) {
             `$filter=contains(ItemName,'${safeQuery}')&` +
             `$top=${pageSize}&$skip=${skip}&$count=true`;
 
-        const response = await axios.get(url, { headers, httpsAgent: agent });
+        const response = await conReintentoSesion(empresa.id, async () => {
+            const session = await getSesionEmpresa(empresa);
+            return axios.get(url, { headers: headersSesion(session), httpsAgent: agent });
+        });
 
         return res.json({
             items: response.data.value || [],
@@ -343,10 +365,6 @@ async function buscarProductosPorNombre(req, res) {
         });
 
     } catch (error) {
-        if (error.response?.status === 401) {
-            delete sapSessions.byEmpresa[empresa_id];
-        }
-
         return res.status(500).json({
             error: "Error SAP búsqueda",
             details: error.message
@@ -363,16 +381,6 @@ async function getProveedores(req, res) {
 
     try {
         const empresa = await obtenerEmpresaSAP(empresa_id);
-        let session = sapSessions.byEmpresa[empresa.id];
-
-        if (!session || !session.sessionId) {
-            session = await loginSAP(empresa);
-            sapSessions.byEmpresa[empresa.id] = session;
-        }
-
-        const headers = {
-            Cookie: `B1SESSION=${session.sessionId}; ROUTEID=${session.routeId}`
-        };
 
         let filterQuery = "CardType eq 'cSupplier' and Valid eq 'tYES'";
 
@@ -386,7 +394,10 @@ async function getProveedores(req, res) {
             `$filter=${filterQuery}&` +
             `$top=20`;
 
-        const response = await axios.get(url, { headers, httpsAgent: agent });
+        const response = await conReintentoSesion(empresa.id, async () => {
+            const session = await getSesionEmpresa(empresa);
+            return axios.get(url, { headers: headersSesion(session), httpsAgent: agent });
+        });
 
         return res.json({
             status: "success",
@@ -394,10 +405,6 @@ async function getProveedores(req, res) {
         });
 
     } catch (error) {
-        if (error.response?.status === 401) {
-            delete sapSessions.byEmpresa[empresa_id];
-        }
-
         return res.status(500).json({
             error: "Error SAP al obtener proveedores",
             details: error.response?.data?.error?.message?.value || error.message
@@ -409,17 +416,8 @@ async function obtenerProductosData(id_tienda) {
     const empresa = await obtenerEmpresaSAPPorTienda(id_tienda);
 
     const executeRequest = async () => {
-        let session = sapSessions.byEmpresa[empresa.id];
-
-        if (!session || !session.sessionId) {
-            session = await loginSAP(empresa);
-            sapSessions.byEmpresa[empresa.id] = session;
-        }
-
-        const headers = {
-            Cookie: `B1SESSION=${session.sessionId}; ROUTEID=${session.routeId}`,
-            Prefer: 'odata.maxpagesize=5000'
-        };
+        const session = await getSesionEmpresa(empresa);
+        const headers = headersSesion(session, { Prefer: 'odata.maxpagesize=5000' });
 
         const [catRes, prodRes] = await Promise.all([
             axios.get(
@@ -459,22 +457,7 @@ async function obtenerProductosData(id_tienda) {
             .filter(c => c.products.length > 0);
     };
 
-    try {
-        return await executeRequest();
-    } catch (error) {
-        const isAuthError =
-            error.response?.status === 401 ||
-            error.response?.data?.error?.code === "301" ||
-            error.response?.data?.error?.code === "302" ||
-            error.response?.data?.error?.code === "206";
-
-        if (isAuthError) {
-            delete sapSessions.byEmpresa[empresa.id];
-            return await executeRequest();
-        }
-
-        throw error;
-    }
+    return await conReintentoSesion(empresa.id, executeRequest);
 }
 
 // ------------------------------------------------------------
@@ -494,16 +477,8 @@ function obtenerCredencialesAvigua() {
     };
 }
 
-async function getAviguaSession() {
-    let session = sapSessions.byEmpresa['avigua'];
-
-    if (!session || !session.sessionId) {
-        const empresa = obtenerCredencialesAvigua();
-        session = await loginSAP(empresa, SAP_AVIGUA_URL);
-        sapSessions.byEmpresa['avigua'] = session;
-    }
-
-    return session;
+function getAviguaSession() {
+    return obtenerSesion('avigua', () => loginSAP(obtenerCredencialesAvigua(), SAP_AVIGUA_URL));
 }
 
 // Consulta el stock disponible en la bodega indicada (el muelle de la ruta
@@ -569,19 +544,8 @@ async function consultarStockPollo(codigosArticulo, whsCode) {
     };
 
     try {
-        return await executeRequest();
+        return await conReintentoSesion('avigua', executeRequest);
     } catch (error) {
-        const isAuthError =
-            error.response?.status === 401 ||
-            error.response?.data?.error?.code === "301" ||
-            error.response?.data?.error?.code === "302" ||
-            error.response?.data?.error?.code === "206";
-
-        if (isAuthError) {
-            delete sapSessions.byEmpresa['avigua'];
-            return await executeRequest();
-        }
-
         console.log("===== SAP AVIGUA ERROR =====");
         console.log("STATUS:", error.response?.status);
         console.log(JSON.stringify(error.response?.data, null, 2));
@@ -619,16 +583,8 @@ function obtenerCredencialesInsumos() {
     };
 }
 
-async function getInsumosSession() {
-    let session = sapSessions.byEmpresa['insumos'];
-
-    if (!session || !session.sessionId) {
-        const empresa = obtenerCredencialesInsumos();
-        session = await loginSAP(empresa, process.env.SAP_URL);
-        sapSessions.byEmpresa['insumos'] = session;
-    }
-
-    return session;
+function getInsumosSession() {
+    return obtenerSesion('insumos', () => loginSAP(obtenerCredencialesInsumos(), process.env.SAP_URL));
 }
 
 // Busca artículos de activo fijo (prefijos "UL"/"UC"/"UA" en ItemCode) por
@@ -646,11 +602,6 @@ async function buscarActivosFijos(req, res) {
     const skip = (page - 1) * pageSize;
 
     try {
-        const session = await getInsumosSession();
-        const headers = {
-            Cookie: `B1SESSION=${session.sessionId}; ROUTEID=${session.routeId}`
-        };
-
         const safeQuery = query.replace(/'/g, "''");
         const filtroPrefijos = PREFIJOS_ACTIVO_FIJO
             .map(p => `startswith(ItemCode,'${p}')`)
@@ -661,7 +612,10 @@ async function buscarActivosFijos(req, res) {
             `$filter=(${filtroPrefijos}) and contains(ItemName,'${safeQuery}') and Frozen eq 'N' and Valid eq 'Y'&` +
             `$top=${pageSize}&$skip=${skip}&$count=true`;
 
-        const response = await axios.get(url, { headers, httpsAgent: agent });
+        const response = await conReintentoSesion('insumos', async () => {
+            const session = await getInsumosSession();
+            return axios.get(url, { headers: headersSesion(session), httpsAgent: agent });
+        });
 
         return res.json({
             items: response.data.value || [],
@@ -669,10 +623,6 @@ async function buscarActivosFijos(req, res) {
         });
 
     } catch (error) {
-        if (error.response?.status === 401) {
-            delete sapSessions.byEmpresa['insumos'];
-        }
-
         return res.status(500).json({
             error: "Error SAP búsqueda de activos fijos",
             details: error.message
@@ -687,12 +637,6 @@ async function buscarActivosFijos(req, res) {
 // catálogo ya agrupado al cargar la vista, sin necesidad de buscar por nombre.
 async function listarActivosFijos(req, res) {
     try {
-        const session = await getInsumosSession();
-        const headers = {
-            Cookie: `B1SESSION=${session.sessionId}; ROUTEID=${session.routeId}`,
-            Prefer: 'odata.maxpagesize=5000'
-        };
-
         const filtroPrefijos = PREFIJOS_ACTIVO_FIJO
             .map(p => `startswith(ItemCode,'${p}')`)
             .join(' or ');
@@ -703,7 +647,13 @@ async function listarActivosFijos(req, res) {
             `$filter=(${filtroPrefijos}) and Frozen eq 'N' and Valid eq 'Y'&` +
             `$top=5000`;
 
-        const response = await axios.get(url, { headers, httpsAgent: agent });
+        const response = await conReintentoSesion('insumos', async () => {
+            const session = await getInsumosSession();
+            return axios.get(url, {
+                headers: headersSesion(session, { Prefer: 'odata.maxpagesize=5000' }),
+                httpsAgent: agent
+            });
+        });
         const items = response.data.value || [];
 
         const gruposPorCodigo = new Map();
@@ -729,10 +679,6 @@ async function listarActivosFijos(req, res) {
         return res.json({ categorias });
 
     } catch (error) {
-        if (error.response?.status === 401) {
-            delete sapSessions.byEmpresa['insumos'];
-        }
-
         return res.status(500).json({
             error: "Error SAP al listar el catálogo de activos fijos",
             details: error.message
@@ -802,19 +748,8 @@ async function consultarStockInsumos(codigosArticulo, whsCode = WHS_INSUMOS) {
     };
 
     try {
-        return await executeRequest();
+        return await conReintentoSesion('insumos', executeRequest);
     } catch (error) {
-        const isAuthError =
-            error.response?.status === 401 ||
-            error.response?.data?.error?.code === "301" ||
-            error.response?.data?.error?.code === "302" ||
-            error.response?.data?.error?.code === "206";
-
-        if (isAuthError) {
-            delete sapSessions.byEmpresa['insumos'];
-            return await executeRequest();
-        }
-
         console.log("===== SAP INSUMOS ERROR =====");
         console.log("STATUS:", error.response?.status);
         console.log(JSON.stringify(error.response?.data, null, 2));
@@ -874,19 +809,8 @@ async function crearTransferenciaPollo({ fromWarehouse, toWarehouse, lineas, com
     };
 
     try {
-        return await executeRequest();
+        return await conReintentoSesion('avigua', executeRequest);
     } catch (error) {
-        const isAuthError =
-            error.response?.status === 401 ||
-            error.response?.data?.error?.code === "301" ||
-            error.response?.data?.error?.code === "302" ||
-            error.response?.data?.error?.code === "206";
-
-        if (isAuthError) {
-            delete sapSessions.byEmpresa['avigua'];
-            return await executeRequest();
-        }
-
         console.log("===== SAP AVIGUA TRANSFERENCIA ERROR =====");
         console.log(process.env.SAP_AVIGUA_BD)
         console.log("STATUS:", error.response?.status);
@@ -944,19 +868,8 @@ async function crearTransferenciaInsumos({ fromWarehouse, toWarehouse, lineas, c
     };
 
     try {
-        return await executeRequest();
+        return await conReintentoSesion('insumos', executeRequest);
     } catch (error) {
-        const isAuthError =
-            error.response?.status === 401 ||
-            error.response?.data?.error?.code === "301" ||
-            error.response?.data?.error?.code === "302" ||
-            error.response?.data?.error?.code === "206";
-
-        if (isAuthError) {
-            delete sapSessions.byEmpresa['insumos'];
-            return await executeRequest();
-        }
-
         console.log("===== SAP INSUMOS TRANSFERENCIA ERROR =====");
         console.log("STATUS:", error.response?.status);
         console.log(JSON.stringify(error.response?.data, null, 2));
@@ -1015,19 +928,8 @@ async function crearEntregaPollo({ cardCode, whsCode, lineas, comentarios }) {
     };
 
     try {
-        return await executeRequest();
+        return await conReintentoSesion('avigua', executeRequest);
     } catch (error) {
-        const isAuthError =
-            error.response?.status === 401 ||
-            error.response?.data?.error?.code === "301" ||
-            error.response?.data?.error?.code === "302" ||
-            error.response?.data?.error?.code === "206";
-
-        if (isAuthError) {
-            delete sapSessions.byEmpresa['avigua'];
-            return await executeRequest();
-        }
-
         console.log("===== SAP AVIGUA ENTREGA ERROR =====");
         console.log("STATUS:", error.response?.status);
         console.log(JSON.stringify(error.response?.data, null, 2));
@@ -1081,19 +983,8 @@ async function crearEntregaInsumos({ cardCode, whsCode, lineas, comentarios }) {
     };
 
     try {
-        return await executeRequest();
+        return await conReintentoSesion('insumos', executeRequest);
     } catch (error) {
-        const isAuthError =
-            error.response?.status === 401 ||
-            error.response?.data?.error?.code === "301" ||
-            error.response?.data?.error?.code === "302" ||
-            error.response?.data?.error?.code === "206";
-
-        if (isAuthError) {
-            delete sapSessions.byEmpresa['insumos'];
-            return await executeRequest();
-        }
-
         console.log("===== SAP INSUMOS ENTREGA ERROR =====");
         console.log("STATUS:", error.response?.status);
         console.log(JSON.stringify(error.response?.data, null, 2));
@@ -1138,19 +1029,8 @@ async function obtenerBodegasCuartoFrioPollo() {
     };
 
     try {
-        return await executeRequest();
+        return await conReintentoSesion('avigua', executeRequest);
     } catch (error) {
-        const isAuthError =
-            error.response?.status === 401 ||
-            error.response?.data?.error?.code === "301" ||
-            error.response?.data?.error?.code === "302" ||
-            error.response?.data?.error?.code === "206";
-
-        if (isAuthError) {
-            delete sapSessions.byEmpresa['avigua'];
-            return await executeRequest();
-        }
-
         console.log("===== SAP AVIGUA BODEGAS CUARTO FRIO ERROR =====");
         console.log("STATUS:", error.response?.status);
         console.log(JSON.stringify(error.response?.data, null, 2));
@@ -1188,19 +1068,8 @@ async function obtenerBodegasCuartoFrioInsumos() {
     };
 
     try {
-        return await executeRequest();
+        return await conReintentoSesion('insumos', executeRequest);
     } catch (error) {
-        const isAuthError =
-            error.response?.status === 401 ||
-            error.response?.data?.error?.code === "301" ||
-            error.response?.data?.error?.code === "302" ||
-            error.response?.data?.error?.code === "206";
-
-        if (isAuthError) {
-            delete sapSessions.byEmpresa['insumos'];
-            return await executeRequest();
-        }
-
         console.log("===== SAP INSUMOS BODEGAS CUARTO FRIO ERROR =====");
         console.log("STATUS:", error.response?.status);
         console.log(JSON.stringify(error.response?.data, null, 2));
@@ -1244,19 +1113,8 @@ async function buscarClientesPollo(query) {
     };
 
     try {
-        return await executeRequest();
+        return await conReintentoSesion('avigua', executeRequest);
     } catch (error) {
-        const isAuthError =
-            error.response?.status === 401 ||
-            error.response?.data?.error?.code === "301" ||
-            error.response?.data?.error?.code === "302" ||
-            error.response?.data?.error?.code === "206";
-
-        if (isAuthError) {
-            delete sapSessions.byEmpresa['avigua'];
-            return await executeRequest();
-        }
-
         const sapErrorData = error.response?.data?.error;
         const sapMessage =
             typeof sapErrorData?.message === 'string' ? sapErrorData.message : sapErrorData?.message?.value;
@@ -1287,19 +1145,8 @@ async function buscarClientesInsumos(query) {
     };
 
     try {
-        return await executeRequest();
+        return await conReintentoSesion('insumos', executeRequest);
     } catch (error) {
-        const isAuthError =
-            error.response?.status === 401 ||
-            error.response?.data?.error?.code === "301" ||
-            error.response?.data?.error?.code === "302" ||
-            error.response?.data?.error?.code === "206";
-
-        if (isAuthError) {
-            delete sapSessions.byEmpresa['insumos'];
-            return await executeRequest();
-        }
-
         const sapErrorData = error.response?.data?.error;
         const sapMessage =
             typeof sapErrorData?.message === 'string' ? sapErrorData.message : sapErrorData?.message?.value;
@@ -1317,10 +1164,9 @@ const CODIGOS_POR_CONSULTA_SWW = 20;
 
 async function consultarCodigosAntiguos(codigosArticulo, tipo) {
     const codigosUnicos = [...new Set((codigosArticulo || []).filter(Boolean))];
-    const resultado = new Map();
 
     if (codigosUnicos.length === 0) {
-        return resultado;
+        return new Map();
     }
 
     const esPollo = tipo === 'POLLO';
@@ -1329,9 +1175,9 @@ async function consultarCodigosAntiguos(codigosArticulo, tipo) {
 
     const executeRequest = async () => {
         const session = esPollo ? await getAviguaSession() : await getInsumosSession();
-        const headers = {
-            Cookie: `B1SESSION=${session.sessionId}; ROUTEID=${session.routeId}`
-        };
+        const headers = headersSesion(session);
+        // Se arma de cero en cada intento, para que un reintento no mezcle resultados.
+        const resultado = new Map();
 
         for (let i = 0; i < codigosUnicos.length; i += CODIGOS_POR_CONSULTA_SWW) {
             const grupo = codigosUnicos.slice(i, i + CODIGOS_POR_CONSULTA_SWW);
@@ -1351,20 +1197,8 @@ async function consultarCodigosAntiguos(codigosArticulo, tipo) {
     };
 
     try {
-        return await executeRequest();
+        return await conReintentoSesion(claveSesion, executeRequest);
     } catch (error) {
-        const isAuthError =
-            error.response?.status === 401 ||
-            error.response?.data?.error?.code === "301" ||
-            error.response?.data?.error?.code === "302" ||
-            error.response?.data?.error?.code === "206";
-
-        if (isAuthError) {
-            delete sapSessions.byEmpresa[claveSesion];
-            resultado.clear();
-            return await executeRequest();
-        }
-
         const sapErrorData = error.response?.data?.error;
         const sapMessage =
             typeof sapErrorData?.message === 'string' ? sapErrorData.message : sapErrorData?.message?.value;

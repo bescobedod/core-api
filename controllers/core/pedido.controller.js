@@ -292,6 +292,165 @@ async function crearPedidoActivoFijo(req, res) {
 }
 
 // ------------------------------------------------------------
+// POST: cambia la fecha de entrega (fecha_requerida) de UN pedido, en la
+// cabecera y en todas sus líneas de detalle. Lo usan las vistas de Pedidos
+// de Pollo y de Insumos. Reglas:
+// - Solo pedidos que aún no se enviaron a SAP (ESTADOS_FECHA_EDITABLE).
+// - La nueva fecha no puede ser anterior a hoy (hora de Guatemala).
+// - Ni la ruta+fecha actual ni la nueva pueden estar tomadas (candado) por
+//   OTRO usuario, ni la ruta puede estar ya despachada en la nueva fecha.
+// - Un pedido VALIDADO vuelve a RECIBIDO y pierde su asignación: las
+//   cantidades se calcularon contra el stock de la fecha original.
+// Queda registro en el historial del pedido.
+// ------------------------------------------------------------
+const ESTADOS_FECHA_EDITABLE = ['PENDIENTE_ENRIQUECIMIENTO', 'RECIBIDO', 'VALIDADO'];
+const ESTADOS_RUTA_DESPACHADA = ['EN_TRANSITO', 'ENTREGADO', 'ENTREGADO_PARCIAL'];
+
+function fechaHoyGuatemala() {
+    // en-CA da el formato YYYY-MM-DD
+    return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Guatemala' }).format(new Date());
+}
+
+function fechaDdMmAaaa(fechaIso) {
+    const [anio, mes, dia] = String(fechaIso || '').split('-');
+    return anio && mes && dia ? `${dia}/${mes}/${anio}` : fechaIso;
+}
+
+async function cambiarFechaRequeridaPedido(req, res) {
+    const { pedido_id, fecha_requerida } = req.body;
+    const id_usuario = req.user && req.user.id_usuario;
+    const usuario = (req.user && (req.user.nombre || req.user.id_usuario)) || null;
+
+    if (!pedido_id || !fecha_requerida) {
+        return res.status(400).json({ error: 'pedido_id y fecha_requerida son requeridos', success: false });
+    }
+
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(fecha_requerida) || isNaN(Date.parse(fecha_requerida))) {
+        return res.status(400).json({ error: 'fecha_requerida debe tener el formato YYYY-MM-DD', success: false });
+    }
+
+    if (fecha_requerida < fechaHoyGuatemala()) {
+        return res.status(400).json({ error: 'La nueva fecha de entrega no puede ser anterior a hoy', success: false });
+    }
+
+    const t = await sequelizeInit.sequelize.transaction();
+
+    try {
+        const pedido = await PedidoPosCabeceraModel.findByPk(pedido_id, { transaction: t, lock: t.LOCK.UPDATE });
+
+        if (!pedido) {
+            await t.rollback();
+            return res.status(404).json({ error: 'El pedido no existe', success: false });
+        }
+
+        const fechaAnterior = pedido.fecha_requerida;
+        const estadoAnterior = pedido.estado;
+
+        if (!ESTADOS_FECHA_EDITABLE.includes(estadoAnterior)) {
+            await t.rollback();
+            return res.status(409).json({
+                error: `No se puede cambiar la fecha de un pedido en estado ${estadoAnterior}: ya fue enviado a SAP o está en proceso de envío`,
+                success: false
+            });
+        }
+
+        if (fechaAnterior === fecha_requerida) {
+            await t.rollback();
+            return res.status(400).json({ error: 'La nueva fecha es igual a la fecha actual del pedido', success: false });
+        }
+
+        const esPollo = pedido.tipo_pedido === 'POLLO';
+
+        if (pedido.ruta_id) {
+            const BloqueoModel = esPollo ? BloqueoRutaPolloModel : BloqueoRutaInsumosModel;
+            const candadoAjeno = await BloqueoModel.findOne({
+                where: {
+                    ruta_id: pedido.ruta_id,
+                    fecha: { [Op.in]: [fechaAnterior, fecha_requerida].filter(Boolean) },
+                    estado: 'ACTIVO',
+                    id_usuario: { [Op.ne]: id_usuario }
+                },
+                transaction: t
+            });
+
+            if (candadoAjeno) {
+                await t.rollback();
+                return res.status(409).json({
+                    error: `La ruta ${pedido.nombre_ruta || ''} está en proceso por otro usuario para el ${fechaDdMmAaaa(candadoAjeno.fecha)}. Debe liberarla antes de cambiar la fecha.`,
+                    success: false
+                });
+            }
+
+            const despachado = await PedidoPosCabeceraModel.findOne({
+                where: {
+                    ruta_id: pedido.ruta_id,
+                    fecha_requerida,
+                    tipo_pedido: esPollo ? 'POLLO' : { [Op.in]: TIPOS_INSUMOS_Y_ACTIVO_FIJO },
+                    estado: { [Op.in]: ESTADOS_RUTA_DESPACHADA }
+                },
+                attributes: ['id'],
+                transaction: t
+            });
+
+            if (despachado) {
+                await t.rollback();
+                return res.status(409).json({
+                    error: `La ruta ${pedido.nombre_ruta || ''} ya fue despachada para el ${fechaDdMmAaaa(fecha_requerida)}; elige otra fecha.`,
+                    success: false
+                });
+            }
+        }
+
+        const ahora = new Date();
+        const eraValidado = estadoAnterior === 'VALIDADO';
+        const estadoNuevo = eraValidado ? 'RECIBIDO' : estadoAnterior;
+
+        await pedido.update({
+            fecha_requerida,
+            estado: estadoNuevo,
+            ...(eraValidado ? { fecha_validacion: null } : {}),
+            actualizado_en: ahora
+        }, { transaction: t });
+
+        await PedidoPosDetalleModel.update({
+            fecha_requerida,
+            ...(eraValidado ? { cantidad_asignada: 0, estado_linea: 'PENDIENTE', ajustado_manual: false } : {}),
+            actualizado_en: ahora
+        }, { where: { pedido_id }, transaction: t });
+
+        await PedidoPosHistorialModel.create({
+            pedido_id,
+            estado_anterior: estadoAnterior,
+            estado_nuevo: estadoNuevo,
+            usuario,
+            comentario: `Fecha de entrega cambiada de ${fechaDdMmAaaa(fechaAnterior)} a ${fechaDdMmAaaa(fecha_requerida)}` +
+                (eraValidado ? ' (se quitó la asignación de cantidades: el pedido vuelve a Recibido)' : ''),
+            fecha: ahora
+        }, { transaction: t });
+
+        await t.commit();
+
+        return res.json({
+            success: true,
+            pedido_id,
+            numero_pedido: pedido.numero_pedido,
+            fecha_anterior: fechaAnterior,
+            fecha_requerida,
+            estado: estadoNuevo,
+            asignacion_reiniciada: eraValidado
+        });
+    } catch (error) {
+        await t.rollback();
+
+        return res.status(500).json({
+            error: 'Error al cambiar la fecha de entrega',
+            details: error.message,
+            success: false
+        });
+    }
+}
+
+// ------------------------------------------------------------
 // GET: lista (paginado) los pedidos de Activo Fijo de una tienda, para la
 // pestaña "Buscar Pedidos" de FixedAssetsView. Solo lectura, no toca SAP,
 // candados ni transporte. Acepta una fecha única o un rango de
@@ -4144,6 +4303,7 @@ module.exports = {
     getPedidoDetalleByEncabezado,
     createPedido,
     crearPedidoActivoFijo,
+    cambiarFechaRequeridaPedido,
     buscarPedidosActivoFijo,
     validarYObtenerPedido,
     subirYProcesarArchivosPedidoPos,
