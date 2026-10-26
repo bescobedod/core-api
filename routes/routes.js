@@ -26,6 +26,7 @@ const pilotoClienteSap = require('../controllers/core/piloto_cliente_sap.control
 const roles = require('../controllers/core/rol.controller.js');
 const usuarioMuellePollo = require('../controllers/core/usuario_muelle_pollo.controller.js');
 const visitas = require('../controllers/core/visita.controller.js');
+const marcajes = require('../controllers/core/marcaje.controller.js');
 const auth = require('../middlewares/auth.js');
 const upload = require('../middlewares/upload.js');
 const rateLimit = require('express-rate-limit');
@@ -73,6 +74,13 @@ router.get('/visita/getUsuarios', auth, visitas.getUsuariosConVisitas);
 router.get('/visita/buscarVisitas', auth, visitas.buscarVisitas);
 router.get('/visita/getVisita', auth, visitas.getVisita);
 router.get('/visita/exportarVisitas', auth, visitas.exportarVisitas);
+
+//MARCAJES
+router.get('/marcaje/getUsuarios', auth, marcajes.getUsuariosConMarcajes);
+router.get('/marcaje/getZonas', auth, marcajes.getZonas);
+router.get('/marcaje/buscarMarcajes', auth, marcajes.buscarMarcajes);
+router.get('/marcaje/getMarcaje', auth, marcajes.getMarcaje);
+router.get('/marcaje/exportarMarcajes', auth, marcajes.exportarMarcajes);
 
 //PEDIDOS-ENVIOS
 router.get('/pedido/getAllTipoPedidoEnvio', tiposPedidoEnvio.getAllTipoPedidoEnvio);

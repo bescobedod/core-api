@@ -308,5 +308,6 @@ module.exports = {
     getUsuariosConVisitas,
     buscarVisitas,
     getVisita,
-    exportarVisitas
+    exportarVisitas,
+    urlDeEvidencia
 };
