@@ -124,8 +124,7 @@ async function findEmployeeInNomina(EmpleadoModel, identifier) {
         where: {
             [Op.or]: [
                 { aliasCodigo: identifier },
-                { email: identifier },
-                { email_office: identifier }
+                { email: identifier }
             ],
             baja: 0
         }
