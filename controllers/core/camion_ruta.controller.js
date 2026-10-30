@@ -18,7 +18,8 @@ const {
     crearTransferenciaPollo,
     crearTransferenciaInsumos,
     crearEntregaPollo,
-    crearEntregaInsumos
+    crearEntregaInsumos,
+    WHS_INSUMOS
 } = require('../../integrations/sap/sapClient');
 
 const CONTEXTO_NOTIFICACION_ENTREGA = {
@@ -361,8 +362,16 @@ async function trasladarACuartoFrio(req, res) {
         return res.status(400).json({ error: 'ruta_id, whs_origen y whs_destino son requeridos', success: false });
     }
 
-    if (!whs_destino.startsWith('CFR-')) {
+    // Pollo devuelve el producto a un cuarto frío (CFR-...); Insumos lo
+    // devuelve a la bodega central (la misma "01" de donde sale).
+    const esPollo = tipo === 'POLLO';
+
+    if (esPollo && !whs_destino.startsWith('CFR-')) {
         return res.status(400).json({ error: 'whs_destino debe ser una bodega de cuarto frío (CFR-...)', success: false });
+    }
+
+    if (!esPollo && whs_destino !== WHS_INSUMOS) {
+        return res.status(400).json({ error: `whs_destino debe ser la bodega central de insumos (${WHS_INSUMOS})`, success: false });
     }
 
     if (!Array.isArray(lineas) || lineas.length === 0) {
@@ -378,7 +387,9 @@ async function trasladarACuartoFrio(req, res) {
         // sales_items_per_unit.
         const lineasSap = lineas.map(l => ({ codigo_producto: l.codigo_producto, cantidad: l.cantidad }));
 
-        const comentarios = `Traslado a cuarto frío - ruta ${nombre_ruta || ruta_id}`;
+        const comentarios = esPollo
+            ? `Traslado a cuarto frío - ruta ${nombre_ruta || ruta_id}`
+            : `Traslado a bodega central - ruta ${nombre_ruta || ruta_id}`;
 
         resultadoSap = tipo === 'POLLO'
             ? await crearTransferenciaPollo({ fromWarehouse: whs_origen, toWarehouse: whs_destino, lineas: lineasSap, comentarios })
