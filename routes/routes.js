@@ -27,6 +27,8 @@ const roles = require('../controllers/core/rol.controller.js');
 const usuarioMuellePollo = require('../controllers/core/usuario_muelle_pollo.controller.js');
 const visitas = require('../controllers/core/visita.controller.js');
 const marcajes = require('../controllers/core/marcaje.controller.js');
+const pedidoEspecial = require('../controllers/core/pedido_especial.controller.js');
+const pedidoArtesano = require('../controllers/core/pedido_artesano.controller.js');
 const auth = require('../middlewares/auth.js');
 const upload = require('../middlewares/upload.js');
 const rateLimit = require('express-rate-limit');
@@ -68,6 +70,22 @@ router.get('/usuario-muelle-pollo/getUsuariosPorMuelle', auth, usuarioMuellePoll
 router.get('/usuario-muelle-pollo/buscarUsuarios', auth, usuarioMuellePollo.buscarUsuarios);
 router.post('/usuario-muelle-pollo/asignarMuelle', auth, usuarioMuellePollo.asignarMuelle);
 router.delete('/usuario-muelle-pollo/quitarMuelle/:id_usuario', auth, usuarioMuellePollo.quitarMuelle);
+
+//PEDIDOS ESPECIALES (vendor PE AVICOLA de Simphony)
+router.get('/pedidoEspecial/getPedidos', auth, pedidoEspecial.getPedidos);
+router.get('/pedidoEspecial/getStock', auth, pedidoEspecial.getStock);
+router.post('/pedidoEspecial/autorizar', auth, pedidoEspecial.autorizar);
+router.post('/pedidoEspecial/rechazar', auth, pedidoEspecial.rechazar);
+router.post('/pedidoEspecial/guardarAsignacion', auth, pedidoEspecial.guardarAsignacion);
+router.post('/pedidoEspecial/marcarListo', auth, pedidoEspecial.marcarListo);
+
+//POLLO ARTESANO
+router.get('/pedidoArtesano/getProductos', auth, pedidoArtesano.getProductos);
+router.get('/pedidoArtesano/getUsuarios', auth, pedidoArtesano.getUsuarios);
+router.get('/pedidoArtesano/getPedidos', auth, pedidoArtesano.getPedidos);
+router.get('/pedidoArtesano/buscarClientes', auth, pedidoArtesano.buscarClientes);
+router.post('/pedidoArtesano/crearCliente', auth, pedidoArtesano.crearCliente);
+router.post('/pedidoArtesano/crearPedido', auth, pedidoArtesano.crearPedido);
 
 //VISITAS A AVICOLAS
 router.get('/visita/getUsuarios', auth, visitas.getUsuariosConVisitas);
