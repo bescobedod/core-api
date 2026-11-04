@@ -58,6 +58,7 @@ router.get('/menus/getAllMenus', auth, menus.getAllMenus);
 router.get('/menus/getPermiso', auth, menus.getPermiso);
 router.get('/menus/getAllMenusAdmin', auth, menus.getAllMenusAdmin);
 router.post('/menus/crearMenu', auth, menus.crearMenu);
+router.put('/menus/actualizarMenu/:id', auth, menus.actualizarMenu);
 router.put('/menus/actualizarVisibilidad/:id', auth, menus.actualizarVisibilidadMenu);
 router.get('/menus/getRolesDeMenu', auth, menus.getRolesDeMenu);
 router.post('/menus/asignarRolAMenu', auth, menus.asignarRolAMenu);

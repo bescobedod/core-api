@@ -225,7 +225,7 @@ async function crearPedidoActivoFijo(req, res) {
             "SELECT nextval('logistica.seq_pedido_activo_fijo') as nextval",
             { type: QueryTypes.SELECT, transaction: t }
         );
-        const numero_pedido = `AF-${new Date().getFullYear()}-${String(nextval).padStart(6, '0')}`;
+        const numero_pedido = `AF${new Date().getFullYear()}-${String(nextval).padStart(6, '0')}`;
 
         const ahora = new Date();
         const hoy = ahora.toISOString().split('T')[0];
@@ -303,6 +303,9 @@ async function crearPedidoActivoFijo(req, res) {
 //   cantidades se calcularon contra el stock de la fecha original.
 // Queda registro en el historial del pedido.
 // ------------------------------------------------------------
+// Pedido cuya tienda no se encontró en tTienda: no entra a asignación,
+// validación ni envío a SAP hasta que se enriquezca.
+const ESTADO_PENDIENTE_ENRIQUECIMIENTO = 'PENDIENTE_ENRIQUECIMIENTO';
 const ESTADOS_FECHA_EDITABLE = ['PENDIENTE_ENRIQUECIMIENTO', 'RECIBIDO', 'VALIDADO'];
 const ESTADOS_RUTA_DESPACHADA = ['EN_TRANSITO', 'ENTREGADO', 'ENTREGADO_PARCIAL'];
 
@@ -514,6 +517,7 @@ async function buscarPedidosActivoFijo(req, res) {
                     unidad_medida: d.unidad_medida,
                     cantidad_solicitada: d.cantidad_solicitada,
                     cantidad_asignada: d.cantidad_asignada,
+                    cantidad_recibida: d.cantidad_recibida,
                     estado_linea: d.estado_linea
                 }))
             };
@@ -616,17 +620,6 @@ async function validarYObtenerPedido(req, res) {
 // de Oracle Simphony (SFTP -> middleware -> Core)
 // ============================================================
 
-function formatearFechaOracle(valor) {
-    // Oracle Simphony manda fechas como 'AAAAMMDD' (ej. '20260718')
-    if (!valor) return null;
-
-    const texto = valor.toString();
-    const anio = texto.substring(0, 4);
-    const mes = texto.substring(4, 6);
-    const dia = texto.substring(6, 8);
-
-    return `${anio}-${mes}-${dia}`;
-}
 
 // ------------------------------------------------------------
 // Parseo del archivo txt (formato B2B Purchase Orders de Oracle Simphony,
@@ -766,7 +759,9 @@ async function guardarPedidoPos(datosPedido, archivo_origen) {
         // POLLO usa el maestro de rutas nuevo (tbl_catalogo_rutas_pollo /
         // tbl_tiendas_rutas_pollo, por whs_code_origen/muelle). INSUMOS
         // todavía usa el maestro viejo hasta que se construya el suyo propio.
-        if (delivery_location_id) {
+        // Sin tienda en tTienda no se asigna ruta: así el pedido queda fuera
+        // de la asignación/validación/envío de la ruta hasta enriquecerse.
+        if (delivery_location_id && estado_inicial !== ESTADO_PENDIENTE_ENRIQUECIMIENTO) {
             if (tipo_pedido === 'POLLO') {
                 const asignacionRutaPollo = await TiendaRutaPolloModel.findOne({
                     where: {
@@ -1450,7 +1445,7 @@ async function getComparativoStockPollo(req, res) {
                 model: PedidoPosCabeceraModel,
                 as: 'cabecera',
                 attributes: [],
-                where: { tipo_pedido: 'POLLO', fecha_requerida: fecha, ruta_id }
+                where: { tipo_pedido: 'POLLO', fecha_requerida: fecha, ruta_id, estado: { [Op.ne]: ESTADO_PENDIENTE_ENRIQUECIMIENTO } }
             }],
             group: ['codigo_producto'],
             subQuery: false,
@@ -1534,7 +1529,7 @@ async function getComparativoStockInsumos(req, res) {
                 model: PedidoPosCabeceraModel,
                 as: 'cabecera',
                 attributes: [],
-                where: { tipo_pedido: { [Op.in]: TIPOS_INSUMOS_Y_ACTIVO_FIJO }, fecha_requerida: fecha, ruta_id }
+                where: { tipo_pedido: { [Op.in]: TIPOS_INSUMOS_Y_ACTIVO_FIJO }, fecha_requerida: fecha, ruta_id, estado: { [Op.ne]: ESTADO_PENDIENTE_ENRIQUECIMIENTO } }
             }],
             group: ['codigo_producto'],
             subQuery: false,
@@ -1607,10 +1602,17 @@ async function guardarAsignacionCantidades(req, res) {
                 throw new Error(`Cada asignación requiere detalle_id y cantidad_asignada (falló en: ${JSON.stringify(asign)})`);
             }
 
-            const detalle = await PedidoPosDetalleModel.findByPk(detalle_id, { transaction: t });
+            const detalle = await PedidoPosDetalleModel.findByPk(detalle_id, {
+                include: [{ model: PedidoPosCabeceraModel, as: 'cabecera', attributes: ['numero_pedido', 'estado'] }],
+                transaction: t
+            });
 
             if (!detalle) {
                 throw new Error(`No existe la línea de detalle ${detalle_id}`);
+            }
+
+            if (detalle.cabecera && detalle.cabecera.estado === ESTADO_PENDIENTE_ENRIQUECIMIENTO) {
+                throw new Error(`El pedido ${detalle.cabecera.numero_pedido} está pendiente de enriquecimiento (tienda no encontrada en tTienda) y no se puede validar`);
             }
 
             const cantidadNum = Number(cantidad_asignada);
@@ -1719,7 +1721,7 @@ async function enviarTransferenciaPollo(req, res) {
                 model: PedidoPosCabeceraModel,
                 as: 'cabecera',
                 attributes: [],
-                where: { tipo_pedido: 'POLLO', fecha_requerida: fecha, ruta_id }
+                where: { tipo_pedido: 'POLLO', fecha_requerida: fecha, ruta_id, estado: { [Op.ne]: ESTADO_PENDIENTE_ENRIQUECIMIENTO } }
             }],
             where: { cantidad_asignada: { [Op.gt]: 0 } },
             group: ['codigo_producto'],
@@ -1747,7 +1749,7 @@ async function enviarTransferenciaPollo(req, res) {
         }));
 
         const cabecerasAfectadas = await PedidoPosCabeceraModel.findAll({
-            where: { tipo_pedido: 'POLLO', fecha_requerida: fecha, ruta_id },
+            where: { tipo_pedido: 'POLLO', fecha_requerida: fecha, ruta_id, estado: { [Op.ne]: ESTADO_PENDIENTE_ENRIQUECIMIENTO } },
             attributes: ['id', 'numero_pedido', 'codigo_tienda']
         });
         const idsPedidos = cabecerasAfectadas.map(c => c.id);
@@ -1879,7 +1881,7 @@ async function enviarTransferenciaInsumos(req, res) {
                 model: PedidoPosCabeceraModel,
                 as: 'cabecera',
                 attributes: [],
-                where: { tipo_pedido: { [Op.in]: TIPOS_INSUMOS_Y_ACTIVO_FIJO }, fecha_requerida: fecha, ruta_id }
+                where: { tipo_pedido: { [Op.in]: TIPOS_INSUMOS_Y_ACTIVO_FIJO }, fecha_requerida: fecha, ruta_id, estado: { [Op.ne]: ESTADO_PENDIENTE_ENRIQUECIMIENTO } }
             }],
             where: { cantidad_asignada: { [Op.gt]: 0 } },
             group: ['codigo_producto'],
@@ -1907,7 +1909,7 @@ async function enviarTransferenciaInsumos(req, res) {
         }));
 
         const cabecerasAfectadas = await PedidoPosCabeceraModel.findAll({
-            where: { tipo_pedido: { [Op.in]: TIPOS_INSUMOS_Y_ACTIVO_FIJO }, fecha_requerida: fecha, ruta_id },
+            where: { tipo_pedido: { [Op.in]: TIPOS_INSUMOS_Y_ACTIVO_FIJO }, fecha_requerida: fecha, ruta_id, estado: { [Op.ne]: ESTADO_PENDIENTE_ENRIQUECIMIENTO } },
             attributes: ['id', 'numero_pedido', 'codigo_tienda']
         });
         const idsPedidos = cabecerasAfectadas.map(c => c.id);
@@ -3785,14 +3787,27 @@ async function getProductosReporte(req, res) {
     }
 }
 
+// Filtro de estado de los reportes de detalle según el nivel del usuario en el
+// menú de la vista (PedidosPolloView / PedidosInsumosView): los pendientes de
+// enriquecimiento nunca salen, y con 'lectura'/'lectura_division' solo salen
+// los pedidos ya despachados (EN_TRANSITO, ENTREGADO, ENTREGADO_PARCIAL).
+// Sin fila en tbl_menu_rol se trata como 'escritura', igual que el frontend.
+async function filtroEstadoReporteDetalle(req, nombreMenu) {
+    const nivel = await nivelPermisoDeMenu(req, nombreMenu);
+
+    return ['lectura', 'lectura_division'].includes(nivel)
+        ? { [Op.in]: ESTADOS_RUTA_DESPACHADA }
+        : { [Op.ne]: ESTADO_PENDIENTE_ENRIQUECIMIENTO };
+}
+
 // GET /pedido/generarReporteDetallePollo?fecha=...&division=1,2&muelles=RAS-002,RAS-003&formato=pdf|excel
 // Búsqueda avanzada (opcional): fecha_hasta=... (rango de fechas, genera un
 // reporte distinto al de una sola fecha) y productos=COD1,COD2 (solo esos
 // artículos). Sin esos parámetros el reporte es exactamente el de siempre.
-// Reporte de las rutas de Pollo para una fecha, sin importar el estado ni
-// si ya se procesó algo — solo el detalle de lo que pide cada tienda,
-// agrupado por ruta. Se puede generar en cualquier momento, incluso antes de
-// tomar el candado de cualquier ruta.
+// Reporte de las rutas de Pollo para una fecha — solo el detalle de lo que
+// pide cada tienda, agrupado por ruta. Los estados que salen dependen del
+// nivel de permiso (ver filtroEstadoReporteDetalle). Se puede generar en
+// cualquier momento, incluso antes de tomar el candado de cualquier ruta.
 // division (opcional, "1", "2" o "1,2") filtra por división de la tienda;
 // muelles (opcional) filtra por el muelle de la ruta — si se manda, los
 // pedidos que aún no tienen ruta quedan fuera porque no tienen muelle.
@@ -3818,7 +3833,7 @@ async function generarReporteDetallePollo(req, res) {
     }
 
     try {
-        const where = { tipo_pedido: 'POLLO' };
+        const where = { tipo_pedido: 'POLLO', estado: await filtroEstadoReporteDetalle(req, 'PedidosPolloView') };
         const include = aplicarBusquedaAvanzada(where, { fecha, ...busqueda });
 
         if (divisiones) {
@@ -3887,7 +3902,10 @@ async function generarReporteDetalleInsumos(req, res) {
     }
 
     try {
-        const where = { tipo_pedido: { [Op.in]: TIPOS_INSUMOS_Y_ACTIVO_FIJO } };
+        const where = {
+            tipo_pedido: { [Op.in]: TIPOS_INSUMOS_Y_ACTIVO_FIJO },
+            estado: await filtroEstadoReporteDetalle(req, 'PedidosInsumosView')
+        };
         const include = aplicarBusquedaAvanzada(where, { fecha, ...busqueda });
 
         if (divisiones) {
@@ -4326,6 +4344,8 @@ module.exports = {
     generarQrsRutaPollo,
     generarQrsRutaInsumos,
     getProductosReporte,
+    obtenerCodigosTiendaPorDivision,
+    obtenerMapaDivisionPorTienda,
     generarReporteDetallePollo,
     generarReporteDetalleInsumos,
     generarReporteEnTransitoPollo,
