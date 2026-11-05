@@ -23,6 +23,7 @@ const TiendaRutaPolloModel = require('../../models/core/tbl_tiendas_rutas_pollo.
 const TiendaRutaInsumosModel = require('../../models/core/tbl_tiendas_rutas_insumos.model');
 const CamionModel = require('../../models/core/tbl_camion.model');
 const DespachoRutaModel = require('../../models/core/tbl_despacho_ruta.model');
+const { nivelPermisoDeMenu } = require('../../services/permisosMenu.service');
 
 PedidoPosCabeceraModel.hasMany(PedidoPosDetalleModel, { foreignKey: 'pedido_id', as: 'detalle' });
 PedidoPosDetalleModel.belongsTo(PedidoPosCabeceraModel, { foreignKey: 'pedido_id', as: 'cabecera' });
