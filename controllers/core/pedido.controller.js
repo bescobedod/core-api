@@ -627,6 +627,18 @@ async function validarYObtenerPedido(req, res) {
 // pipe-delimited). Agrupa las líneas por numero_pedido, ya que un mismo
 // archivo puede traer más de un pedido.
 // ------------------------------------------------------------
+function formatearFechaOracle(valor) {
+    // Oracle Simphony manda fechas como 'AAAAMMDD' (ej. '20260718')
+    if (!valor) return null;
+
+    const texto = valor.toString();
+    const anio = texto.substring(0, 4);
+    const mes = texto.substring(4, 6);
+    const dia = texto.substring(6, 8);
+
+    return `${anio}-${mes}-${dia}`;
+}
+
 function parsearLineaArchivo(lineaTexto) {
     const campos = lineaTexto.split('|');
 
