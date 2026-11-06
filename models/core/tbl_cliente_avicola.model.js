@@ -13,6 +13,7 @@ ClienteAvicolaModel.init({
     direccion: { type: DataTypes.STRING(250), allowNull: true },
     // Dirección real de entrega; vacía en los clientes recién importados.
     direccion_fisica: { type: DataTypes.STRING(250), allowNull: true },
+    telefono: { type: DataTypes.STRING(30), allowNull: true },
     vigente: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: true },
     creado_por: { type: DataTypes.BIGINT, allowNull: true },
     creado_en: { type: DataTypes.DATE, allowNull: false, defaultValue: DataTypes.NOW },

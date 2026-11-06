@@ -86,6 +86,11 @@ router.get('/pedidoArtesano/getPedidos', auth, pedidoArtesano.getPedidos);
 router.get('/pedidoArtesano/buscarClientes', auth, pedidoArtesano.buscarClientes);
 router.post('/pedidoArtesano/crearCliente', auth, pedidoArtesano.crearCliente);
 router.post('/pedidoArtesano/crearPedido', auth, pedidoArtesano.crearPedido);
+router.post('/pedidoArtesano/editarPedido', auth, pedidoArtesano.editarPedido);
+router.get('/pedidoArtesano/getPendientes', auth, pedidoArtesano.getPendientes);
+router.get('/pedidoArtesano/getStock', auth, pedidoArtesano.getStock);
+router.post('/pedidoArtesano/autorizar', auth, pedidoArtesano.autorizar);
+router.post('/pedidoArtesano/rechazar', auth, pedidoArtesano.rechazar);
 
 //VISITAS A AVICOLAS
 router.get('/visita/getUsuarios', auth, visitas.getUsuariosConVisitas);
