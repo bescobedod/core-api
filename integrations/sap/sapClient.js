@@ -1003,6 +1003,63 @@ async function crearEntregaInsumos({ cardCode, whsCode, lineas, comentarios }) {
     }
 }
 
+// Entrega de venta de Pollo Artesano a nombre del cliente, con precio por línea.
+async function crearEntregaArtesano({ cardCode, whsCode, lineas, comentarios, numAtCard }) {
+    if (!cardCode || !whsCode) {
+        throw new Error('cardCode y whsCode son requeridos');
+    }
+
+    if (!lineas || lineas.length === 0) {
+        throw new Error('Se requiere al menos una línea para entregar');
+    }
+
+    const executeRequest = async () => {
+        const session = await getAviguaSession();
+        const headers = {
+            Cookie: `B1SESSION=${session.sessionId}; ROUTEID=${session.routeId}`,
+            'Content-Type': 'application/json'
+        };
+
+        const payload = {
+            CardCode: cardCode,
+            DocDate: fechaSapHoy(),
+            NumAtCard: numAtCard ? String(numAtCard).slice(0, 100) : undefined,
+            Comments: ajustarComentariosSap(comentarios) || undefined,
+            DocumentLines: lineas.map(l => ({
+                ItemCode: l.codigo_producto,
+                Quantity: Number(l.cantidad),
+                WarehouseCode: whsCode,
+                UnitPrice: Number(l.precio)
+            }))
+        };
+
+        const url = `${SAP_AVIGUA_URL.replace(/\/$/, '')}/DeliveryNotes`;
+        const response = await axios.post(url, payload, { headers, httpsAgent: agent });
+
+        return { DocEntry: response.data.DocEntry, DocNum: response.data.DocNum };
+    };
+
+    try {
+        return await conReintentoSesion('avigua', executeRequest);
+    } catch (error) {
+        console.log('===== SAP AVIGUA ENTREGA PEDIDO ARTESANO ERROR =====');
+        console.log('STATUS:', error.response?.status);
+        console.log(JSON.stringify(error.response?.data, null, 2));
+
+        const sapErrorData = error.response?.data?.error;
+        const sapMessage =
+            typeof sapErrorData?.message === 'string'
+                ? sapErrorData.message
+                : sapErrorData?.message?.value;
+
+        const finalError = new Error(sapMessage || error.message);
+        finalError.sapCode = sapErrorData?.code;
+        finalError.sapStatus = error.response?.status;
+
+        throw finalError;
+    }
+}
+
 // ------------------------------------------------------------
 // Bodegas de cuarto frío (WhsCode que empieza con "CFR-") disponibles como
 // destino del botón "Trasladar a Cuarto Frío". A diferencia del inventario
@@ -1229,5 +1286,6 @@ module.exports = {
     buscarClientesInsumos,
     crearEntregaPollo,
     crearEntregaInsumos,
+    crearEntregaArtesano,
     consultarCodigosAntiguos
 };

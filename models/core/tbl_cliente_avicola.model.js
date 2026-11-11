@@ -10,10 +10,13 @@ ClienteAvicolaModel.init({
     id_cliente_origen: { type: DataTypes.INTEGER, allowNull: true },
     nombre: { type: DataTypes.STRING(250), allowNull: false },
     nit: { type: DataTypes.STRING(20), allowNull: true },
+    // Dirección de entrega. Vacía en los empleados, que no tienen dirección.
     direccion: { type: DataTypes.STRING(250), allowNull: true },
-    // Dirección real de entrega; vacía en los clientes recién importados.
-    direccion_fisica: { type: DataTypes.STRING(250), allowNull: true },
     telefono: { type: DataTypes.STRING(30), allowNull: true },
+    // Solo si el cliente es empleado de la empresa (ej. "AL 8641").
+    codigo_empleado: { type: DataTypes.STRING(20), allowNull: true },
+    // CardCode del cliente en SAP (AVIGUA); sin él no se puede entregar el pedido.
+    card_code: { type: DataTypes.STRING(20), allowNull: true },
     vigente: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: true },
     creado_por: { type: DataTypes.BIGINT, allowNull: true },
     creado_en: { type: DataTypes.DATE, allowNull: false, defaultValue: DataTypes.NOW },

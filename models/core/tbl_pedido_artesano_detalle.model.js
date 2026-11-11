@@ -11,6 +11,8 @@ PedidoArtesanoDetalleModel.init({
     descripcion_producto: { type: DataTypes.STRING(200), allowNull: true },
     unidad_medida: { type: DataTypes.STRING(30), allowNull: true },
     cantidad: { type: DataTypes.DECIMAL(14, 3), allowNull: false },
+    // Precio con el que se vendió la línea; queda fijo aunque el producto cambie de precio.
+    precio_unitario: { type: DataTypes.DECIMAL(10, 2), allowNull: true },
     cantidad_autorizada: { type: DataTypes.DECIMAL(14, 3), allowNull: true }
 }, {
     sequelize: sequelize,

@@ -30,4 +30,16 @@ async function nombreDelUsuario(req) {
     return nombre || String(req.user.id_usuario);
 }
 
-module.exports = { nivelPermisoDeMenu, nombreDelUsuario };
+// Primer nombre y primer apellido ("Damián Orozco"), para donde no se quiere el nombre completo.
+async function nombreCortoDelUsuario(req) {
+    const usuario = await UsersModel.findByPk(req.user.id_usuario, {
+        attributes: ['first_name', 'first_last_name']
+    });
+
+    const primera = (texto) => String(texto || '').trim().split(/\s+/)[0];
+    const nombre = [primera(usuario && usuario.first_name), primera(usuario && usuario.first_last_name)].filter(Boolean).join(' ');
+
+    return nombre || String(req.user.id_usuario);
+}
+
+module.exports = { nivelPermisoDeMenu, nombreDelUsuario, nombreCortoDelUsuario };

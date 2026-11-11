@@ -87,10 +87,18 @@ router.get('/pedidoArtesano/buscarClientes', auth, pedidoArtesano.buscarClientes
 router.post('/pedidoArtesano/crearCliente', auth, pedidoArtesano.crearCliente);
 router.post('/pedidoArtesano/crearPedido', auth, pedidoArtesano.crearPedido);
 router.post('/pedidoArtesano/editarPedido', auth, pedidoArtesano.editarPedido);
+router.post('/pedidoArtesano/completarPago', auth, pedidoArtesano.completarPago);
 router.get('/pedidoArtesano/getPendientes', auth, pedidoArtesano.getPendientes);
 router.get('/pedidoArtesano/getStock', auth, pedidoArtesano.getStock);
-router.post('/pedidoArtesano/autorizar', auth, pedidoArtesano.autorizar);
 router.post('/pedidoArtesano/rechazar', auth, pedidoArtesano.rechazar);
+router.get('/pedidoArtesano/getPilotos', auth, pedidoArtesano.getPilotos);
+router.post('/pedidoArtesano/cargar', auth, pedidoArtesano.cargar);
+router.post('/pedidoArtesano/cambiarPiloto', auth, pedidoArtesano.cambiarPiloto);
+router.get('/pedidoArtesano/pdf', auth, pedidoArtesano.getPdf);
+router.post('/pedidoArtesano/entregar', auth, pedidoArtesano.entregar);
+router.post('/pedidoArtesano/subirEvidencia', auth, pedidoArtesano.recibirFoto, pedidoArtesano.subirEvidencia);
+router.get('/pedidoArtesano/getEvidencia', auth, pedidoArtesano.getEvidencia);
+router.get('/pedidoArtesano/exportarPedidos', auth, pedidoArtesano.exportarPedidos);
 
 //VISITAS A AVICOLAS
 router.get('/visita/getUsuarios', auth, visitas.getUsuariosConVisitas);
