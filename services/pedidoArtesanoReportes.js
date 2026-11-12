@@ -5,9 +5,13 @@ const MIME_XLSX = 'application/vnd.openxmlformats-officedocument.spreadsheetml.s
 const ZONA_HORARIA = 'America/Guatemala';
 const ARGB_ENCABEZADO = 'FF2183AE';
 
+// Pedidos que no se envían: no cuentan en totales ni cobran nada.
+const SIN_ENVIO = ['RECHAZADO', 'CANCELADO'];
+
 const TEXTO_ESTADO = {
     CREADO: 'Creado',
     RECHAZADO: 'Rechazado',
+    CANCELADO: 'Cancelado',
     CARGADO: 'Cargado',
     ENTREGADO: 'Entregado'
 };
@@ -80,6 +84,9 @@ const COLUMNAS_PEDIDOS = [
     { header: 'Rechazado por', key: 'rechazado_por', width: 24 },
     { header: 'Fecha de rechazo', key: 'fecha_rechazo', width: 17 },
     { header: 'Motivo de rechazo', key: 'motivo_rechazo', width: 30, ajustar: true },
+    { header: 'Cancelado por', key: 'cancelado_por', width: 24 },
+    { header: 'Fecha de cancelación', key: 'fecha_cancelacion', width: 17 },
+    { header: 'Motivo de cancelación', key: 'motivo_cancelacion', width: 30, ajustar: true },
     { header: 'Piloto', key: 'piloto', width: 26 },
     { header: 'Cargado por', key: 'cargado_por', width: 24 },
     { header: 'Fecha de carga', key: 'fecha_carga', width: 17 },
@@ -113,7 +120,7 @@ function construirHojaPedidos(libro, datos, catalogo) {
 
         lineas.forEach((l) => {
             const enviado = cantidadEnvio(l);
-            const { cajas, libras } = p.estado === 'RECHAZADO' ? { cajas: null, libras: null } : equivalencias(enviado, catalogo.get(l.codigo_producto));
+            const { cajas, libras } = SIN_ENVIO.includes(p.estado) ? { cajas: null, libras: null } : equivalencias(enviado, catalogo.get(l.codigo_producto));
 
             const valores = {
                 numero: p.numero_pedido,
@@ -134,6 +141,9 @@ function construirHojaPedidos(libro, datos, catalogo) {
                 rechazado_por: acortarNombre(p.rechazado_por_nombre),
                 fecha_rechazo: formatearFechaHora(p.fecha_rechazo),
                 motivo_rechazo: p.motivo_rechazo || '',
+                cancelado_por: acortarNombre(p.cancelado_por_nombre),
+                fecha_cancelacion: formatearFechaHora(p.fecha_cancelacion),
+                motivo_cancelacion: p.motivo_cancelacion || '',
                 piloto: acortarNombre(p.nombre_piloto),
                 cargado_por: acortarNombre(p.cargado_por_nombre),
                 fecha_carga: formatearFechaHora(p.fecha_carga),
@@ -147,7 +157,7 @@ function construirHojaPedidos(libro, datos, catalogo) {
                 libras: libras === null ? '' : libras,
                 precio: l.precio_unitario === null || l.precio_unitario === undefined ? '' : Number(l.precio_unitario),
                 // Lo que se cobra: precio por lo que se envía; un pedido rechazado no cobra nada.
-                total: p.estado === 'RECHAZADO' || l.precio_unitario === null || l.precio_unitario === undefined ? '' : redondear(Number(l.precio_unitario) * enviado),
+                total: SIN_ENVIO.includes(p.estado) || l.precio_unitario === null || l.precio_unitario === undefined ? '' : redondear(Number(l.precio_unitario) * enviado),
                 evidencia: p.evidencia_entrega_key ? 'Sí' : 'No'
             };
 
@@ -161,7 +171,7 @@ function construirHojaPedidos(libro, datos, catalogo) {
                 else celda.alignment = { vertical: 'top' };
             });
 
-            if (p.estado === 'RECHAZADO') {
+            if (SIN_ENVIO.includes(p.estado)) {
                 fila.getCell(COLUMNAS_PEDIDOS.findIndex(c => c.key === 'estado') + 1).font = { color: { argb: 'FFB91C1C' }, bold: true };
             }
 
@@ -191,7 +201,7 @@ function construirHojaResumen(libro, datos, catalogo) {
         { header: 'Libras', width: 10 }
     ];
 
-    agregarTitulo(hoja, 'Resumen por producto (sin pedidos rechazados)', datos);
+    agregarTitulo(hoja, 'Resumen por producto (sin pedidos rechazados ni cancelados)', datos);
 
     const filaEncabezado = hoja.addRow(encabezados.map(e => e.header));
     estilarEncabezado(filaEncabezado);
@@ -199,7 +209,7 @@ function construirHojaResumen(libro, datos, catalogo) {
 
     const totales = new Map();
 
-    datos.pedidos.filter(p => p.estado !== 'RECHAZADO').forEach((p) => {
+    datos.pedidos.filter(p => !SIN_ENVIO.includes(p.estado)).forEach((p) => {
         (p.detalle || []).forEach((l) => {
             const actual = totales.get(l.codigo_producto) || { descripcion: l.descripcion_producto || l.codigo_producto, solicitado: 0, autorizado: 0, enviado: 0 };
 
@@ -240,4 +250,187 @@ async function enviarExcelPedidosArtesano(res, datos, nombreArchivo) {
     res.end();
 }
 
-module.exports = { enviarExcelPedidosArtesano, MIME_XLSX };
+// ------------------------------------------------------------
+// Reporte por cliente: una hoja por cliente, igual al control de contabilidad.
+// ------------------------------------------------------------
+const ARGB_DEPOSITO = 'FFFFFFCC';
+const ARGB_RECHAZADO = 'FFBDD7EE';
+const BORDE_FINO = { style: 'thin' };
+const FORMATO_MONEDA = '"Q"#,##0.00';
+
+const TEXTO_PAGO = { DEPOSITO: 'pago por depósito', PLANILLA: 'descuento de planilla', PENDIENTE: 'pago pendiente' };
+
+// Nombre de hoja: máximo 31 caracteres, sin caracteres no permitidos y sin repetirse.
+function nombreDeHoja(nombre, usados) {
+    const base = (acortarNombre(nombre) || 'CLIENTE').toUpperCase().replace(/[\[\]:*?/\\]/g, '').slice(0, 31) || 'CLIENTE';
+    let candidato = base;
+    let n = 2;
+
+    while (usados.has(candidato)) {
+        const sufijo = ` ${n}`;
+        candidato = base.slice(0, 31 - sufijo.length) + sufijo;
+        n += 1;
+    }
+
+    usados.add(candidato);
+
+    return candidato;
+}
+
+function textoObservaciones(pedido, codigoEmpleado) {
+    const empleado = codigoEmpleado ? ` - ${codigoEmpleado}` : '';
+    const pago = TEXTO_PAGO[pedido.condicion_pago] || '';
+    const base = `Pedido para ${pedido.cliente_nombre}${empleado}${pago ? `, ${pago}` : ''}.`;
+
+    return pedido.comentario ? `${base} ${pedido.comentario}` : base;
+}
+
+function textoSinEnvio(p) {
+    const cancelado = p.estado === 'CANCELADO';
+    const motivo = cancelado ? p.motivo_cancelacion : p.motivo_rechazo;
+
+    return `Envío ${cancelado ? 'cancelado' : 'rechazado'}${motivo ? `: ${motivo}` : ''}`;
+}
+
+function construirHojaCliente(libro, nombreHoja, pedidos, codigoEmpleado, catalogo) {
+    const hoja = libro.addWorksheet(nombreHoja);
+
+    // Productos que pidió el cliente, en el orden del catálogo; el nombre es el del pedido más reciente.
+    const nombres = new Map();
+
+    pedidos.forEach((p) => {
+        (p.detalle || []).forEach((l) => nombres.set(l.codigo_producto, l.descripcion_producto || l.codigo_producto));
+    });
+
+    const codigos = [...nombres.keys()].sort((a, b) => ((catalogo.get(a) || {}).orden ?? 999) - ((catalogo.get(b) || {}).orden ?? 999));
+
+    const encabezados = [
+        '-', 'Tienda',
+        ...codigos.map(c => nombres.get(c)),
+        'Observaciones', 'Fecha', 'No. Envio', 'Ruta',
+        'Facturación', 'Autorización', 'Banco', 'Fecha de depósito', 'Cantidad depositada',
+        ...codigos.map(c => `Total ${nombres.get(c)}`),
+        'Nombre', 'Firma', 'Obs'
+    ];
+
+    const filaEncabezado = hoja.addRow(encabezados);
+    const colObservaciones = 3 + codigos.length;
+    const colFacturacion = colObservaciones + 4;
+    const colAutorizacion = colObservaciones + 5;
+    const colUltimoDeposito = colObservaciones + 8;
+    const colPrimerTotal = colUltimoDeposito + 1;
+
+    filaEncabezado.font = { bold: true };
+    filaEncabezado.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
+
+    for (let c = colFacturacion; c <= colUltimoDeposito; c += 1) {
+        filaEncabezado.getCell(c).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: ARGB_DEPOSITO } };
+    }
+
+    const anchos = [2.4, 20, ...codigos.map(() => 13), 45, 12, 16, 22, 28, 15, 10, 20, 22, ...codigos.map(() => 18), 18, 18, 34];
+
+    anchos.forEach((ancho, i) => { hoja.getColumn(i + 1).width = ancho; });
+
+    const ordenados = [...pedidos].sort((a, b) => String(a.fecha_requerida).localeCompare(String(b.fecha_requerida)) || String(a.numero_pedido).localeCompare(String(b.numero_pedido)));
+
+    ordenados.forEach((p) => {
+        const rechazado = SIN_ENVIO.includes(p.estado);
+        const planilla = p.condicion_pago === 'PLANILLA';
+        const lineas = new Map((p.detalle || []).map(l => [l.codigo_producto, l]));
+        const numeroFila = hoja.rowCount + 1;
+        const facturacion = [p.cliente_nit, acortarNombre(p.cliente_nombre)].filter(Boolean).join(' - ');
+
+        const valores = [
+            '',
+            (p.nombre_tienda_referencia || '').toUpperCase(),
+            ...codigos.map(c => (lineas.has(c) ? cantidadEnvio(lineas.get(c)) : '-')),
+            textoObservaciones(p, codigoEmpleado),
+            String(p.fecha_requerida).slice(0, 10),
+            p.numero_pedido,
+            p.nombre_ruta,
+            facturacion,
+            planilla ? 'N/A' : (p.condicion_pago === 'DEPOSITO' && p.numero_boleta ? p.numero_boleta : ''),
+            planilla ? 'N/A' : '',
+            planilla ? 'N/A' : '',
+            planilla ? 'N/A' : '',
+            ...codigos.map((c, i) => {
+                const linea = lineas.get(c);
+
+                if (!linea) return '-';
+                if (rechazado || linea.precio_unitario === null || linea.precio_unitario === undefined) return '';
+
+                const columna = hoja.getColumn(3 + i).letter;
+                const precio = Number(linea.precio_unitario);
+
+                return { formula: `${precio}*${columna}${numeroFila}`, result: redondear(precio * cantidadEnvio(linea)) };
+            }),
+            '',
+            '',
+            rechazado ? textoSinEnvio(p) : ''
+        ];
+
+        const fila = hoja.addRow(valores);
+
+        fila.eachCell({ includeEmpty: true }, (celda, col) => {
+            celda.border = { top: BORDE_FINO, left: BORDE_FINO, bottom: BORDE_FINO, right: BORDE_FINO };
+
+            const esTexto = col === colObservaciones || col === 2 || col === valores.length;
+
+            celda.alignment = { horizontal: esTexto ? 'left' : 'center', vertical: 'middle', wrapText: col === colObservaciones };
+
+            if (col >= 3 && col < colObservaciones) celda.numFmt = '0';
+            if (col === colUltimoDeposito || (col >= colPrimerTotal && col < colPrimerTotal + codigos.length)) celda.numFmt = FORMATO_MONEDA;
+
+            if (rechazado) celda.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: ARGB_RECHAZADO } };
+        });
+    });
+
+    hoja.views = [{ state: 'frozen', ySplit: 1 }];
+
+    // Marca en rojo los números de autorización repetidos.
+    if (ordenados.length > 0) {
+        const letra = hoja.getColumn(colAutorizacion).letter;
+        const rango = `${letra}2:${letra}${ordenados.length + 1}`;
+
+        hoja.addConditionalFormatting({
+            ref: rango,
+            rules: [{
+                type: 'expression',
+                priority: 1,
+                formulae: [`AND(LEN(${letra}2)>0,${letra}2<>"N/A",COUNTIF($${letra}$2:$${letra}$${ordenados.length + 1},${letra}2)>1)`],
+                style: {
+                    fill: { type: 'pattern', pattern: 'solid', bgColor: { argb: 'FFFFC7CE' } },
+                    font: { color: { argb: 'FF9C0006' } }
+                }
+            }]
+        });
+    }
+}
+
+// datos: { pedidos (con detalle), clientes (Map id -> codigo_empleado), productos (catálogo) }
+async function enviarExcelPorCliente(res, datos, nombreArchivo) {
+    const catalogo = new Map(datos.productos.map(p => [p.codigo_producto, p]));
+    const libro = new ExcelJS.Workbook();
+    const porCliente = new Map();
+
+    datos.pedidos.forEach((p) => {
+        if (!porCliente.has(p.cliente_id)) porCliente.set(p.cliente_id, []);
+        porCliente.get(p.cliente_id).push(p);
+    });
+
+    const usados = new Set();
+
+    [...porCliente.entries()]
+        .sort((a, b) => String(a[1][0].cliente_nombre).localeCompare(String(b[1][0].cliente_nombre), 'es'))
+        .forEach(([clienteId, pedidos]) => {
+            construirHojaCliente(libro, nombreDeHoja(pedidos[0].cliente_nombre, usados), pedidos, datos.clientes.get(clienteId), catalogo);
+        });
+
+    res.setHeader('Content-Type', MIME_XLSX);
+    res.setHeader('Content-Disposition', `attachment; filename="${nombreArchivo}"`);
+
+    await libro.xlsx.write(res);
+    res.end();
+}
+
+module.exports = { enviarExcelPedidosArtesano, enviarExcelPorCliente, MIME_XLSX };

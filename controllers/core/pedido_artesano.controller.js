@@ -16,7 +16,7 @@ const crypto = require('crypto');
 const path = require('path');
 const { generarPdfEnvios } = require('../../services/pedidoArtesanoPdf');
 const { acortarNombre } = require('../../services/nombres.service');
-const { enviarExcelPedidosArtesano } = require('../../services/pedidoArtesanoReportes');
+const { enviarExcelPedidosArtesano, enviarExcelPorCliente } = require('../../services/pedidoArtesanoReportes');
 const { uploadBufferToS3, getPresignedUrl, deleteFromS3 } = require('../../integrations/aws/s3');
 const { upload } = require('../../middlewares/upload');
 
@@ -50,8 +50,8 @@ const REGEX_FECHA = /^\d{4}-\d{2}-\d{2}$/;
 const REGEX_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const ZONA_HORARIA = 'America/Guatemala';
 
-// Estados: CREADO, CARGADO, ENTREGADO y RECHAZADO. Cargar incluye la autorización.
-const ESTADOS = ['CREADO', 'RECHAZADO', 'CARGADO', 'ENTREGADO'];
+// Estados: CREADO, CARGADO, ENTREGADO, RECHAZADO (rastro) y CANCELADO (asistente). Cargar incluye la autorización.
+const ESTADOS = ['CREADO', 'RECHAZADO', 'CANCELADO', 'CARGADO', 'ENTREGADO'];
 
 class ErrorPedidoArtesano extends Error {
     constructor(status, mensaje) {
@@ -211,6 +211,9 @@ function mapearPedido(pedido) {
         motivo_rechazo: p.motivo_rechazo,
         rechazado_por: p.rechazado_por_nombre ? acortarNombre(p.rechazado_por_nombre) : null,
         fecha_rechazo: fechaGuatemala(p.fecha_rechazo),
+        motivo_cancelacion: p.motivo_cancelacion,
+        cancelado_por: p.cancelado_por_nombre ? acortarNombre(p.cancelado_por_nombre) : null,
+        fecha_cancelacion: fechaGuatemala(p.fecha_cancelacion),
         codigo_piloto: p.codigo_piloto ? Number(p.codigo_piloto) : null,
         nombre_piloto: p.nombre_piloto ? acortarNombre(p.nombre_piloto) : null,
         cargado_por: p.cargado_por_nombre ? acortarNombre(p.cargado_por_nombre) : null,
@@ -349,17 +352,19 @@ async function validarDatosPedido(body) {
     }
 
     // La tienda de referencia debe estar asignada a la ruta (asignación vigente).
-    if (!body.id_tienda_simphony_referencia) throw new ErrorPedidoArtesano(400, 'La tienda de referencia es obligatoria');
+    let tiendaReferencia = null;
 
-    const tiendaReferencia = await TiendaRutaPolloModel.findOne({
-        where: {
-            ruta_id: ruta.id,
-            id_tienda_simphony: String(body.id_tienda_simphony_referencia),
-            fecha_fin_asignacion: null
-        }
-    });
+    if (body.id_tienda_simphony_referencia) {
+        tiendaReferencia = await TiendaRutaPolloModel.findOne({
+            where: {
+                ruta_id: ruta.id,
+                id_tienda_simphony: String(body.id_tienda_simphony_referencia),
+                fecha_fin_asignacion: null
+            }
+        });
 
-    if (!tiendaReferencia) throw new ErrorPedidoArtesano(400, 'La tienda de referencia no pertenece a la ruta seleccionada');
+        if (!tiendaReferencia) throw new ErrorPedidoArtesano(400, 'La tienda de referencia no pertenece a la ruta seleccionada');
+    }
 
     return {
         fechaRequerida: body.fecha_requerida,
@@ -646,6 +651,47 @@ async function exportarPedidos(req, res) {
     }
 }
 
+// GET /pedidoArtesano/exportarPorCliente?...mismos filtros que getPedidos
+// Excel con una hoja por cliente, con el formato del control de contabilidad.
+async function exportarPorCliente(req, res) {
+    try {
+        await exigirLectura(req);
+
+        const where = construirWhereBusqueda(req.query);
+        const total = await PedidoArtesanoModel.count({ where });
+
+        if (total === 0) throw new ErrorPedidoArtesano(404, 'No hay pedidos para los filtros seleccionados');
+
+        const [pedidos, productos] = await Promise.all([
+            PedidoArtesanoModel.findAll({
+                where,
+                include: [{ model: PedidoArtesanoDetalleModel, as: 'detalle' }],
+                order: [['fecha_requerida', 'ASC'], ['numero_pedido', 'ASC']],
+                limit: LIMITE_EXPORTACION
+            }),
+            PedidoArtesanoProductoModel.findAll()
+        ]);
+
+        const idsClientes = [...new Set(pedidos.map(p => p.cliente_id))];
+        const clientes = await ClienteAvicolaModel.findAll({ where: { id: { [Op.in]: idsClientes } }, attributes: ['id', 'codigo_empleado'] });
+        const marcaDeTiempo = new Date().toISOString().slice(0, 10);
+
+        return await enviarExcelPorCliente(
+            res,
+            {
+                pedidos: pedidos.map(p => p.get({ plain: true })),
+                clientes: new Map(clientes.map(c => [c.id, c.codigo_empleado])),
+                productos: productos.map(p => p.get({ plain: true }))
+            },
+            `pollo_artesano_clientes_${marcaDeTiempo}.xlsx`
+        );
+    } catch (error) {
+        if (res.headersSent) return res.end();
+
+        return responderError(res, error, 'Error al exportar el reporte por cliente');
+    }
+}
+
 // GET /pedidoArtesano/buscarClientes?texto=
 async function buscarClientes(req, res) {
     try {
@@ -697,7 +743,7 @@ async function crearCliente(req, res) {
 }
 
 // POST /pedidoArtesano/crearPedido
-// { fecha_requerida, ruta_id, id_tienda_simphony_referencia, cliente_id, direccion?,
+// { fecha_requerida, ruta_id, id_tienda_simphony_referencia?, cliente_id, direccion?,
 //   telefono_contacto?, condicion_pago, numero_boleta?, comentario?, items: [{ codigo_producto, cantidad }] }
 async function crearPedido(req, res) {
     try {
@@ -766,7 +812,9 @@ async function completarPago(req, res) {
             const pedido = await PedidoArtesanoModel.findByPk(id, { transaction: t, lock: t.LOCK.UPDATE });
 
             if (!pedido) throw new ErrorPedidoArtesano(404, 'El pedido no existe');
-            if (pedido.estado === 'RECHAZADO') throw new ErrorPedidoArtesano(409, 'Un pedido rechazado no tiene pago que completar');
+            if (pedido.estado === 'RECHAZADO' || pedido.estado === 'CANCELADO') {
+                throw new ErrorPedidoArtesano(409, 'Un pedido rechazado o cancelado no tiene pago que completar');
+            }
             if (pedido.condicion_pago !== 'PENDIENTE') throw new ErrorPedidoArtesano(409, 'El pago de este pedido ya está registrado');
 
             if (condicion === 'PLANILLA') {
@@ -864,6 +912,49 @@ async function cambiarEstado(pedido, estadosPermitidos, estadoNuevo, campos, usu
     }
 
     await registrarHistorial(pedido.id, pedido.estado, estadoNuevo, usuario, comentario, transaction);
+}
+
+// POST /pedidoArtesano/cancelar { id, motivo }
+// La asistente cancela un pedido que sigue CREADO; no toca SAP porque aún no hay documentos.
+async function cancelar(req, res) {
+    try {
+        await exigirEscritura(req);
+
+        const { id } = req.body;
+        validarId(id);
+
+        const motivo = textoObligatorio(req.body.motivo, MAX_COMENTARIO, 'El motivo de la cancelación');
+
+        if (motivo.length < 5) throw new ErrorPedidoArtesano(400, 'El motivo de la cancelación es obligatorio (mínimo 5 caracteres)');
+
+        const usuario = await nombreCortoDelUsuario(req);
+        const t = await sequelizeInit.sequelize.transaction();
+
+        try {
+            const pedido = await PedidoArtesanoModel.findByPk(id, { transaction: t, lock: t.LOCK.UPDATE });
+
+            if (!pedido) throw new ErrorPedidoArtesano(404, 'El pedido no existe');
+
+            await cambiarEstado(
+                pedido,
+                ['CREADO'],
+                'CANCELADO',
+                { cancelado_por: req.user.id_usuario, cancelado_por_nombre: usuario, fecha_cancelacion: new Date(), motivo_cancelacion: motivo },
+                usuario,
+                `Cancelado: ${motivo}`,
+                t
+            );
+
+            await t.commit();
+        } catch (error) {
+            await t.rollback();
+            throw error;
+        }
+
+        return res.json({ success: true, pedido: mapearPedido(await cargarPedido(id)) });
+    } catch (error) {
+        return responderError(res, error, 'Error al cancelar el pedido');
+    }
 }
 
 // GET /pedidoArtesano/getPendientes?estado=CREADO|CARGADO&fecha_desde=&fecha_hasta=
@@ -1257,9 +1348,24 @@ async function cargar(req, res) {
         const piloto = await resolverPiloto(req.body.codigo_piloto);
         const usuario = await nombreCortoDelUsuario(req);
 
-        const existentes = await PedidoArtesanoModel.findAll({ where: { id: { [Op.in]: ids } }, attributes: ['id', 'numero_pedido', 'ruta_id', 'nombre_ruta'] });
+        const existentes = await PedidoArtesanoModel.findAll({ where: { id: { [Op.in]: ids } }, attributes: ['id', 'numero_pedido', 'ruta_id', 'nombre_ruta', 'fecha_requerida'] });
 
         if (existentes.length !== ids.length) throw new ErrorPedidoArtesano(404, 'Alguno de los pedidos no existe');
+
+        // Un solo piloto por ruta y día: se carga la ruta completa, no pedidos sueltos.
+        const rutasIds = new Set(existentes.map(p => p.ruta_id));
+        const fechas = new Set(existentes.map(p => String(p.fecha_requerida)));
+
+        if (rutasIds.size > 1 || fechas.size > 1) throw new ErrorPedidoArtesano(400, 'La carga es de una sola ruta y una sola fecha');
+
+        const pendientes = await PedidoArtesanoModel.findAll({
+            where: { ruta_id: existentes[0].ruta_id, fecha_requerida: existentes[0].fecha_requerida, estado: 'CREADO' },
+            attributes: ['id']
+        });
+
+        if (pendientes.some(p => !ids.includes(p.id))) {
+            throw new ErrorPedidoArtesano(409, 'La carga es por ruta completa: hay pedidos pendientes de esa ruta y fecha. Actualiza la lista');
+        }
 
         const grupos = new Map();
 
@@ -1622,5 +1728,7 @@ module.exports = {
     recibirFoto,
     subirEvidencia,
     getEvidencia,
-    exportarPedidos
+    exportarPedidos,
+    exportarPorCliente,
+    cancelar
 };
