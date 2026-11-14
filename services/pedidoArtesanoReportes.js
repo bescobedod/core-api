@@ -10,9 +10,10 @@ const SIN_ENVIO = ['RECHAZADO', 'CANCELADO'];
 
 const TEXTO_ESTADO = {
     CREADO: 'Creado',
+    VALIDADO: 'Validado',
     RECHAZADO: 'Rechazado',
     CANCELADO: 'Cancelado',
-    CARGADO: 'Cargado',
+    EN_TRANSITO: 'En tránsito',
     ENTREGADO: 'Entregado'
 };
 
@@ -433,4 +434,15 @@ async function enviarExcelPorCliente(res, datos, nombreArchivo) {
     res.end();
 }
 
-module.exports = { enviarExcelPedidosArtesano, enviarExcelPorCliente, MIME_XLSX };
+module.exports = {
+    enviarExcelPedidosArtesano,
+    enviarExcelPorCliente,
+    MIME_XLSX,
+    TEXTO_ESTADO,
+    SIN_ENVIO,
+    formatearFecha,
+    redondear,
+    cantidadEnvio,
+    equivalencias,
+    estilarEncabezado
+};

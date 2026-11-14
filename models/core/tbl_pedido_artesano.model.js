@@ -8,7 +8,7 @@ class PedidoArtesanoModel extends Model {}
 // Pedidos de pollo artesano: los crea la asistente de avícola en Core para un
 // cliente (no una tienda) y salen en una ruta. La tienda es solo la
 // referencia para saber la ruta; se entregan en direccion_entrega.
-// Estados: CREADO -> CARGADO -> ENTREGADO, o CREADO -> RECHAZADO (rastro) | CANCELADO (asistente).
+// Estados: CREADO -> EN_TRANSITO -> ENTREGADO, o CREADO -> RECHAZADO (rastro) | CANCELADO (asistente).
 PedidoArtesanoModel.init({
     id: { type: DataTypes.UUID, primaryKey: true, defaultValue: DataTypes.UUIDV4, allowNull: false },
     numero_pedido: { type: DataTypes.STRING(30), allowNull: false },

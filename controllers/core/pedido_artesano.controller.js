@@ -9,6 +9,8 @@ const PedidoArtesanoModel = require('../../models/core/tbl_pedido_artesano.model
 const PedidoArtesanoDetalleModel = require('../../models/core/tbl_pedido_artesano_detalle.model');
 const PedidoArtesanoHistorialModel = require('../../models/core/tbl_pedido_artesano_historial.model');
 const PedidoArtesanoProductoModel = require('../../models/core/tbl_pedido_artesano_producto.model');
+const BloqueoRutaPolloModel = require('../../models/core/tbl_bloqueo_ruta_pollo.model');
+const DespachoRutaModel = require('../../models/core/tbl_despacho_ruta.model');
 const { consultarStockPollo, crearTransferenciaPollo, crearEntregaArtesano } = require('../../integrations/sap/sapClient');
 const { nivelPermisoDeMenu, nombreCortoDelUsuario } = require('../../services/permisosMenu.service');
 const { parsearPaginacion, armarPaginacion } = require('../../services/paginacion.service');
@@ -17,6 +19,7 @@ const path = require('path');
 const { generarPdfEnvios } = require('../../services/pedidoArtesanoPdf');
 const { acortarNombre } = require('../../services/nombres.service');
 const { enviarExcelPedidosArtesano, enviarExcelPorCliente } = require('../../services/pedidoArtesanoReportes');
+const { armarViajes, enviarReporteDetalle, enviarReporteEnTransito } = require('../../services/pedidoArtesanoReportesRuta');
 const { uploadBufferToS3, getPresignedUrl, deleteFromS3 } = require('../../integrations/aws/s3');
 const { upload } = require('../../middlewares/upload');
 
@@ -50,8 +53,8 @@ const REGEX_FECHA = /^\d{4}-\d{2}-\d{2}$/;
 const REGEX_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const ZONA_HORARIA = 'America/Guatemala';
 
-// Estados: CREADO, CARGADO, ENTREGADO, RECHAZADO (rastro) y CANCELADO (asistente). Cargar incluye la autorización.
-const ESTADOS = ['CREADO', 'RECHAZADO', 'CANCELADO', 'CARGADO', 'ENTREGADO'];
+// Estados: CREADO, VALIDADO (stock asignado en Pedidos de Pollo), EN_TRANSITO, ENTREGADO, RECHAZADO (rastro) y CANCELADO (asistente).
+const ESTADOS = ['CREADO', 'VALIDADO', 'RECHAZADO', 'CANCELADO', 'EN_TRANSITO', 'ENTREGADO'];
 
 class ErrorPedidoArtesano extends Error {
     constructor(status, mensaje) {
@@ -308,8 +311,8 @@ async function validarDatosPedido(body) {
         throw new ErrorPedidoArtesano(400, "condicion_pago debe ser 'DEPOSITO', 'PLANILLA' o 'PENDIENTE'");
     }
 
-    // La boleta del depósito es opcional por ahora; con descuento de planilla o pago pendiente no aplica.
-    const numeroBoleta = body.condicion_pago === 'DEPOSITO' ? textoOpcional(body.numero_boleta, 50, 'El número de boleta') : null;
+    // El depósito exige su boleta; con descuento de planilla o pago pendiente no aplica.
+    const numeroBoleta = body.condicion_pago === 'DEPOSITO' ? textoObligatorio(body.numero_boleta, 50, 'El número de boleta') : null;
     // La dirección es obligatoria salvo para los empleados (se valida al tener el cliente).
     const direccion = textoOpcional(body.direccion, 250, 'La dirección de entrega');
     const telefono = textoOpcional(body.telefono_contacto, 30, 'El teléfono de contacto');
@@ -524,7 +527,7 @@ async function getUsuarios(req, res) {
 
 // Filtros de la búsqueda de pedidos: usuario, estado(s), número y fechas de entrega requerida.
 function construirWhereBusqueda(query) {
-    const { id_usuario, fecha_desde, fecha_hasta, estado, numero } = query;
+    const { id_usuario, fecha_desde, fecha_hasta, estado, numero, cliente } = query;
     const where = {};
 
     if (id_usuario) {
@@ -560,10 +563,15 @@ function construirWhereBusqueda(query) {
 
     if (textoNumero) where.numero_pedido = { [Op.iLike]: `%${textoNumero}%` };
 
+    // Cliente: parte del nombre o del NIT.
+    const textoCliente = String(cliente || '').trim().replace(/[%_]/g, '');
+
+    if (textoCliente) where[Op.or] = [{ cliente_nombre: { [Op.iLike]: `%${textoCliente}%` } }, { cliente_nit: { [Op.iLike]: `%${textoCliente}%` } }];
+
     return where;
 }
 
-// GET /pedidoArtesano/getPedidos?id_usuario=&fecha_desde=&fecha_hasta=&estado=A,B&numero=
+// GET /pedidoArtesano/getPedidos?id_usuario=&fecha_desde=&fecha_hasta=&estado=A,B&numero=&cliente=
 async function getPedidos(req, res) {
     try {
         await exigirLectura(req);
@@ -606,6 +614,7 @@ function describirFiltrosBusqueda(query) {
 
     if (query.estado) partes.push(`Estado: ${String(query.estado).split(',').map(e => e.trim()).join(', ')}`);
     if (query.numero) partes.push(`Número: ${String(query.numero).trim()}`);
+    if (query.cliente) partes.push(`Cliente: ${String(query.cliente).trim()}`);
     if (query.id_usuario) partes.push(`Usuario (id): ${query.id_usuario}`);
 
     return partes.length > 0 ? `Filtros — ${partes.join(' · ')}` : 'Sin filtros';
@@ -744,7 +753,7 @@ async function crearCliente(req, res) {
 
 // POST /pedidoArtesano/crearPedido
 // { fecha_requerida, ruta_id, id_tienda_simphony_referencia?, cliente_id, direccion?,
-//   telefono_contacto?, condicion_pago, numero_boleta?, comentario?, items: [{ codigo_producto, cantidad }] }
+//   telefono_contacto?, condicion_pago, numero_boleta (si es depósito), comentario?, items: [{ codigo_producto, cantidad }] }
 async function crearPedido(req, res) {
     try {
         await exigirEscritura(req);
@@ -804,7 +813,7 @@ async function completarPago(req, res) {
         }
 
         const condicion = req.body.condicion_pago;
-        const numeroBoleta = condicion === 'DEPOSITO' ? textoOpcional(req.body.numero_boleta, 50, 'El número de boleta') : null;
+        const numeroBoleta = condicion === 'DEPOSITO' ? textoObligatorio(req.body.numero_boleta, 50, 'El número de boleta') : null;
         const usuario = await nombreDelUsuario(req);
         const t = await sequelizeInit.sequelize.transaction();
 
@@ -828,7 +837,7 @@ async function completarPago(req, res) {
             await pedido.update({ condicion_pago: condicion, numero_boleta: numeroBoleta }, { transaction: t });
 
             const detalle = condicion === 'DEPOSITO'
-                ? `Depósito${numeroBoleta ? ` (boleta ${numeroBoleta})` : ' (sin boleta)'}`
+                ? `Depósito (boleta ${numeroBoleta})`
                 : 'Descuento de planilla';
 
             await registrarHistorial(id, pedido.estado, pedido.estado, usuario, `Pago completado — ${detalle}`, t);
@@ -957,7 +966,7 @@ async function cancelar(req, res) {
     }
 }
 
-// GET /pedidoArtesano/getPendientes?estado=CREADO|CARGADO&fecha_desde=&fecha_hasta=
+// GET /pedidoArtesano/getPendientes?estado=CREADO|EN_TRANSITO&fecha_desde=&fecha_hasta=
 // Pedidos del rastro por estado (por defecto CREADO), los de entrega más próxima primero.
 async function getPendientes(req, res) {
     try {
@@ -966,8 +975,8 @@ async function getPendientes(req, res) {
         const { fecha_desde, fecha_hasta } = req.query;
         const estado = req.query.estado || 'CREADO';
 
-        if (!['CREADO', 'CARGADO'].includes(estado)) {
-            throw new ErrorPedidoArtesano(400, 'estado debe ser CREADO o CARGADO');
+        if (!['CREADO', 'EN_TRANSITO'].includes(estado)) {
+            throw new ErrorPedidoArtesano(400, 'estado debe ser CREADO o EN_TRANSITO');
         }
 
         if ((fecha_desde && !REGEX_FECHA.test(fecha_desde)) || (fecha_hasta && !REGEX_FECHA.test(fecha_hasta))) {
@@ -1270,7 +1279,7 @@ async function cargarGrupoRuta({ ids, ajustes, versiones, piloto, usuario, req }
         const totales = new Map();
 
         for (const pedido of pedidos) {
-            if (pedido.estado !== 'CREADO') {
+            if (!['CREADO', 'VALIDADO'].includes(pedido.estado)) {
                 throw new ErrorPedidoArtesano(409, `El pedido ${pedido.numero_pedido} ya no está pendiente de carga`);
             }
 
@@ -1279,7 +1288,10 @@ async function cargarGrupoRuta({ ids, ajustes, versiones, piloto, usuario, req }
             }
 
             const lineas = await PedidoArtesanoDetalleModel.findAll({ where: { pedido_id: pedido.id }, order: [['numero_linea', 'ASC']], transaction: t });
-            const diferencias = await fijarCantidadesACargar(pedido, lineas, Array.isArray(ajustes[pedido.id]) ? ajustes[pedido.id] : null, t);
+            // Un pedido validado ya trae sus cantidades asignadas; uno creado las fija aquí.
+            const diferencias = pedido.estado === 'VALIDADO'
+                ? lineas.filter(l => Number(l.cantidad_autorizada) < Number(l.cantidad)).map(l => `${l.codigo_producto}: ${textoCantidad(l.cantidad)} → ${textoCantidad(l.cantidad_autorizada)}`)
+                : await fijarCantidadesACargar(pedido, lineas, Array.isArray(ajustes[pedido.id]) ? ajustes[pedido.id] : null, t);
 
             lineas.forEach((l) => totales.set(l.codigo_producto, (totales.get(l.codigo_producto) || 0) + Number(l.cantidad_autorizada)));
             preparados.push({ pedido, diferencias });
@@ -1307,8 +1319,8 @@ async function cargarGrupoRuta({ ids, ajustes, versiones, piloto, usuario, req }
 
             await cambiarEstado(
                 pedido,
-                ['CREADO'],
-                'CARGADO',
+                ['CREADO', 'VALIDADO'],
+                'EN_TRANSITO',
                 {
                     cargado_por: req.user.id_usuario,
                     cargado_por_nombre: usuario,
@@ -1327,6 +1339,8 @@ async function cargarGrupoRuta({ ids, ajustes, versiones, piloto, usuario, req }
         }
 
         await t.commit();
+
+        return documento;
     } catch (error) {
         await t.rollback();
         throw error;
@@ -1334,7 +1348,7 @@ async function cargarGrupoRuta({ ids, ajustes, versiones, piloto, usuario, req }
 }
 
 // POST /pedidoArtesano/cargar { ids, codigo_piloto, ajustes?, versiones? }
-// Pasa los pedidos CREADOS a CARGADO con una transferencia de SAP por ruta (cantidad autorizada).
+// Pasa los pedidos CREADOS a EN_TRANSITO con una transferencia de SAP por ruta (cantidad autorizada).
 // Si SAP rechaza una ruta, esos pedidos no se cargan y el error queda en el pedido; las demás rutas sí.
 async function cargar(req, res) {
     try {
@@ -1399,8 +1413,360 @@ async function cargar(req, res) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Pedidos de Pollo: flujo por ruta (candado, stock, asignación y envío)
+// Misma forma de respuesta que los pedidos de tienda; el cliente va donde iría la tienda.
+// ---------------------------------------------------------------------------
+const MENU_PEDIDOS_POLLO = 'PedidosPolloView';
+const ESTADOS_EN_RUTA = ['CREADO', 'VALIDADO', 'EN_TRANSITO', 'ENTREGADO'];
+const ESTADOS_POR_CARGAR = ['CREADO', 'VALIDADO'];
+
+async function exigirNivelPedidosPollo(req, niveles, mensaje) {
+    const nivel = await nivelPermisoDeMenu(req, MENU_PEDIDOS_POLLO);
+
+    if (!nivel || !niveles.includes(nivel)) throw new ErrorPedidoArtesano(403, mensaje);
+}
+
+const exigirLecturaPedidosPollo = (req) => exigirNivelPedidosPollo(req, ['lectura', 'lectura_division', 'escritura'], 'No tienes permiso para ver los pedidos de la ruta');
+const exigirEscrituraPedidosPollo = (req) => exigirNivelPedidosPollo(req, ['escritura'], 'No tienes permiso para validar o enviar pedidos de la ruta');
+
+function validarRutaYFecha(ruta_id, fecha) {
+    if (!ruta_id || !REGEX_UUID.test(ruta_id)) throw new ErrorPedidoArtesano(400, 'ruta_id inválido');
+    if (!REGEX_FECHA.test(String(fecha || ''))) throw new ErrorPedidoArtesano(400, 'La fecha debe tener el formato YYYY-MM-DD');
+}
+
+// Solo quien tiene el candado activo de la ruta y fecha puede validar o enviar.
+async function exigirCandadoDeRuta(req, ruta_id, fecha) {
+    const candado = await BloqueoRutaPolloModel.findOne({ where: { ruta_id, fecha, estado: 'ACTIVO' } });
+
+    if (!candado || String(candado.id_usuario) !== String(req.user.id_usuario)) {
+        throw new ErrorPedidoArtesano(403, 'Debes tomar el candado de esta ruta primero');
+    }
+}
+
+function mapearPedidoRuta(p) {
+    const creado = new Date(p.creado_en);
+
+    return {
+        pedido_id: p.id,
+        codigo_tienda: p.codigo_tienda_referencia,
+        nombre_tienda: p.cliente_nombre,
+        codigo_empresa: null,
+        codigo_bodega: null,
+        numero_pedido: p.numero_pedido,
+        fecha_pedido: fechaGuatemala(creado),
+        hora_pedido: creado.toLocaleTimeString('en-GB', { timeZone: ZONA_HORARIA, hour12: false }),
+        fecha_requerida: String(p.fecha_requerida),
+        estado: p.estado,
+        sap_docentry: p.sap_traslado_docentry,
+        sap_docnum: p.sap_traslado_docnum,
+        sap_error: null,
+        serie: p.serie,
+        direccion_entrega: p.direccion_entrega,
+        condicion_pago: p.condicion_pago,
+        items: [...(p.detalle || [])]
+            .sort((a, b) => a.numero_linea - b.numero_linea)
+            .map(d => ({
+                id: d.id,
+                codigo_producto: d.codigo_producto,
+                descripcion_producto: d.descripcion_producto,
+                unidad_medida: d.unidad_medida,
+                fecha_requerida: String(p.fecha_requerida),
+                cantidad_solicitada: String(d.cantidad),
+                cantidad_asignada: String(d.cantidad_autorizada ?? 0),
+                estado_linea: d.cantidad_autorizada === null || d.cantidad_autorizada === undefined
+                    ? 'PENDIENTE'
+                    : Number(d.cantidad_autorizada) <= 0 ? 'SIN_STOCK' : Number(d.cantidad_autorizada) >= Number(d.cantidad) ? 'VALIDADA' : 'PARCIAL'
+            }))
+    };
+}
+
+// GET /pedidoArtesano/getPedidosRuta?ruta_id=&fecha_requerida=
+// Pedidos de una ruta y fecha, con la forma de getPedidosPos (clientes en lugar de tiendas).
+async function getPedidosRuta(req, res) {
+    try {
+        await exigirLecturaPedidosPollo(req);
+
+        const { ruta_id, fecha_requerida } = req.query;
+        validarRutaYFecha(ruta_id, fecha_requerida);
+
+        const [ruta, despacho, pedidos] = await Promise.all([
+            CatalogoRutaPolloModel.findByPk(ruta_id),
+            DespachoRutaModel.findOne({ where: { ruta_id, fecha: fecha_requerida } }),
+            PedidoArtesanoModel.findAll({
+                where: { ruta_id, fecha_requerida, estado: { [Op.in]: ESTADOS_EN_RUTA } },
+                include: [{ model: PedidoArtesanoDetalleModel, as: 'detalle' }],
+                order: [['creado_en', 'ASC']]
+            })
+        ]);
+
+        if (!ruta) throw new ErrorPedidoArtesano(404, 'La ruta no existe');
+
+        if (pedidos.length === 0) return res.json({ success: true, tipo_pedido: 'POLLO_ARTESANO', fecha_requerida, rutas: [] });
+
+        const clientes = pedidos.map(p => mapearPedidoRuta(p.get({ plain: true })));
+        const estados = [...new Set(clientes.map(c => c.estado))];
+        const conDocumento = clientes.find(c => c.sap_docnum);
+
+        return res.json({
+            success: true,
+            tipo_pedido: 'POLLO_ARTESANO',
+            fecha_requerida,
+            rutas: [{
+                ruta_id,
+                nombre_ruta: ruta.nombre_ruta,
+                camion_id: despacho ? despacho.camion_id : null,
+                camion_placa: despacho ? despacho.camion_placa : null,
+                piloto_id: despacho ? Number(despacho.piloto_id) : null,
+                piloto_nombre: despacho ? despacho.piloto_nombre : null,
+                estado_general: estados.length === 1 ? estados[0] : 'MIXTO',
+                sap_docnum: conDocumento ? conDocumento.sap_docnum : null,
+                sap_docentry: conDocumento ? conDocumento.sap_docentry : null,
+                tiendas: clientes
+            }]
+        });
+    } catch (error) {
+        return responderError(res, error, 'Error al obtener los pedidos de la ruta');
+    }
+}
+
+// GET /pedidoArtesano/getResumenRutas?fecha=
+// Cuántos pedidos tiene cada ruta ese día, para el selector de ruta de Pedidos de Pollo.
+async function getResumenRutas(req, res) {
+    try {
+        await exigirLecturaPedidosPollo(req);
+
+        const { fecha } = req.query;
+
+        if (!REGEX_FECHA.test(String(fecha || ''))) throw new ErrorPedidoArtesano(400, 'La fecha debe tener el formato YYYY-MM-DD');
+
+        const filas = await PedidoArtesanoModel.findAll({
+            attributes: ['ruta_id', 'estado', [fn('COUNT', col('id')), 'total']],
+            where: { fecha_requerida: fecha, estado: { [Op.in]: ESTADOS_EN_RUTA } },
+            group: ['ruta_id', 'estado'],
+            raw: true
+        });
+
+        const rutas = new Map();
+
+        filas.forEach((f) => {
+            const actual = rutas.get(f.ruta_id) || { ruta_id: f.ruta_id, total: 0, por_validar: 0, validados: 0 };
+            const cantidad = Number(f.total);
+
+            actual.total += cantidad;
+            if (f.estado === 'CREADO') actual.por_validar += cantidad;
+            if (f.estado === 'VALIDADO') actual.validados += cantidad;
+            rutas.set(f.ruta_id, actual);
+        });
+
+        return res.json({ success: true, fecha, rutas: [...rutas.values()] });
+    } catch (error) {
+        return responderError(res, error, 'Error al obtener el resumen de rutas');
+    }
+}
+
+// Pedidos de la ruta y fecha que todavía se pueden validar o cargar, con sus líneas.
+function pedidosPorCargarDeRuta(ruta_id, fecha, transaction) {
+    return PedidoArtesanoModel.findAll({
+        where: { ruta_id, fecha_requerida: fecha, estado: { [Op.in]: ESTADOS_POR_CARGAR } },
+        include: [{ model: PedidoArtesanoDetalleModel, as: 'detalle' }],
+        order: [['creado_en', 'ASC']],
+        transaction
+    });
+}
+
+// GET /pedidoArtesano/getComparativoRuta?ruta_id=&fecha=
+// Lo solicitado por todos los pedidos de la ruta contra el stock de SAP, en unidades del pedido.
+async function getComparativoRuta(req, res) {
+    try {
+        await exigirLecturaPedidosPollo(req);
+
+        const { ruta_id, fecha } = req.query;
+        validarRutaYFecha(ruta_id, fecha);
+
+        const ruta = await CatalogoRutaPolloModel.findByPk(ruta_id);
+
+        if (!ruta) throw new ErrorPedidoArtesano(404, 'La ruta no existe');
+
+        await exigirCandadoDeRuta(req, ruta_id, fecha);
+
+        const pedidos = await pedidosPorCargarDeRuta(ruta_id, fecha);
+        const totales = new Map();
+
+        pedidos.forEach((p) => {
+            p.detalle.forEach((d) => {
+                const actual = totales.get(d.codigo_producto) || { descripcion: d.descripcion_producto, unidad: d.unidad_medida, cantidad: 0 };
+                actual.cantidad += Number(d.cantidad);
+                totales.set(d.codigo_producto, actual);
+            });
+        });
+
+        const codigos = [...totales.keys()];
+        let stockSap;
+
+        try {
+            stockSap = await consultarStockPollo(codigos, ruta.whs_code_origen);
+        } catch (error) {
+            throw new ErrorSapArtesano(`No se pudo consultar el stock en SAP: ${error.message}`);
+        }
+
+        const productos = await PedidoArtesanoProductoModel.findAll({ where: { codigo_producto: { [Op.in]: codigos } }, attributes: ['codigo_producto', 'unidades_sap'] });
+        const unidades = new Map(productos.map(p => [p.codigo_producto, Number(p.unidades_sap) || 1]));
+        const porCodigo = new Map(stockSap.map(s => [s.codigo_articulo, s]));
+
+        const comparativo = codigos.map((codigo) => {
+            const total = totales.get(codigo);
+            const stock = porCodigo.get(codigo);
+            // El stock de SAP está en su unidad de venta; se pasa a unidades del pedido (lasaña: paquete de 4).
+            const disponible = stock ? Math.floor(Number(stock.bolsas_completas) / (unidades.get(codigo) || 1)) : 0;
+
+            return {
+                codigo_producto: codigo,
+                descripcion_producto: total.descripcion,
+                unidad_medida: total.unidad,
+                cantidad_solicitada_total: total.cantidad,
+                stock_disponible: disponible,
+                encontrado_en_sap: !!stock,
+                diferencia: disponible - total.cantidad
+            };
+        });
+
+        return res.json({ success: true, fecha, ruta_id, whs_code: ruta.whs_code_origen, comparativo });
+    } catch (error) {
+        return responderError(res, error, 'Error al obtener el comparativo de stock');
+    }
+}
+
+// POST /pedidoArtesano/guardarAsignacionRuta { ruta_id, fecha, asignaciones: [{ detalle_id, cantidad_asignada, ajustado_manual }] }
+// Guarda lo asignado por línea; los pedidos con algo asignado pasan a VALIDADO. No toca SAP.
+async function guardarAsignacionRuta(req, res) {
+    try {
+        await exigirEscrituraPedidosPollo(req);
+
+        const { ruta_id, fecha, asignaciones } = req.body;
+        validarRutaYFecha(ruta_id, fecha);
+
+        if (!Array.isArray(asignaciones) || asignaciones.length === 0) throw new ErrorPedidoArtesano(400, 'asignaciones es requerido');
+
+        await exigirCandadoDeRuta(req, ruta_id, fecha);
+
+        const usuario = await nombreCortoDelUsuario(req);
+        const t = await sequelizeInit.sequelize.transaction();
+        let validados = 0;
+        let sinAsignar = 0;
+
+        try {
+            const pedidos = await pedidosPorCargarDeRuta(ruta_id, fecha, t);
+            const asignadas = new Map(asignaciones.map(a => [String(a.detalle_id), Number(a.cantidad_asignada)]));
+            const lineas = new Map();
+
+            pedidos.forEach(p => p.detalle.forEach(d => lineas.set(String(d.id), d)));
+
+            for (const [detalleId, cantidad] of asignadas) {
+                const linea = lineas.get(detalleId);
+
+                if (!linea) throw new ErrorPedidoArtesano(400, 'Una línea no pertenece a los pedidos pendientes de esta ruta');
+                if (!Number.isFinite(cantidad) || cantidad < 0) throw new ErrorPedidoArtesano(400, `Cantidad inválida para ${linea.codigo_producto}`);
+                if (cantidad > Number(linea.cantidad)) throw new ErrorPedidoArtesano(400, `No se puede asignar más de lo solicitado en ${linea.codigo_producto} (${textoCantidad(Number(linea.cantidad))})`);
+            }
+
+            for (const pedido of pedidos) {
+                const propias = pedido.detalle.filter(d => asignadas.has(String(d.id)));
+
+                if (propias.length === 0) continue;
+                if (propias.length !== pedido.detalle.length) throw new ErrorPedidoArtesano(400, `Falta asignar alguna línea del pedido ${pedido.numero_pedido}`);
+
+                const total = propias.reduce((suma, d) => suma + asignadas.get(String(d.id)), 0);
+
+                if (total <= 0) {
+                    // Sin stock para este pedido: queda creado, sin cantidades, para rechazarlo con su motivo.
+                    for (const d of propias) await d.update({ cantidad_autorizada: null }, { transaction: t });
+
+                    if (pedido.estado === 'VALIDADO') {
+                        await cambiarEstado(pedido, ['VALIDADO'], 'CREADO', {}, usuario, 'Validación sin stock: vuelve a creado', t);
+                    }
+
+                    sinAsignar += 1;
+                    continue;
+                }
+
+                const diferencias = [];
+
+                for (const d of propias) {
+                    const cantidad = asignadas.get(String(d.id));
+
+                    await d.update({ cantidad_autorizada: cantidad }, { transaction: t });
+                    if (cantidad < Number(d.cantidad)) diferencias.push(`${d.codigo_producto}: ${textoCantidad(Number(d.cantidad))} → ${textoCantidad(cantidad)}`);
+                }
+
+                await cambiarEstado(
+                    pedido,
+                    ESTADOS_POR_CARGAR,
+                    'VALIDADO',
+                    {},
+                    usuario,
+                    diferencias.length > 0 ? `Validado parcialmente — ${diferencias.join('; ')}` : 'Validado completo',
+                    t
+                );
+                validados += 1;
+            }
+
+            await t.commit();
+        } catch (error) {
+            await t.rollback();
+            throw error;
+        }
+
+        return res.json({ success: true, pedidos_validados: validados, pedidos_sin_asignar: sinAsignar, lineas_actualizadas: asignaciones.length });
+    } catch (error) {
+        return responderError(res, error, 'Error al guardar la asignación de cantidades');
+    }
+}
+
+// POST /pedidoArtesano/enviarRuta { ruta_id, fecha }
+// Carga los pedidos VALIDADOS de la ruta con una transferencia de SAP, con el piloto asignado a la ruta, y libera el candado.
+async function enviarRuta(req, res) {
+    try {
+        await exigirEscrituraPedidosPollo(req);
+
+        const { ruta_id, fecha } = req.body;
+        validarRutaYFecha(ruta_id, fecha);
+
+        await exigirCandadoDeRuta(req, ruta_id, fecha);
+
+        const despacho = await DespachoRutaModel.findOne({ where: { ruta_id, fecha } });
+
+        if (!despacho || !despacho.piloto_id) throw new ErrorPedidoArtesano(400, 'Asigna piloto y camión a esta ruta antes de enviarla');
+
+        const piloto = await resolverPiloto(despacho.piloto_id);
+        const usuario = await nombreCortoDelUsuario(req);
+        const validados = await PedidoArtesanoModel.findAll({ where: { ruta_id, fecha_requerida: fecha, estado: 'VALIDADO' }, attributes: ['id'] });
+        const ids = validados.map(p => p.id);
+
+        if (ids.length === 0) throw new ErrorPedidoArtesano(400, 'No hay pedidos validados para enviar. Calcula el stock y guarda la asignación');
+
+        let documento;
+
+        try {
+            documento = await cargarGrupoRuta({ ids, ajustes: {}, versiones: {}, piloto, usuario, req });
+        } catch (error) {
+            if (error instanceof ErrorSapArtesano) await guardarErrorSap(ids, error.detalle);
+
+            throw error;
+        }
+
+        await BloqueoRutaPolloModel.update({ estado: 'LIBERADO', fecha_liberacion: new Date() }, { where: { ruta_id, fecha, estado: 'ACTIVO' } });
+
+        const sinValidar = await PedidoArtesanoModel.count({ where: { ruta_id, fecha_requerida: fecha, estado: 'CREADO' } });
+
+        return res.json({ success: true, sap_docnum: documento.DocNum, pedidos_cargados: ids.length, pedidos_sin_validar: sinValidar });
+    } catch (error) {
+        return responderError(res, error, 'Error al enviar la ruta');
+    }
+}
+
 // POST /pedidoArtesano/cambiarPiloto  { ids: [...], codigo_piloto }
-// Cambia el piloto de pedidos CARGADOS; queda en el historial.
+// Cambia el piloto de pedidos EN_TRANSITO; queda en el historial.
 async function cambiarPiloto(req, res) {
     try {
         await exigirEscrituraRastro(req);
@@ -1418,7 +1784,7 @@ async function cambiarPiloto(req, res) {
             if (pedidos.length !== ids.length) throw new ErrorPedidoArtesano(404, 'Alguno de los pedidos no existe');
 
             for (const pedido of pedidos) {
-                if (pedido.estado !== 'CARGADO') {
+                if (pedido.estado !== 'EN_TRANSITO') {
                     throw new ErrorPedidoArtesano(409, `El piloto solo se cambia en pedidos cargados (${pedido.numero_pedido})`);
                 }
 
@@ -1431,7 +1797,7 @@ async function cambiarPiloto(req, res) {
                     actualizado_en: new Date()
                 }, { transaction: t });
 
-                await registrarHistorial(pedido.id, 'CARGADO', 'CARGADO', usuario, `Piloto: ${anterior} → ${nuevo}`, t);
+                await registrarHistorial(pedido.id, 'EN_TRANSITO', 'EN_TRANSITO', usuario, `Piloto: ${anterior} → ${nuevo}`, t);
             }
 
             await t.commit();
@@ -1448,7 +1814,7 @@ async function cambiarPiloto(req, res) {
     }
 }
 
-// GET /pedidoArtesano/pdf?ids=a,b,c: constancia de envío de pedidos CARGADOS
+// GET /pedidoArtesano/pdf?ids=a,b,c: constancia de envío de pedidos EN_TRANSITO
 // (una página por pedido). Se puede reimprimir las veces que haga falta.
 async function getPdf(req, res) {
     try {
@@ -1461,7 +1827,7 @@ async function getPdf(req, res) {
 
         if (pedidos.length !== ids.length) throw new ErrorPedidoArtesano(404, 'Alguno de los pedidos no existe');
 
-        const noCargado = pedidos.find(p => !['CARGADO', 'ENTREGADO'].includes(p.estado));
+        const noCargado = pedidos.find(p => !['EN_TRANSITO', 'ENTREGADO'].includes(p.estado));
 
         if (noCargado) throw new ErrorPedidoArtesano(409, `El pedido ${noCargado.numero_pedido} todavía no se ha cargado`);
 
@@ -1487,7 +1853,7 @@ async function getPdf(req, res) {
 
 // Rastro: entrega, evidencia y reporte
 
-// Entrega un pedido CARGADO: crea la entrega en SAP y lo marca ENTREGADO. Si SAP la rechaza, sigue CARGADO.
+// Entrega un pedido EN_TRANSITO: crea la entrega en SAP y lo marca ENTREGADO. Si SAP la rechaza, sigue EN_TRANSITO.
 async function entregarPedido(id, usuario, req) {
     const t = await sequelizeInit.sequelize.transaction();
 
@@ -1496,7 +1862,7 @@ async function entregarPedido(id, usuario, req) {
 
         if (!pedido) throw new ErrorPedidoArtesano(404, 'El pedido no existe');
 
-        if (pedido.estado !== 'CARGADO') {
+        if (pedido.estado !== 'EN_TRANSITO') {
             throw new ErrorPedidoArtesano(409, `El pedido ${pedido.numero_pedido} no está cargado, no se puede marcar como entregado`);
         }
 
@@ -1551,7 +1917,7 @@ async function entregarPedido(id, usuario, req) {
 
         await cambiarEstado(
             pedido,
-            ['CARGADO'],
+            ['EN_TRANSITO'],
             'ENTREGADO',
             {
                 entregado_por: req.user.id_usuario,
@@ -1630,7 +1996,7 @@ function llaveEvidencia(pedidoId, file) {
 }
 
 // POST /pedidoArtesano/subirEvidencia  (multipart: id, foto)
-// Adjunta o reemplaza la foto de la hoja firmada de un pedido CARGADO o ENTREGADO.
+// Adjunta o reemplaza la foto de la hoja firmada de un pedido EN_TRANSITO o ENTREGADO.
 async function subirEvidencia(req, res) {
     try {
         await exigirEscrituraRastro(req);
@@ -1644,7 +2010,7 @@ async function subirEvidencia(req, res) {
 
         if (!pedido) throw new ErrorPedidoArtesano(404, 'El pedido no existe');
 
-        if (!['CARGADO', 'ENTREGADO'].includes(pedido.estado)) {
+        if (!['EN_TRANSITO', 'ENTREGADO'].includes(pedido.estado)) {
             throw new ErrorPedidoArtesano(409, 'Solo se adjunta evidencia a pedidos cargados o entregados');
         }
 
@@ -1708,6 +2074,142 @@ async function getEvidencia(req, res) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Reportes de Pedidos de Pollo: detalle por ruta y pedidos en tránsito (PDF o Excel)
+// ---------------------------------------------------------------------------
+
+const MAX_DIAS_REPORTE = 31;
+
+function parsearFormatoReporte(valor) {
+    const formato = String(valor || 'pdf').trim().toLowerCase();
+
+    if (!['pdf', 'excel'].includes(formato)) throw new ErrorPedidoArtesano(400, "formato debe ser 'pdf' o 'excel'");
+
+    return formato;
+}
+
+// "a,b,c" -> ['a','b','c']; vacío -> null (sin filtro). Cada valor debe pasar la validación.
+function parsearLista(valor, validar, mensaje) {
+    if (valor === undefined || valor === null || String(valor).trim() === '') return null;
+
+    const lista = [...new Set(String(valor).split(',').map(v => v.trim()).filter(Boolean))];
+
+    if (lista.length === 0 || !lista.every(validar)) throw new ErrorPedidoArtesano(400, mensaje);
+
+    return lista;
+}
+
+async function viajesDeReporte(pedidos, productosFiltro) {
+    let filtrados = pedidos.map(p => p.get({ plain: true }));
+
+    if (productosFiltro) {
+        filtrados = filtrados
+            .map(p => ({ ...p, detalle: (p.detalle || []).filter(l => productosFiltro.includes(l.codigo_producto)) }))
+            .filter(p => p.detalle.length > 0);
+    }
+
+    const rutaIds = [...new Set(filtrados.map(p => p.ruta_id).filter(Boolean))];
+    const fechas = [...new Set(filtrados.map(p => String(p.fecha_requerida).slice(0, 10)))];
+
+    const [catalogo, despachos] = await Promise.all([
+        PedidoArtesanoProductoModel.findAll(),
+        rutaIds.length === 0
+            ? []
+            : DespachoRutaModel.findAll({ where: { ruta_id: { [Op.in]: rutaIds }, fecha: { [Op.in]: fechas } } })
+    ]);
+
+    return armarViajes(
+        filtrados,
+        new Map(catalogo.map(c => [c.codigo_producto, c.get({ plain: true })])),
+        new Map(despachos.map(d => [`${d.ruta_id}|${String(d.fecha).slice(0, 10)}`, d.get({ plain: true })]))
+    );
+}
+
+// GET /pedidoArtesano/generarReporteDetalle?fecha=&fecha_hasta=&estados=&rutas=&productos=&formato=pdf|excel
+// Detalle de los pedidos por ruta, de un día o de un rango de fechas requeridas, sin importar el estado salvo que se filtre.
+async function generarReporteDetalle(req, res) {
+    try {
+        await exigirLecturaPedidosPollo(req);
+
+        const { fecha, fecha_hasta: fechaHasta } = req.query;
+
+        if (!REGEX_FECHA.test(String(fecha || ''))) throw new ErrorPedidoArtesano(400, 'La fecha debe tener el formato YYYY-MM-DD');
+
+        const esRango = !!fechaHasta && String(fechaHasta) > fecha;
+
+        if (fechaHasta && !REGEX_FECHA.test(String(fechaHasta))) throw new ErrorPedidoArtesano(400, 'fecha_hasta debe tener el formato YYYY-MM-DD');
+
+        if (esRango && (Date.parse(fechaHasta) - Date.parse(fecha)) / 86400000 + 1 > MAX_DIAS_REPORTE) {
+            throw new ErrorPedidoArtesano(400, `El rango no puede pasar de ${MAX_DIAS_REPORTE} días`);
+        }
+
+        const formato = parsearFormatoReporte(req.query.formato);
+        const estados = parsearLista(req.query.estados, e => ESTADOS.includes(e), `estados debe ser una lista de: ${ESTADOS.join(', ')}`);
+        const rutas = parsearLista(req.query.rutas, r => REGEX_UUID.test(r), 'rutas inválidas');
+        const productos = parsearLista(req.query.productos, c => /^[A-Za-z0-9_-]{1,50}$/.test(c), 'productos inválidos');
+
+        const where = { fecha_requerida: esRango ? { [Op.between]: [fecha, fechaHasta] } : fecha };
+
+        if (estados) where.estado = { [Op.in]: estados };
+        if (rutas) where.ruta_id = { [Op.in]: rutas };
+
+        const pedidos = await PedidoArtesanoModel.findAll({
+            where,
+            include: [{ model: PedidoArtesanoDetalleModel, as: 'detalle' }],
+            order: [['fecha_requerida', 'ASC'], ['nombre_ruta', 'ASC'], ['numero_pedido', 'ASC']],
+            limit: LIMITE_EXPORTACION
+        });
+
+        const viajes = await viajesDeReporte(pedidos, productos);
+
+        if (viajes.length === 0) throw new ErrorPedidoArtesano(404, 'No hay pedidos para los filtros seleccionados');
+
+        const lineas = [
+            esRango ? `Fecha requerida: ${fecha} al ${fechaHasta}` : `Fecha requerida: ${fecha}`,
+            estados ? `Estados: ${estados.map(e => ({ CREADO: 'Creado', VALIDADO: 'Validado', EN_TRANSITO: 'En tránsito', ENTREGADO: 'Entregado', RECHAZADO: 'Rechazado', CANCELADO: 'Cancelado' }[e])).join(', ')}` : 'Todos los estados',
+            rutas ? `Rutas: ${[...new Set(viajes.map(v => v.nombre_ruta))].join(', ')}` : 'Todas las rutas',
+            productos ? `Productos: ${productos.length} seleccionado${productos.length !== 1 ? 's' : ''}` : null
+        ];
+
+        return await enviarReporteDetalle(res, {
+            formato,
+            viajes,
+            lineas,
+            agruparPorFecha: esRango,
+            nombreBase: `pollo_artesano_detalle_${fecha}${esRango ? `_a_${fechaHasta}` : ''}`
+        });
+    } catch (error) {
+        if (res.headersSent) return res.end();
+
+        return responderError(res, error, 'Error al generar el reporte de pedidos');
+    }
+}
+
+// GET /pedidoArtesano/generarReporteEnTransito?formato=pdf|excel
+// Pedidos EN_TRANSITO (enviados a SAP, sin entregar) de cualquier fecha.
+async function generarReporteEnTransito(req, res) {
+    try {
+        await exigirLecturaPedidosPollo(req);
+
+        const formato = parsearFormatoReporte(req.query.formato);
+
+        const pedidos = await PedidoArtesanoModel.findAll({
+            where: { estado: 'EN_TRANSITO' },
+            include: [{ model: PedidoArtesanoDetalleModel, as: 'detalle' }],
+            order: [['fecha_requerida', 'ASC'], ['nombre_ruta', 'ASC'], ['numero_pedido', 'ASC']],
+            limit: LIMITE_EXPORTACION
+        });
+
+        if (pedidos.length === 0) throw new ErrorPedidoArtesano(404, 'No hay pedidos en tránsito');
+
+        return await enviarReporteEnTransito(res, { formato, viajes: await viajesDeReporte(pedidos, null) });
+    } catch (error) {
+        if (res.headersSent) return res.end();
+
+        return responderError(res, error, 'Error al generar el reporte de pedidos en tránsito');
+    }
+}
+
 module.exports = {
     getProductos,
     getUsuarios,
@@ -1730,5 +2232,12 @@ module.exports = {
     getEvidencia,
     exportarPedidos,
     exportarPorCliente,
-    cancelar
+    cancelar,
+    getPedidosRuta,
+    getResumenRutas,
+    getComparativoRuta,
+    guardarAsignacionRuta,
+    enviarRuta,
+    generarReporteDetalle,
+    generarReporteEnTransito
 };

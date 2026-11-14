@@ -89,6 +89,11 @@ router.post('/pedidoArtesano/crearPedido', auth, pedidoArtesano.crearPedido);
 router.post('/pedidoArtesano/editarPedido', auth, pedidoArtesano.editarPedido);
 router.post('/pedidoArtesano/completarPago', auth, pedidoArtesano.completarPago);
 router.post('/pedidoArtesano/cancelar', auth, pedidoArtesano.cancelar);
+router.get('/pedidoArtesano/getPedidosRuta', auth, pedidoArtesano.getPedidosRuta);
+router.get('/pedidoArtesano/getResumenRutas', auth, pedidoArtesano.getResumenRutas);
+router.get('/pedidoArtesano/getComparativoRuta', auth, pedidoArtesano.getComparativoRuta);
+router.post('/pedidoArtesano/guardarAsignacionRuta', auth, pedidoArtesano.guardarAsignacionRuta);
+router.post('/pedidoArtesano/enviarRuta', auth, pedidoArtesano.enviarRuta);
 router.get('/pedidoArtesano/getPendientes', auth, pedidoArtesano.getPendientes);
 router.get('/pedidoArtesano/getStock', auth, pedidoArtesano.getStock);
 router.post('/pedidoArtesano/rechazar', auth, pedidoArtesano.rechazar);
@@ -101,6 +106,8 @@ router.post('/pedidoArtesano/subirEvidencia', auth, pedidoArtesano.recibirFoto, 
 router.get('/pedidoArtesano/getEvidencia', auth, pedidoArtesano.getEvidencia);
 router.get('/pedidoArtesano/exportarPedidos', auth, pedidoArtesano.exportarPedidos);
 router.get('/pedidoArtesano/exportarPorCliente', auth, pedidoArtesano.exportarPorCliente);
+router.get('/pedidoArtesano/generarReporteDetalle', auth, pedidoArtesano.generarReporteDetalle);
+router.get('/pedidoArtesano/generarReporteEnTransito', auth, pedidoArtesano.generarReporteEnTransito);
 
 //VISITAS A AVICOLAS
 router.get('/visita/getUsuarios', auth, visitas.getUsuariosConVisitas);
