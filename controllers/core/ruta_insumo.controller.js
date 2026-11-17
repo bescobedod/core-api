@@ -12,6 +12,34 @@ const { Op, fn, col } = require('sequelize');
 // TODO: confirmar el nombre real de la clave de conexión a PDV en configDatabase
 const PDV_CONNECTION = 'PDV';
 
+// Una tienda puede tener a la vez una ruta vigente de INSUMOS y una de
+// VERDURA (Ruta 13/14), pero nunca dos del mismo tipo.
+const TIPOS_RUTA_INSUMOS = ['INSUMOS', 'VERDURA'];
+const TIPO_RUTA_DEFAULT = 'INSUMOS';
+
+function normalizarTipoRuta(valor) {
+    const tipo = (valor || TIPO_RUTA_DEFAULT).toString().trim().toUpperCase();
+    return TIPOS_RUTA_INSUMOS.includes(tipo) ? tipo : null;
+}
+
+// Asignaciones vigentes de las tiendas indicadas, solo en rutas del tipo dado
+async function asignacionesVigentesPorTipo(idsTiendaSimphony, tipo_ruta, transaction) {
+    return TiendaRutaInsumosModel.findAll({
+        where: {
+            id_tienda_simphony: { [Op.in]: idsTiendaSimphony },
+            fecha_fin_asignacion: null
+        },
+        include: [{
+            model: CatalogoRutaInsumosModel,
+            as: 'ruta',
+            attributes: ['id', 'tipo_ruta'],
+            where: { tipo_ruta },
+            required: true
+        }],
+        transaction
+    });
+}
+
 // ------------------------------------------------------------
 // GET: lista las rutas de insumos, con cuántas tiendas tiene asignadas
 // ------------------------------------------------------------
@@ -44,6 +72,7 @@ async function getRutasInsumos(req, res) {
             whs_code_origen: r.whs_code_origen,
             whs_code_destino: r.whs_code_destino,
             activo: r.activo,
+            tipo_ruta: r.tipo_ruta,
             total_tiendas: conteoMap.get(r.id) || 0
         }));
 
@@ -58,10 +87,18 @@ async function getRutasInsumos(req, res) {
 // ------------------------------------------------------------
 async function crearRutaInsumos(req, res) {
     const { nombre_ruta, whs_code_destino } = req.body;
+    const tipo_ruta = normalizarTipoRuta(req.body.tipo_ruta);
 
     if (!nombre_ruta || !whs_code_destino) {
         return res.status(400).json({
             error: 'nombre_ruta y whs_code_destino son requeridos',
+            success: false
+        });
+    }
+
+    if (!tipo_ruta) {
+        return res.status(400).json({
+            error: `tipo_ruta debe ser uno de: ${TIPOS_RUTA_INSUMOS.join(', ')}`,
             success: false
         });
     }
@@ -72,6 +109,7 @@ async function crearRutaInsumos(req, res) {
             whs_code_origen: '01',
             whs_code_destino,
             activo: true,
+            tipo_ruta,
             creado_en: new Date()
         });
 
@@ -83,13 +121,22 @@ async function crearRutaInsumos(req, res) {
 
 // ------------------------------------------------------------
 // GET: busca tiendas en PDV, e indica si ya están asignadas a alguna
-// ruta de insumos vigente.
+// ruta vigente del tipo indicado (?tipo_ruta=INSUMOS|VERDURA, por
+// defecto INSUMOS).
 // ------------------------------------------------------------
 async function buscarTiendasPdv(req, res) {
     const { query } = req.query;
+    const tipo_ruta = normalizarTipoRuta(req.query.tipo_ruta);
 
     if (!query || query.trim().length < 2) {
         return res.status(400).json({ error: 'query debe tener al menos 2 caracteres', success: false });
+    }
+
+    if (!tipo_ruta) {
+        return res.status(400).json({
+            error: `tipo_ruta debe ser uno de: ${TIPOS_RUTA_INSUMOS.join(', ')}`,
+            success: false
+        });
     }
 
     try {
@@ -109,12 +156,7 @@ async function buscarTiendasPdv(req, res) {
 
         const simphonyIds = tiendas.map(t => t.StoreNumberSimphony).filter(Boolean);
 
-        const asignadas = await TiendaRutaInsumosModel.findAll({
-            where: {
-                id_tienda_simphony: { [Op.in]: simphonyIds },
-                fecha_fin_asignacion: null
-            }
-        });
+        const asignadas = await asignacionesVigentesPorTipo(simphonyIds, tipo_ruta);
 
         const asignadaMap = new Map(asignadas.map(a => [a.id_tienda_simphony, a]));
 
@@ -158,8 +200,9 @@ async function getTiendasDeRuta(req, res) {
 }
 
 // ------------------------------------------------------------
-// POST: asigna una tienda a una ruta de insumos (cierra la asignación
-// vigente anterior, sea de la misma ruta o de otra)
+// POST: asigna una tienda a una ruta de insumos. Cierra solo la
+// asignación vigente anterior del MISMO tipo de ruta (INSUMOS o
+// VERDURA); la del otro tipo se conserva.
 // ------------------------------------------------------------
 async function asignarTiendaRutaInsumos(req, res) {
     const {
@@ -179,16 +222,26 @@ async function asignarTiendaRutaInsumos(req, res) {
         });
     }
 
+    const ruta = await CatalogoRutaInsumosModel.findByPk(ruta_id);
+
+    if (!ruta) {
+        return res.status(404).json({ error: 'Ruta no encontrada', success: false });
+    }
+
     const sequelizeCore = await sequelizeInit.sequelizeInit('CORE');
     const t = await sequelizeCore.transaction();
 
     try {
         const ahora = new Date();
 
-        await TiendaRutaInsumosModel.update(
-            { fecha_fin_asignacion: ahora },
-            { where: { id_tienda_simphony, fecha_fin_asignacion: null }, transaction: t }
-        );
+        const vigentesMismoTipo = await asignacionesVigentesPorTipo([id_tienda_simphony], ruta.tipo_ruta, t);
+
+        if (vigentesMismoTipo.length > 0) {
+            await TiendaRutaInsumosModel.update(
+                { fecha_fin_asignacion: ahora },
+                { where: { id: { [Op.in]: vigentesMismoTipo.map(a => a.id) } }, transaction: t }
+            );
+        }
 
         const nuevaAsignacion = await TiendaRutaInsumosModel.create({
             ruta_id,
@@ -212,20 +265,37 @@ async function asignarTiendaRutaInsumos(req, res) {
 }
 
 // ------------------------------------------------------------
-// POST: quita una tienda de su ruta de insumos actual
+// POST: quita una tienda de una ruta. Con ruta_id cierra solo esa
+// asignación; sin ruta_id (frontend anterior) cierra solo la de tipo
+// INSUMOS, para no tocar la ruta de verduras de la tienda.
 // ------------------------------------------------------------
 async function quitarTiendaDeRutaInsumos(req, res) {
-    const { id_tienda_simphony } = req.body;
+    const { id_tienda_simphony, ruta_id } = req.body;
 
     if (!id_tienda_simphony) {
         return res.status(400).json({ error: 'id_tienda_simphony es requerido', success: false });
     }
 
     try {
-        await TiendaRutaInsumosModel.update(
-            { fecha_fin_asignacion: new Date() },
-            { where: { id_tienda_simphony, fecha_fin_asignacion: null } }
-        );
+        let idsAsignacion;
+
+        if (ruta_id) {
+            const vigentes = await TiendaRutaInsumosModel.findAll({
+                where: { id_tienda_simphony, ruta_id, fecha_fin_asignacion: null },
+                attributes: ['id']
+            });
+            idsAsignacion = vigentes.map(a => a.id);
+        } else {
+            const vigentes = await asignacionesVigentesPorTipo([id_tienda_simphony], TIPO_RUTA_DEFAULT);
+            idsAsignacion = vigentes.map(a => a.id);
+        }
+
+        if (idsAsignacion.length > 0) {
+            await TiendaRutaInsumosModel.update(
+                { fecha_fin_asignacion: new Date() },
+                { where: { id: { [Op.in]: idsAsignacion } } }
+            );
+        }
 
         return res.json({ success: true });
     } catch (error) {

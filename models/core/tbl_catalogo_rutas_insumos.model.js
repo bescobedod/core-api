@@ -9,6 +9,8 @@ CatalogoRutaInsumosModel.init({
     whs_code_origen: { type: DataTypes.STRING(20), allowNull: false, defaultValue: '01' },
     whs_code_destino: { type: DataTypes.STRING(20), allowNull: false },
     activo: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: true },
+    // 'INSUMOS' o 'VERDURA': una tienda puede tener una ruta vigente de cada tipo
+    tipo_ruta: { type: DataTypes.STRING(20), allowNull: false, defaultValue: 'INSUMOS' },
     creado_en: { type: DataTypes.DATE, allowNull: false }
 }, {
     sequelize: sequelize,

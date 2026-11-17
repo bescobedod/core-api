@@ -240,7 +240,9 @@ async function quitarTiendaDeRutaPollo(req, res) {
 }
 
 // ------------------------------------------------------------
-// GET: obtiene el muelle (whs_code_origen) asignado al usuario logueado
+// GET: obtiene los muelles (whs_code_origen) asignados al usuario logueado.
+// Un usuario puede tener varios; `muelles` los trae todos. whs_code_origen
+// y nombre_muelle (el primero) se mantienen por compatibilidad.
 // ------------------------------------------------------------
 async function getMuelleUsuario(req, res) {
     const id_usuario = req.user && req.user.id_usuario;
@@ -250,21 +252,28 @@ async function getMuelleUsuario(req, res) {
     }
 
     try {
-        const asignacion = await UsuarioMuellePolloModel.findOne({
-            where: { id_usuario, activo: true }
+        const asignaciones = await UsuarioMuellePolloModel.findAll({
+            where: { id_usuario, activo: true },
+            order: [['whs_code_origen', 'ASC']]
         });
 
-        if (!asignacion) {
+        if (asignaciones.length === 0) {
             return res.status(404).json({
                 error: 'Este usuario no tiene un muelle de pollo asignado',
                 success: false
             });
         }
 
+        const muelles = asignaciones.map(a => ({
+            whs_code_origen: a.whs_code_origen,
+            nombre_muelle: a.nombre_muelle
+        }));
+
         return res.json({
             success: true,
-            whs_code_origen: asignacion.whs_code_origen,
-            nombre_muelle: asignacion.nombre_muelle
+            whs_code_origen: muelles[0].whs_code_origen,
+            nombre_muelle: muelles[0].nombre_muelle,
+            muelles
         });
     } catch (error) {
         return res.status(500).json({ error: 'Error al obtener el muelle del usuario', details: error.message, success: false });

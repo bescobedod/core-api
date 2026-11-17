@@ -7,7 +7,7 @@ const TicketTrasladoModel = require('../../models/core/tbl_tickets_traslado.mode
 const initPedidoDetalleModel = require('../../models/core/tbl_pedido_detalle.model');
 const initTiendaModel = require('../../models/pdv/tTienda.model');
 const UsersModel = require('../../models/pioapp/users.model');
-const { obtenerProductosData, consultarStockPollo, consultarStockInsumos, crearTransferenciaPollo, crearTransferenciaInsumos, consultarCodigosAntiguos, WHS_INSUMOS } = require('../../integrations/sap/sapClient');
+const { obtenerProductosData, consultarStockPollo, consultarStockInsumos, crearTransferenciaPollo, crearTransferenciaInsumos, consultarCodigosAntiguos } = require('../../integrations/sap/sapClient');
 const CatalogoRutaPolloModel = require('../../models/core/tbl_catalogo_rutas_pollo.model');
 const BloqueoRutaPolloModel = require('../../models/core/tbl_bloqueo_ruta_pollo.model');
 const CatalogoRutaInsumosModel = require('../../models/core/tbl_catalogo_rutas_insumos.model');
@@ -21,6 +21,7 @@ const CatalogoRutaModel = require('../../models/core/tbl_catalogo_ruta.model');
 const TiendaRutaModel = require('../../models/core/tbl_tienda_ruta.model');
 const TiendaRutaPolloModel = require('../../models/core/tbl_tiendas_rutas_pollo.model');
 const TiendaRutaInsumosModel = require('../../models/core/tbl_tiendas_rutas_insumos.model');
+const ArticuloVerduraModel = require('../../models/core/tbl_articulos_verdura.model');
 const CamionModel = require('../../models/core/tbl_camion.model');
 const DespachoRutaModel = require('../../models/core/tbl_despacho_ruta.model');
 const { nivelPermisoDeMenu } = require('../../services/permisosMenu.service');
@@ -51,6 +52,13 @@ const PDV_CONNECTION = 'PDV';
 // transferencia SAP y ticket de traslado. Se buscan/procesan juntos en
 // esas funciones (no así POLLO, que usa una base SAP separada, AVIGUA).
 const TIPOS_INSUMOS_Y_ACTIVO_FIJO = ['INSUMOS', 'ACTIVO_FIJO'];
+
+// Flujo operativo de insumos (vista, stock, asignación, envío SAP, tickets,
+// QR): también incluye VERDURA, que sale de la misma bodega "01". Las rutas
+// de verduras (13/14) son distintas a las de insumos, así que al filtrar por
+// ruta_id + fecha nunca se mezclan. Los REPORTES no usan esta lista: ahí
+// Insumos (TIPOS_INSUMOS_Y_ACTIVO_FIJO) y Verduras van por separado.
+const TIPOS_FLUJO_INSUMOS = ['INSUMOS', 'ACTIVO_FIJO', 'VERDURA'];
 
 async function getAllPedidosEncabezado(req, res) {
     try {
@@ -180,9 +188,11 @@ async function createPedido(req, res) {
 // POST: crea manualmente un pedido de Activo Fijo (desde FixedAssetsView),
 // insertando directo en cabecera + detalle + historial de
 // tbl_pedidos_pos_*, igual que si viniera del middleware de Simphony pero
-// sin archivo de por medio. Sale siempre de la bodega "01" (misma base SAP
-// que INSUMOS), así que la ruta se resuelve con el mismo maestro de rutas
-// de insumos (tbl_tiendas_rutas_insumos, vía id_tienda_pdv).
+// sin archivo de por medio. Se despacha desde la misma base SAP que INSUMOS
+// (bodega origen "01", que sale de la ruta), así que la ruta se resuelve con
+// el mismo maestro de rutas de insumos (tbl_tiendas_rutas_insumos, vía
+// id_tienda_pdv). codigo_bodega es, igual que en Pollo/Insumos, la bodega
+// SAP de la TIENDA destino (tTienda.whsCode), no la de origen.
 // ------------------------------------------------------------
 async function crearPedidoActivoFijo(req, res) {
     const { id_tienda, codigo_tienda, nombre_tienda, codigo_empresa, fecha_requerida, items } = req.body;
@@ -221,6 +231,7 @@ async function crearPedidoActivoFijo(req, res) {
         const TiendaPdvModel = initTiendaModel(sequelizePdv);
         const tiendaPdv = await TiendaPdvModel.findOne({ where: { idTienda: id_tienda } });
         const codigoTiendaSimphony = tiendaPdv?.StoreNumberSimphony || codigo_tienda || String(id_tienda);
+        const codigoBodegaTienda = tiendaPdv?.whsCode || null;
 
         const [{ nextval }] = await sequelizeCore.query(
             "SELECT nextval('logistica.seq_pedido_activo_fijo') as nextval",
@@ -239,7 +250,7 @@ async function crearPedidoActivoFijo(req, res) {
             fecha_requerida,
             hora_pedido: ahora.toTimeString().split(' ')[0],
             nombre_tienda: nombre_tienda || null,
-            codigo_bodega: WHS_INSUMOS,
+            codigo_bodega: codigoBodegaTienda,
             tipo_pedido: 'ACTIVO_FIJO',
             ruta_id,
             nombre_ruta,
@@ -363,6 +374,16 @@ async function cambiarFechaRequeridaPedido(req, res) {
             return res.status(400).json({ error: 'La nueva fecha es igual a la fecha actual del pedido', success: false });
         }
 
+        // Verduras solo se entregan jueves o viernes (sin corte del lunes en
+        // el cambio manual: se puede mover dentro de la misma semana).
+        if (pedido.tipo_pedido === TIPO_PEDIDO_VERDURA && !esDiaEntregaVerdura(fecha_requerida)) {
+            await t.rollback();
+            return res.status(400).json({
+                error: 'Los pedidos de verduras solo se entregan jueves o viernes; elige una de esas fechas.',
+                success: false
+            });
+        }
+
         const esPollo = pedido.tipo_pedido === 'POLLO';
 
         if (pedido.ruta_id) {
@@ -389,7 +410,7 @@ async function cambiarFechaRequeridaPedido(req, res) {
                 where: {
                     ruta_id: pedido.ruta_id,
                     fecha_requerida,
-                    tipo_pedido: esPollo ? 'POLLO' : { [Op.in]: TIPOS_INSUMOS_Y_ACTIVO_FIJO },
+                    tipo_pedido: esPollo ? 'POLLO' : { [Op.in]: TIPOS_FLUJO_INSUMOS },
                     estado: { [Op.in]: ESTADOS_RUTA_DESPACHADA }
                 },
                 attributes: ['id'],
@@ -448,6 +469,148 @@ async function cambiarFechaRequeridaPedido(req, res) {
 
         return res.status(500).json({
             error: 'Error al cambiar la fecha de entrega',
+            details: error.message,
+            success: false
+        });
+    }
+}
+
+// ------------------------------------------------------------
+// POST: cancela UN pedido. No se borra: pasa a estado CANCELADO (con el
+// motivo en el historial) y desde ese momento el modelo lo oculta de todas
+// las vistas, reportes, transferencias y tickets (defaultScope de la cabecera).
+// Reglas:
+// - Solo usuarios con nivel 'escritura' o 'lectura_division' en el menú de
+//   Pedidos de Pollo (POLLO) o de Insumos (insumos, activo fijo, verduras).
+//   Con 'lectura_division', solo pedidos de tiendas de SU división.
+// - Solo pedidos en estado RECIBIDO; cualquier otro estado se rechaza.
+// - La ruta+fecha del pedido no puede estar tomada (candado) por OTRO usuario.
+// - El motivo es obligatorio.
+// Solo cambia el estado en Core (más el registro en el historial): no toca
+// SAP, ni las líneas de detalle, ni nada más.
+// ------------------------------------------------------------
+const ESTADOS_CANCELABLES = ['RECIBIDO'];
+const NIVELES_QUE_CANCELAN = ['escritura', 'lectura_division'];
+const MENU_POR_TIPO_PEDIDO = { POLLO: 'PedidosPolloView' };
+const MENU_PEDIDOS_INSUMOS = 'PedidosInsumosView';
+const MOTIVO_CANCELACION_MIN = 5;
+const MOTIVO_CANCELACION_MAX = 500;
+
+async function cancelarPedido(req, res) {
+    const { pedido_id } = req.body;
+    const motivo = typeof req.body.motivo === 'string' ? req.body.motivo.trim() : '';
+    const id_usuario = req.user && req.user.id_usuario;
+    const usuario = (req.user && (req.user.nombre || req.user.id_usuario)) || null;
+
+    if (!pedido_id) {
+        return res.status(400).json({ error: 'pedido_id es requerido', success: false });
+    }
+
+    if (motivo.length < MOTIVO_CANCELACION_MIN || motivo.length > MOTIVO_CANCELACION_MAX) {
+        return res.status(400).json({
+            error: `Indica el motivo de la cancelación (entre ${MOTIVO_CANCELACION_MIN} y ${MOTIVO_CANCELACION_MAX} caracteres)`,
+            success: false
+        });
+    }
+
+    const t = await sequelizeInit.sequelize.transaction();
+
+    try {
+        const pedido = await PedidoPosCabeceraModel.findByPk(pedido_id, { transaction: t, lock: t.LOCK.UPDATE });
+
+        if (!pedido) {
+            await t.rollback();
+            return res.status(404).json({ error: 'El pedido no existe o ya fue cancelado', success: false });
+        }
+
+        // Permiso: nivel del rol del usuario sobre el menú de ese tipo de pedido.
+        const nombreMenu = MENU_POR_TIPO_PEDIDO[pedido.tipo_pedido] || MENU_PEDIDOS_INSUMOS;
+        const nivel = await nivelPermisoDeMenu(req, nombreMenu);
+
+        if (!NIVELES_QUE_CANCELAN.includes(nivel)) {
+            await t.rollback();
+            return res.status(403).json({
+                error: 'No tienes permiso para cancelar pedidos (requiere escritura o lectura por división)',
+                success: false
+            });
+        }
+
+        if (nivel === 'lectura_division') {
+            const usuarioPioapp = await UsersModel.findByPk(id_usuario, { attributes: ['division'] });
+            const miDivision = usuarioPioapp && usuarioPioapp.division !== null && usuarioPioapp.division !== undefined
+                ? String(usuarioPioapp.division).trim()
+                : null;
+            const divisionTienda = (await obtenerMapaDivisionPorTienda()).get(pedido.codigo_tienda) || null;
+
+            if (!miDivision || divisionTienda !== miDivision) {
+                await t.rollback();
+                return res.status(403).json({
+                    error: 'Solo puedes cancelar pedidos de tiendas de tu división',
+                    success: false
+                });
+            }
+        }
+
+        const estadoAnterior = pedido.estado;
+
+        if (!ESTADOS_CANCELABLES.includes(estadoAnterior)) {
+            await t.rollback();
+            return res.status(409).json({
+                error: `Solo se pueden cancelar pedidos en estado RECIBIDO; este pedido está en estado ${estadoAnterior}`,
+                success: false
+            });
+        }
+
+        if (pedido.ruta_id) {
+            const BloqueoModel = pedido.tipo_pedido === 'POLLO' ? BloqueoRutaPolloModel : BloqueoRutaInsumosModel;
+            const candadoAjeno = await BloqueoModel.findOne({
+                where: {
+                    ruta_id: pedido.ruta_id,
+                    fecha: pedido.fecha_requerida,
+                    estado: 'ACTIVO',
+                    id_usuario: { [Op.ne]: id_usuario }
+                },
+                transaction: t
+            });
+
+            if (candadoAjeno) {
+                await t.rollback();
+                return res.status(409).json({
+                    error: `La ruta ${pedido.nombre_ruta || ''} está en proceso por otro usuario para el ${fechaDdMmAaaa(candadoAjeno.fecha)}. Debe liberarla antes de cancelar el pedido.`,
+                    success: false
+                });
+            }
+        }
+
+        const ahora = new Date();
+
+        await pedido.update({
+            estado: PedidoPosCabeceraModel.ESTADO_CANCELADO,
+            actualizado_en: ahora
+        }, { transaction: t });
+
+        await PedidoPosHistorialModel.create({
+            pedido_id,
+            estado_anterior: estadoAnterior,
+            estado_nuevo: PedidoPosCabeceraModel.ESTADO_CANCELADO,
+            usuario,
+            comentario: `Pedido cancelado. Motivo: ${motivo}`,
+            fecha: ahora
+        }, { transaction: t });
+
+        await t.commit();
+
+        return res.json({
+            success: true,
+            pedido_id,
+            numero_pedido: pedido.numero_pedido,
+            estado: PedidoPosCabeceraModel.ESTADO_CANCELADO
+        });
+    } catch (error) {
+        await t.rollback();
+
+        return res.status(500).json({
+            error: 'Error al cancelar el pedido',
             details: error.message,
             success: false
         });
@@ -639,6 +802,72 @@ function formatearFechaOracle(valor) {
     return `${anio}-${mes}-${dia}`;
 }
 
+// ------------------------------------------------------------
+// Verduras (Corporación RM). Un pedido de CORPORACION RM es VERDURA si
+// TODAS sus líneas son artículos de logistica.tbl_articulos_verdura,
+// INSUMOS si ninguna lo es, e INVALIDO si mezcla ambos (se registra
+// como RECHAZADO, sin ruta, y no aparece en ninguna vista).
+// ------------------------------------------------------------
+const TIPO_PEDIDO_VERDURA = 'VERDURA';
+const TIPO_PEDIDO_INVALIDO = 'INVALIDO';
+const ESTADO_RECHAZADO = 'RECHAZADO';
+const DIAS_ENTREGA_VERDURA = [4, 5]; // jueves, viernes (Date.getUTCDay)
+
+async function clasificarPedidoCorporacionRm(lineas, transaction) {
+    const articulos = await ArticuloVerduraModel.findAll({
+        where: { activo: true },
+        attributes: ['codigo_producto'],
+        transaction
+    });
+    const codigosVerdura = new Set(articulos.map(a => a.codigo_producto.trim().toUpperCase()));
+
+    const totalVerdura = lineas.filter(l =>
+        codigosVerdura.has((l.item_no || '').trim().toUpperCase())
+    ).length;
+
+    if (totalVerdura === 0) return 'INSUMOS';
+    if (totalVerdura === lineas.length) return TIPO_PEDIDO_VERDURA;
+    return TIPO_PEDIDO_INVALIDO;
+}
+
+function fechaIsoAUtc(fechaIso) {
+    return new Date(`${fechaIso}T00:00:00Z`);
+}
+
+function utcAFechaIso(fecha) {
+    return fecha.toISOString().substring(0, 10);
+}
+
+function esDiaEntregaVerdura(fechaIso) {
+    return !!fechaIso && DIAS_ENTREGA_VERDURA.includes(fechaIsoAUtc(fechaIso).getUTCDay());
+}
+
+// Regla de corte de verduras: se entregan jueves/viernes y el corte es el
+// lunes 23:59 de esa misma semana (según fecha_pedido). Si el pedido se hizo
+// después del lunes, la entrega pasa al jueves/viernes de la semana
+// siguiente. Si fecha_requerida no es jueves/viernes no se mueve (se corrige
+// con el cambio manual de fecha). Devuelve la fecha ISO final.
+function ajustarFechaEntregaVerdura(fechaRequeridaIso, fechaPedidoIso) {
+    if (!esDiaEntregaVerdura(fechaRequeridaIso) || !fechaPedidoIso) {
+        return fechaRequeridaIso;
+    }
+
+    const entrega = fechaIsoAUtc(fechaRequeridaIso);
+    const pedido = fechaIsoAUtc(fechaPedidoIso);
+    const DIA_MS = 24 * 60 * 60 * 1000;
+
+    // Lunes de la semana de entrega (jueves -> -3 días, viernes -> -4)
+    const lunesDeCorte = new Date(entrega.getTime() - (entrega.getUTCDay() - 1) * DIA_MS);
+
+    // Se repite por si el pedido se hizo con más de una semana de atraso
+    while (pedido > lunesDeCorte) {
+        entrega.setTime(entrega.getTime() + 7 * DIA_MS);
+        lunesDeCorte.setTime(lunesDeCorte.getTime() + 7 * DIA_MS);
+    }
+
+    return utcAFechaIso(entrega);
+}
+
 function parsearLineaArchivo(lineaTexto) {
     const campos = lineaTexto.split('|');
 
@@ -758,8 +987,24 @@ async function guardarPedidoPos(datosPedido, archivo_origen) {
         // tipo_pedido se clasifica por el NOMBRE del proveedor, no por su ID
         // (el Vendor ID de AVICOLA GUADALUPE ha cambiado entre archivos: "1004",
         // "CLI0011"... el nombre es el dato estable).
-        const esAvicolaGuadalupe = (vendor_name || '').trim().toUpperCase().includes('AVICOLA GUADALUPE');
-        const tipo_pedido = vendor_name ? (esAvicolaGuadalupe ? 'POLLO' : 'INSUMOS') : null;
+        const vendorNormalizado = (vendor_name || '').trim().toUpperCase();
+        let tipo_pedido = null;
+
+        if (vendor_name) {
+            if (vendorNormalizado.includes('AVICOLA GUADALUPE')) {
+                tipo_pedido = 'POLLO';
+            } else if (vendorNormalizado.includes('CORPORACION RM')) {
+                tipo_pedido = await clasificarPedidoCorporacionRm(lineas, t);
+            } else {
+                tipo_pedido = 'INSUMOS';
+            }
+        }
+
+        // Pedido que mezcla verduras con insumos: se guarda para dejar
+        // registro, pero rechazado y sin ruta.
+        if (tipo_pedido === TIPO_PEDIDO_INVALIDO) {
+            estado_inicial = ESTADO_RECHAZADO;
+        }
 
         // nombre_bodega: SAP (Warehouses/OWHS) no trae el nombre en tTienda,
         // solo el WhsCode. Queda pendiente resolverlo si se necesita mostrar
@@ -774,7 +1019,7 @@ async function guardarPedidoPos(datosPedido, archivo_origen) {
         // todavía usa el maestro viejo hasta que se construya el suyo propio.
         // Sin tienda en tTienda no se asigna ruta: así el pedido queda fuera
         // de la asignación/validación/envío de la ruta hasta enriquecerse.
-        if (delivery_location_id && estado_inicial !== ESTADO_PENDIENTE_ENRIQUECIMIENTO) {
+        if (delivery_location_id && estado_inicial === 'RECIBIDO') {
             if (tipo_pedido === 'POLLO') {
                 const asignacionRutaPollo = await TiendaRutaPolloModel.findOne({
                     where: {
@@ -790,12 +1035,21 @@ async function guardarPedidoPos(datosPedido, archivo_origen) {
                     nombre_ruta = asignacionRutaPollo.ruta.nombre_ruta;
                 }
             } else {
+                // La tienda puede tener una ruta de INSUMOS y otra de VERDURA:
+                // se toma la del tipo que corresponde al pedido.
+                const tipoRutaBuscada = tipo_pedido === TIPO_PEDIDO_VERDURA ? 'VERDURA' : 'INSUMOS';
+
                 const asignacionRutaInsumos = await TiendaRutaInsumosModel.findOne({
                     where: {
                         id_tienda_simphony: delivery_location_id,
                         fecha_fin_asignacion: null
                     },
-                    include: [{ model: CatalogoRutaInsumosModel, as: 'ruta' }],
+                    include: [{
+                        model: CatalogoRutaInsumosModel,
+                        as: 'ruta',
+                        where: { tipo_ruta: tipoRutaBuscada },
+                        required: true
+                    }],
                     transaction: t
                 });
 
@@ -811,9 +1065,26 @@ async function guardarPedidoPos(datosPedido, archivo_origen) {
         // fecha_requerida: se toma de la primera línea, asumiendo que todas
         // las líneas del pedido comparten la misma fecha (así viene en la
         // práctica en los archivos reales).
-        const fecha_requerida = lineas.length > 0
+        const fecha_requerida_original = lineas.length > 0
             ? formatearFechaOracle(lineas[0].fecha_entrega)
             : null;
+
+        // Verduras: si se pidió después del corte del lunes, la entrega pasa
+        // a la semana siguiente (cabecera y detalle quedan con la misma fecha).
+        const esVerdura = tipo_pedido === TIPO_PEDIDO_VERDURA;
+        const fecha_requerida = esVerdura
+            ? ajustarFechaEntregaVerdura(fecha_requerida_original, formatearFechaOracle(fecha_pedido))
+            : fecha_requerida_original;
+
+        const comentariosHistorial = ['Pedido recibido desde middleware Oracle Simphony'];
+        if (tipo_pedido === TIPO_PEDIDO_INVALIDO) {
+            comentariosHistorial.push('Rechazado: el pedido mezcla artículos de verduras con insumos');
+        }
+        if (esVerdura && fecha_requerida !== fecha_requerida_original) {
+            comentariosHistorial.push(
+                `Fecha requerida movida de ${fecha_requerida_original} a ${fecha_requerida} por corte del lunes (verduras)`
+            );
+        }
 
         const cabecera = await PedidoPosCabeceraModel.create({
             codigo_empresa: codigo_empresa,
@@ -851,7 +1122,7 @@ async function guardarPedidoPos(datosPedido, archivo_origen) {
             codigo_producto: linea.item_no || null,
             descripcion_producto: linea.nombre_articulo,
             unidad_medida: linea.unidad_orden,
-            fecha_requerida: formatearFechaOracle(linea.fecha_entrega),
+            fecha_requerida: esVerdura ? fecha_requerida : formatearFechaOracle(linea.fecha_entrega),
             cantidad_solicitada: linea.cantidad,
             factor: linea.factor || 1,
             precio_unitario: linea.precio || null,
@@ -868,7 +1139,7 @@ async function guardarPedidoPos(datosPedido, archivo_origen) {
             estado_anterior: null,
             estado_nuevo: estado_inicial,
             usuario: null,
-            comentario: 'Pedido recibido desde middleware Oracle Simphony',
+            comentario: comentariosHistorial.join('. '),
             fecha: ahora
         }, { transaction: t });
 
@@ -967,6 +1238,7 @@ function agruparPedidosPosPorRuta(pedidos, esInsumos) {
     const mapearPedido = (p) => ({
         pedido_id: p.id,
         numero_pedido: p.numero_pedido,
+        tipo_pedido: p.tipo_pedido,
         fecha_pedido: p.fecha_pedido,
         hora_pedido: p.hora_pedido,
         fecha_requerida: p.fecha_requerida,
@@ -1049,7 +1321,12 @@ function agruparPedidosPosPorRuta(pedidos, esInsumos) {
         const sap_docnum = pedidoConDoc ? docnumDe(pedidoConDoc) : null;
         const sap_docentry = pedidoConDoc ? docentryDe(pedidoConDoc) : null;
 
-        return { ...ruta, estado_general, sap_docnum, sap_docentry };
+        // Ruta de verduras (13/14): todos sus pedidos son VERDURA. El frontend
+        // lo usa para etiquetarla como "Verduras".
+        const es_verdura = esInsumos && ruta.tiendas.length > 0 &&
+            ruta.tiendas.every(t => t.insumos?.tipo_pedido === TIPO_PEDIDO_VERDURA);
+
+        return { ...ruta, estado_general, sap_docnum, sap_docentry, es_verdura };
     });
 }
 
@@ -1072,10 +1349,10 @@ async function getPedidosPos(req, res) {
 
     try {
         // POLLO no cambia (una base SAP separada, AVIGUA, no se fusiona con nada).
-        // INSUMOS ahora también trae ACTIVO_FIJO (misma bodega/base SAP), para
-        // fusionar en una sola tarjeta por tienda los pedidos de ambos tipos.
+        // INSUMOS ahora también trae ACTIVO_FIJO y VERDURA (misma bodega/base
+        // SAP); las verduras quedan en sus propias rutas (13/14).
         const esInsumos = tipo_pedido === 'INSUMOS';
-        const tiposConsulta = esInsumos ? TIPOS_INSUMOS_Y_ACTIVO_FIJO : [tipo_pedido];
+        const tiposConsulta = esInsumos ? TIPOS_FLUJO_INSUMOS : [tipo_pedido];
 
         const whereCabecera = { tipo_pedido: { [Op.in]: tiposConsulta }, fecha_requerida };
 
@@ -1203,7 +1480,7 @@ async function getPedidosPorDivision(req, res) {
         }
 
         const esInsumos = tipo_pedido === 'INSUMOS';
-        const tiposConsulta = esInsumos ? TIPOS_INSUMOS_Y_ACTIVO_FIJO : [tipo_pedido];
+        const tiposConsulta = esInsumos ? TIPOS_FLUJO_INSUMOS : [tipo_pedido];
 
         const pedidos = await PedidoPosCabeceraModel.findAll({
             where: {
@@ -1542,7 +1819,7 @@ async function getComparativoStockInsumos(req, res) {
                 model: PedidoPosCabeceraModel,
                 as: 'cabecera',
                 attributes: [],
-                where: { tipo_pedido: { [Op.in]: TIPOS_INSUMOS_Y_ACTIVO_FIJO }, fecha_requerida: fecha, ruta_id, estado: { [Op.ne]: ESTADO_PENDIENTE_ENRIQUECIMIENTO } }
+                where: { tipo_pedido: { [Op.in]: TIPOS_FLUJO_INSUMOS }, fecha_requerida: fecha, ruta_id, estado: { [Op.ne]: ESTADO_PENDIENTE_ENRIQUECIMIENTO } }
             }],
             group: ['codigo_producto'],
             subQuery: false,
@@ -1894,7 +2171,7 @@ async function enviarTransferenciaInsumos(req, res) {
                 model: PedidoPosCabeceraModel,
                 as: 'cabecera',
                 attributes: [],
-                where: { tipo_pedido: { [Op.in]: TIPOS_INSUMOS_Y_ACTIVO_FIJO }, fecha_requerida: fecha, ruta_id, estado: { [Op.ne]: ESTADO_PENDIENTE_ENRIQUECIMIENTO } }
+                where: { tipo_pedido: { [Op.in]: TIPOS_FLUJO_INSUMOS }, fecha_requerida: fecha, ruta_id, estado: { [Op.ne]: ESTADO_PENDIENTE_ENRIQUECIMIENTO } }
             }],
             where: { cantidad_asignada: { [Op.gt]: 0 } },
             group: ['codigo_producto'],
@@ -1922,7 +2199,7 @@ async function enviarTransferenciaInsumos(req, res) {
         }));
 
         const cabecerasAfectadas = await PedidoPosCabeceraModel.findAll({
-            where: { tipo_pedido: { [Op.in]: TIPOS_INSUMOS_Y_ACTIVO_FIJO }, fecha_requerida: fecha, ruta_id, estado: { [Op.ne]: ESTADO_PENDIENTE_ENRIQUECIMIENTO } },
+            where: { tipo_pedido: { [Op.in]: TIPOS_FLUJO_INSUMOS }, fecha_requerida: fecha, ruta_id, estado: { [Op.ne]: ESTADO_PENDIENTE_ENRIQUECIMIENTO } },
             attributes: ['id', 'numero_pedido', 'codigo_tienda']
         });
         const idsPedidos = cabecerasAfectadas.map(c => c.id);
@@ -2293,7 +2570,7 @@ async function generarTicketInsumos(req, res) {
         }
 
         const cabecera = await PedidoPosCabeceraModel.findOne({
-            where: { tipo_pedido: { [Op.in]: TIPOS_INSUMOS_Y_ACTIVO_FIJO }, fecha_requerida: fecha, ruta_id, estado: { [Op.in]: ESTADOS_TICKET_VISIBLE } }
+            where: { tipo_pedido: { [Op.in]: TIPOS_FLUJO_INSUMOS }, fecha_requerida: fecha, ruta_id, estado: { [Op.in]: ESTADOS_TICKET_VISIBLE } }
         });
 
         if (!cabecera) {
@@ -2314,7 +2591,7 @@ async function generarTicketInsumos(req, res) {
                 model: PedidoPosCabeceraModel,
                 as: 'cabecera',
                 attributes: [],
-                where: { tipo_pedido: { [Op.in]: TIPOS_INSUMOS_Y_ACTIVO_FIJO }, fecha_requerida: fecha, ruta_id }
+                where: { tipo_pedido: { [Op.in]: TIPOS_FLUJO_INSUMOS }, fecha_requerida: fecha, ruta_id }
             }],
             where: { cantidad_asignada: { [Op.gt]: 0 } },
             group: ['codigo_producto'],
@@ -2384,7 +2661,7 @@ async function generarResumenRutaInsumos(req, res) {
         }
 
         const cabeceras = await PedidoPosCabeceraModel.findAll({
-            where: { tipo_pedido: { [Op.in]: TIPOS_INSUMOS_Y_ACTIVO_FIJO }, fecha_requerida: fecha, ruta_id },
+            where: { tipo_pedido: { [Op.in]: TIPOS_FLUJO_INSUMOS }, fecha_requerida: fecha, ruta_id },
             attributes: ['id', 'codigo_tienda', 'nombre_tienda', 'estado']
         });
 
@@ -2702,7 +2979,10 @@ function construirBloquesPedido(cabeceras) {
             ruta_id: p.ruta_id || 'sin_ruta',
             nombre_ruta: p.nombre_ruta || 'Sin ruta asignada',
             nombre_tienda: p.nombre_tienda || p.codigo_tienda,
-            label: p.tipo_pedido === 'ACTIVO_FIJO' ? 'Activo Fijo' : (p.tipo_pedido === 'INSUMOS' ? 'Insumos' : null),
+            label: p.tipo_pedido === 'ACTIVO_FIJO' ? 'Activo Fijo'
+                : p.tipo_pedido === 'INSUMOS' ? 'Insumos'
+                : p.tipo_pedido === TIPO_PEDIDO_VERDURA ? 'Verduras'
+                : null,
             numero_pedido: p.numero_pedido,
             estado: p.estado,
             fecha_requerida: p.fecha_requerida,
@@ -2812,7 +3092,7 @@ function dibujarPdfQrsRuta(res, { nombreRuta, fecha, bloques, carga = null, nomb
         doc.text('Artículo', colNombre, yEncabezado, { width: anchoNombre });
         doc.text('Pedido', colPedido, yEncabezado, { width: anchoPedido, align: 'center' });
         doc.text('Enviado', colEnviado, yEncabezado, { width: anchoEnviado, align: 'center' });
-        doc.text('Diferencia', colDif, yEncabezado, { width: anchoDif, align: 'center' });
+        doc.text(COLUMNA_NO_ENVIADO, colDif, yEncabezado, { width: anchoDif, align: 'center' });
         doc.y = yEncabezado + 12;
         doc.moveTo(startX, doc.y).lineTo(startX + anchoUtil, doc.y).strokeColor('#999999').stroke();
         doc.moveDown(0.2);
@@ -2928,12 +3208,36 @@ function resumenEstadosPedidos(rutasConBloques) {
     return [...conteo.entries()].map(([texto, n]) => `${n} ${texto}`).join('   ·   ');
 }
 
+// Nombres de las columnas de diferencia (mismos en PDF y Excel):
+// - No enviado: lo que la tienda pidió y la sede no puso en el camión (Pedido − Enviado).
+// - No recibido vs pedido: lo que a la tienda le faltó contra su pedido (Pedido − Recibido).
+// - No recibido vs enviado: lo que salió en el camión y la tienda no recibió (Enviado − Recibido).
+// Las dos últimas solo salen cuando el reporte ya tiene pedidos entregados,
+// igual que la columna "Recibido".
+const COLUMNA_NO_ENVIADO = 'No enviado';
+const COLUMNA_NO_RECIBIDO_VS_PEDIDO = 'No recibido vs pedido';
+const COLUMNA_NO_RECIBIDO_VS_ENVIADO = 'No recibido vs enviado';
+
+// Cantidades de una línea (o de un total) con las tres diferencias. Si la
+// tienda todavía no confirmó la línea (recibido null), las diferencias contra
+// lo recibido también quedan null.
+function calcularDiferencias({ pedido, enviado, recibido }) {
+    const hayRecibido = recibido !== null && recibido !== undefined;
+
+    return {
+        noEnviado: pedido - enviado,
+        noRecibidoVsPedido: hayRecibido ? pedido - recibido : null,
+        noRecibidoVsEnviado: hayRecibido ? enviado - recibido : null
+    };
+}
+
 function crearLayoutTabla(doc, mostrarRecibido) {
     const startX = doc.page.margins.left;
     const anchoUtil = doc.page.width - doc.page.margins.left - doc.page.margins.right;
     const anchoCodigo = 60;
-    const anchoNum = mostrarRecibido ? 60 : 70;
-    const columnasNumericas = mostrarRecibido ? 4 : 3;
+    // Con entregas: Pedido, Enviado, Recibido y las 3 diferencias.
+    const anchoNum = mostrarRecibido ? 52 : 70;
+    const columnasNumericas = mostrarRecibido ? 6 : 3;
     const anchoNombre = anchoUtil - anchoCodigo - anchoNum * columnasNumericas;
 
     const colCodigo = startX;
@@ -2941,34 +3245,54 @@ function crearLayoutTabla(doc, mostrarRecibido) {
     const colPedido = colNombre + anchoNombre;
     const colEnviado = colPedido + anchoNum;
     const colRecibido = mostrarRecibido ? colEnviado + anchoNum : null;
-    const colDif = (mostrarRecibido ? colRecibido : colEnviado) + anchoNum;
+    const colNoEnviado = (mostrarRecibido ? colRecibido : colEnviado) + anchoNum;
+    const colNoRecibidoVsPedido = mostrarRecibido ? colNoEnviado + anchoNum : null;
+    const colNoRecibidoVsEnviado = mostrarRecibido ? colNoRecibidoVsPedido + anchoNum : null;
 
     return {
         startX, anchoUtil, anchoCodigo, anchoNombre, anchoNum, mostrarRecibido,
-        colCodigo, colNombre, colPedido, colEnviado, colRecibido, colDif
+        colCodigo, colNombre, colPedido, colEnviado, colRecibido,
+        colNoEnviado, colNoRecibidoVsPedido, colNoRecibidoVsEnviado
     };
 }
 
 function dibujarEncabezadoTabla(doc, L) {
     const y = doc.y;
+    const encabezados = [
+        ['Pedido', L.colPedido],
+        ['Enviado', L.colEnviado],
+        ...(L.mostrarRecibido ? [['Recibido', L.colRecibido]] : []),
+        [COLUMNA_NO_ENVIADO, L.colNoEnviado],
+        ...(L.mostrarRecibido ? [
+            [COLUMNA_NO_RECIBIDO_VS_PEDIDO, L.colNoRecibidoVsPedido],
+            [COLUMNA_NO_RECIBIDO_VS_ENVIADO, L.colNoRecibidoVsEnviado]
+        ] : [])
+    ];
 
     doc.font('Helvetica-Bold').fontSize(8).fillColor('#000000');
+
+    // Los nombres de las diferencias pueden ocupar 2 líneas: el alto del
+    // encabezado es el del texto más alto.
+    const altoEncabezado = Math.max(
+        10,
+        ...encabezados.map(([texto]) => doc.heightOfString(texto, { width: L.anchoNum, align: 'center' }))
+    );
+
     doc.text('Código', L.colCodigo, y, { width: L.anchoCodigo });
     doc.text('Artículo', L.colNombre, y, { width: L.anchoNombre });
-    doc.text('Pedido', L.colPedido, y, { width: L.anchoNum, align: 'center' });
-    doc.text('Enviado', L.colEnviado, y, { width: L.anchoNum, align: 'center' });
-    if (L.mostrarRecibido) {
-        doc.text('Recibido', L.colRecibido, y, { width: L.anchoNum, align: 'center' });
-    }
-    doc.text('Diferencia', L.colDif, y, { width: L.anchoNum, align: 'center' });
+    encabezados.forEach(([texto, x]) => {
+        doc.text(texto, x, y, { width: L.anchoNum, align: 'center' });
+    });
 
-    doc.y = y + 12;
+    doc.y = y + altoEncabezado + 2;
     doc.moveTo(L.startX, doc.y).lineTo(L.startX + L.anchoUtil, doc.y).strokeColor('#999999').stroke();
     doc.moveDown(0.2);
 }
 
 function dibujarFilaTabla(doc, L, { codigo, nombre, pedido, enviado, recibido, negritaPedido }) {
     const y = doc.y;
+    const texto = (valor) => (valor === null || valor === undefined ? '—' : String(valor));
+    const dif = calcularDiferencias({ pedido, enviado, recibido });
 
     doc.font('Helvetica').fontSize(8).fillColor('#000000');
     doc.text(codigo || '—', L.colCodigo, y, { width: L.anchoCodigo });
@@ -2978,10 +3302,13 @@ function dibujarFilaTabla(doc, L, { codigo, nombre, pedido, enviado, recibido, n
     doc.font('Helvetica');
     doc.text(String(enviado), L.colEnviado, y, { width: L.anchoNum, align: 'center' });
     if (L.mostrarRecibido) {
-        const textoRecibido = recibido === null || recibido === undefined ? '—' : String(recibido);
-        doc.text(textoRecibido, L.colRecibido, y, { width: L.anchoNum, align: 'center' });
+        doc.text(texto(recibido), L.colRecibido, y, { width: L.anchoNum, align: 'center' });
     }
-    doc.text(String(pedido - enviado), L.colDif, y, { width: L.anchoNum, align: 'center' });
+    doc.text(String(dif.noEnviado), L.colNoEnviado, y, { width: L.anchoNum, align: 'center' });
+    if (L.mostrarRecibido) {
+        doc.text(texto(dif.noRecibidoVsPedido), L.colNoRecibidoVsPedido, y, { width: L.anchoNum, align: 'center' });
+        doc.text(texto(dif.noRecibidoVsEnviado), L.colNoRecibidoVsEnviado, y, { width: L.anchoNum, align: 'center' });
+    }
 
     doc.y = y + 14;
 }
@@ -3135,10 +3462,10 @@ function dibujarRutasConBloques(doc, L, rutasConBloques, { conEntregas, conCarga
 // Dibuja el PDF del reporte de pedidos por RANGO de fechas (búsqueda
 // avanzada). Es un documento distinto al de una sola fecha: primero un
 // resumen general de todo el rango y luego una sección por fecha de entrega,
-// cada una en hoja nueva, con sus rutas y pedidos. No lleva "tiendas sin
-// pedido" (esa sección solo tiene sentido para un día).
+// cada una en hoja nueva, con sus rutas y pedidos. Solo el de verduras lleva
+// "tiendas sin pedido", por semana y por jueves/viernes (faltantesPorSemana).
 // fechas: [{ fecha, rutasConBloques }] ordenadas por fecha.
-function dibujarPdfDetalleRango(res, { fechaDesde, fechaHasta, fechas, nombreArchivo, descripcionFiltros, conCarga = false }) {
+function dibujarPdfDetalleRango(res, { fechaDesde, fechaHasta, fechas, nombreArchivo, descripcionFiltros, conCarga = false, faltantesPorSemana = null }) {
     const doc = new PDFDocument({ margin: 40, size: 'LETTER' });
 
     res.setHeader('Content-Type', 'application/pdf');
@@ -3176,6 +3503,10 @@ function dibujarPdfDetalleRango(res, { fechaDesde, fechaHasta, fechas, nombreArc
 
         dibujarRutasConBloques(doc, L, rutasConBloques, { conEntregas, conCarga });
     });
+
+    if (faltantesPorSemana) {
+        dibujarFaltantesPorSemana(doc, L, faltantesPorSemana);
+    }
 
     doc.end();
 }
@@ -3237,9 +3568,17 @@ function dibujarPdfDetallePorRuta(res, { fecha, rutasConBloques, nombreArchivo, 
     doc.moveTo(startX, doc.y + 2).lineTo(startX + anchoUtil, doc.y + 2).strokeColor('#2183AE').stroke();
     doc.moveDown(0.6);
 
+    dibujarListaFaltantes(doc, startX, faltantes, 'Todas las tiendas asignadas hicieron pedido para esta fecha.');
+
+    doc.end();
+}
+
+// Lista de tiendas sin pedido ([{ division, rutas: [{ nombre_ruta, tiendas }] }]),
+// por división y por ruta. La usan el reporte de una fecha y el de rango
+// de verduras (una lista por cada jueves/viernes).
+function dibujarListaFaltantes(doc, startX, faltantes, mensajeVacio) {
     if (faltantes.length === 0) {
-        doc.font('Helvetica').fontSize(9).fillColor('#6b7280')
-            .text('Todas las tiendas asignadas hicieron pedido para esta fecha.', startX);
+        doc.font('Helvetica').fontSize(9).fillColor('#6b7280').text(mensajeVacio, startX);
         doc.fillColor('#000000');
     }
 
@@ -3267,8 +3606,41 @@ function dibujarPdfDetallePorRuta(res, { fecha, rutasConBloques, nombreArchivo, 
 
         doc.moveDown(0.4);
     });
+}
 
-    doc.end();
+// Tiendas sin pedido del reporte de rango de verduras, agrupadas por semana y
+// luego por día de entrega (jueves/viernes).
+// faltantesPorSemana: [{ semana, lunes, domingo, dias: [{ fecha, nombre_dia, faltantes }] }]
+function dibujarFaltantesPorSemana(doc, L, faltantesPorSemana) {
+    const { startX, anchoUtil } = L;
+
+    doc.addPage();
+    doc.font('Helvetica-Bold').fontSize(12).fillColor('#2183AE');
+    doc.text('Tiendas sin pedido por semana (jueves y viernes)', startX);
+    doc.fillColor('#000000');
+    doc.moveTo(startX, doc.y + 2).lineTo(startX + anchoUtil, doc.y + 2).strokeColor('#2183AE').stroke();
+    doc.moveDown(0.6);
+
+    faltantesPorSemana.forEach((semana, indice) => {
+        if (indice > 0) doc.addPage();
+
+        doc.font('Helvetica-Bold').fontSize(13).fillColor('#111827');
+        doc.text(`Semana ${semana.semana}  (${fechaDdMmAaaa(semana.lunes)} al ${fechaDdMmAaaa(semana.domingo)})`, startX);
+        doc.fillColor('#000000');
+        doc.moveDown(0.5);
+
+        semana.dias.forEach((dia) => {
+            if (doc.y + 50 > doc.page.height - doc.page.margins.bottom) doc.addPage();
+
+            doc.font('Helvetica-Bold').fontSize(11).fillColor('#374151');
+            doc.text(`${dia.nombre_dia} ${fechaDdMmAaaa(dia.fecha)}`, startX);
+            doc.fillColor('#000000');
+            doc.moveDown(0.3);
+
+            dibujarListaFaltantes(doc, startX + 8, dia.faltantes, 'Todas las tiendas asignadas hicieron pedido para este día.');
+            doc.moveDown(0.4);
+        });
+    });
 }
 
 // Dibuja el PDF de generarReporteEnTransito*: carta vertical, pedidos que ya
@@ -3393,21 +3765,71 @@ async function enviarLibroExcel(res, libro, nombreArchivo) {
     res.end();
 }
 
+// Reportes de la vista de insumos: "Insumos" (Insumos + Activo Fijo, rutas de
+// tipo INSUMOS) y "Verduras" (rutas de tipo VERDURA) son reportes separados,
+// nunca mezclados. Se elige con el parámetro `categoria` (por defecto INSUMOS).
+const CATEGORIAS_REPORTE_INSUMOS = {
+    INSUMOS: { tiposPedido: TIPOS_INSUMOS_Y_ACTIVO_FIJO, tipoRuta: 'INSUMOS', titulo: 'Insumos y Activo Fijo', prefijo: 'insumos' },
+    VERDURA: { tiposPedido: [TIPO_PEDIDO_VERDURA], tipoRuta: 'VERDURA', titulo: 'Verduras', prefijo: 'verduras' }
+};
+
+function parsearCategoriaReporte(valor) {
+    const clave = String(valor || 'INSUMOS').trim().toUpperCase();
+    const categoria = CATEGORIAS_REPORTE_INSUMOS[clave];
+
+    if (!categoria) {
+        throw new Error("categoria debe ser 'INSUMOS' o 'VERDURA'");
+    }
+
+    return { clave, ...categoria };
+}
+
+const NOMBRE_DIA_ENTREGA_VERDURA = { 4: 'Jueves', 5: 'Viernes' };
+
+// Jueves y viernes de un rango, agrupados por semana (de lunes a domingo):
+// [{ semana: 1, lunes, domingo, fechas: ['2026-11-12', '2026-11-13'] }, ...]
+function fechasEntregaVerduraPorSemana(fechaDesde, fechaHasta) {
+    const DIA_MS = 24 * 60 * 60 * 1000;
+    const hasta = fechaIsoAUtc(fechaHasta);
+    const semanas = new Map();
+
+    for (let dia = fechaIsoAUtc(fechaDesde); dia <= hasta; dia = new Date(dia.getTime() + DIA_MS)) {
+        if (!DIAS_ENTREGA_VERDURA.includes(dia.getUTCDay())) continue;
+
+        const lunes = utcAFechaIso(new Date(dia.getTime() - (dia.getUTCDay() - 1) * DIA_MS));
+        if (!semanas.has(lunes)) semanas.set(lunes, []);
+        semanas.get(lunes).push(utcAFechaIso(dia));
+    }
+
+    return [...semanas.entries()].map(([lunes, fechas], indice) => ({
+        semana: indice + 1,
+        lunes,
+        domingo: utcAFechaIso(new Date(fechaIsoAUtc(lunes).getTime() + 6 * DIA_MS)),
+        fechas
+    }));
+}
+
 // Tiendas asignadas a las rutas del reporte (activas y con la tienda vigente
 // en esa fecha), dentro de la división y muelle pedidos, que NO tienen ningún
 // pedido para la fecha. Devuelve [{ division, rutas: [{ nombre_ruta, tiendas }] }].
 // Un pedido de cualquier tipo del reporte cuenta (en Insumos, Insumos o
 // Activo Fijo): la tienda sale en la lista solo si no aparece en el reporte.
-async function calcularTiendasSinPedido({ esPollo, fecha, divisiones, muelles }) {
+// En la vista de insumos, `categoria` (ver CATEGORIAS_REPORTE_INSUMOS) decide
+// qué rutas cuentan (INSUMOS o VERDURA) y qué tipos de pedido.
+async function calcularTiendasSinPedido({ esPollo, fecha, divisiones, muelles, categoria = CATEGORIAS_REPORTE_INSUMOS.INSUMOS }) {
     const CatalogoRutaModel = esPollo ? CatalogoRutaPolloModel : CatalogoRutaInsumosModel;
     const TiendaRutaModel = esPollo ? TiendaRutaPolloModel : TiendaRutaInsumosModel;
-    const tiposPedido = esPollo ? ['POLLO'] : TIPOS_INSUMOS_Y_ACTIVO_FIJO;
+    const tiposPedido = esPollo ? ['POLLO'] : categoria.tiposPedido;
     const divisionesAlcance = divisiones || DIVISIONES_VALIDAS;
 
     const whereRutas = { activo: true };
 
     if (esPollo && muelles) {
         whereRutas.whs_code_origen = { [Op.in]: muelles };
+    }
+
+    if (!esPollo) {
+        whereRutas.tipo_ruta = categoria.tipoRuta;
     }
 
     const rutas = await CatalogoRutaModel.findAll({
@@ -3604,8 +4026,13 @@ async function obtenerColumnasExtraExcel(cabeceras, tipo) {
 
 // Respuesta del reporte por RANGO de fechas (PDF o Excel): documento distinto
 // al de una sola fecha, agrupado por fecha y luego por ruta.
-async function responderReporteDetalleRango(res, { tipo, formato, fecha, fechaHasta, cabeceras, descripcionFiltros, nombreBase, conCarga = false }) {
-    if (cabeceras.length === 0) {
+// faltantesPorSemana (solo verduras): tiendas sin pedido por semana y por
+// jueves/viernes; null = sin esa sección.
+async function responderReporteDetalleRango(res, { tipo, formato, fecha, fechaHasta, cabeceras, descripcionFiltros, nombreBase, conCarga = false, faltantesPorSemana = null }) {
+    const hayFaltantes = !!faltantesPorSemana &&
+        faltantesPorSemana.some(s => s.dias.some(d => d.faltantes.length > 0));
+
+    if (cabeceras.length === 0 && !hayFaltantes) {
         return res.status(404).json({
             error: 'No hay pedidos para esos filtros en el rango de fechas',
             success: false
@@ -3626,7 +4053,8 @@ async function responderReporteDetalleRango(res, { tipo, formato, fecha, fechaHa
             conEntregas: reporteTieneEntregas(todasLasRutas),
             resumenEstados: resumenEstadosPedidos(todasLasRutas),
             etiquetaEstado: etiquetaEstadoPedido,
-            conCarga
+            conCarga,
+            faltantesPorSemana
         });
 
         return enviarLibroExcel(res, libro, `${nombreBase}.xlsx`);
@@ -3638,6 +4066,7 @@ async function responderReporteDetalleRango(res, { tipo, formato, fecha, fechaHa
         fechas,
         descripcionFiltros,
         conCarga,
+        faltantesPorSemana,
         nombreArchivo: `${nombreBase}.pdf`
     });
 }
@@ -3686,7 +4115,7 @@ async function responderReporteDetalle(res, { tipo, formato, fecha, cabeceras, f
 // Elige entre el reporte de una sola fecha (el de siempre) y el de rango de
 // fechas. `faltantes` es null cuando la búsqueda avanzada no lo permite (rango
 // o filtro de productos).
-function responderReporteDetalleAvanzado(res, { tipo, formato, fecha, busqueda, cabeceras, faltantes, descripcionFiltros, nombreBase, conCarga }) {
+function responderReporteDetalleAvanzado(res, { tipo, formato, fecha, busqueda, cabeceras, faltantes, descripcionFiltros, nombreBase, conCarga, faltantesPorSemana = null }) {
     const descripcion = busqueda.productos
         ? `${descripcionFiltros}   ·   ${describirProductos(busqueda.productos, cabeceras)}`
         : descripcionFiltros;
@@ -3700,7 +4129,8 @@ function responderReporteDetalleAvanzado(res, { tipo, formato, fecha, busqueda, 
             cabeceras,
             descripcionFiltros: descripcion,
             nombreBase: `${nombreBase}_a_${busqueda.fechaHasta}`,
-            conCarga
+            conCarga,
+            faltantesPorSemana
         });
     }
 
@@ -3723,7 +4153,9 @@ const TTL_PRODUCTOS_REPORTE_MS = 10 * 60 * 1000;
 const cacheProductosReporte = new Map();
 
 async function consultarProductosReporte(tipo_pedido) {
-    const tipos = tipo_pedido === 'INSUMOS' ? TIPOS_INSUMOS_Y_ACTIVO_FIJO : ['POLLO'];
+    const tipos = tipo_pedido === 'INSUMOS' ? TIPOS_INSUMOS_Y_ACTIVO_FIJO
+        : tipo_pedido === TIPO_PEDIDO_VERDURA ? [TIPO_PEDIDO_VERDURA]
+        : ['POLLO'];
 
     const desde = new Date();
     desde.setMonth(desde.getMonth() - MESES_PRODUCTOS_REPORTE);
@@ -3769,15 +4201,15 @@ async function consultarProductosReporte(tipo_pedido) {
         .sort((a, b) => a.descripcion_producto.localeCompare(b.descripcion_producto));
 }
 
-// GET /pedido/getProductosReporte?tipo_pedido=POLLO|INSUMOS
+// GET /pedido/getProductosReporte?tipo_pedido=POLLO|INSUMOS|VERDURA
 // Productos que han aparecido en pedidos de ese tipo en los últimos 12 meses
-// (INSUMOS incluye Activo Fijo), para elegir cuáles incluir en el reporte con
-// búsqueda avanzada.
+// (INSUMOS incluye Activo Fijo, no Verduras), para elegir cuáles incluir en
+// el reporte con búsqueda avanzada.
 async function getProductosReporte(req, res) {
     const { tipo_pedido } = req.query;
 
-    if (!['POLLO', 'INSUMOS'].includes(tipo_pedido)) {
-        return res.status(400).json({ error: "tipo_pedido debe ser 'POLLO' o 'INSUMOS'", success: false });
+    if (!['POLLO', 'INSUMOS', TIPO_PEDIDO_VERDURA].includes(tipo_pedido)) {
+        return res.status(400).json({ error: "tipo_pedido debe ser 'POLLO', 'INSUMOS' o 'VERDURA'", success: false });
     }
 
     try {
@@ -3893,8 +4325,13 @@ async function generarReporteDetallePollo(req, res) {
     }
 }
 
-// GET /pedido/generarReporteDetalleInsumos?fecha=...&division=1,2
+// GET /pedido/generarReporteDetalleInsumos?fecha=...&division=1,2&categoria=INSUMOS|VERDURA
 // Igual que el de Pollo, pero sin muelles (Insumos no tiene).
+// categoria (opcional, por defecto INSUMOS) separa el reporte de Insumos y
+// Activo Fijo del de Verduras. Reglas de Verduras:
+// - Un solo día: la fecha tiene que ser jueves o viernes.
+// - Rango: solo salen los pedidos con entrega jueves/viernes, y las tiendas
+//   sin pedido se listan por cada jueves/viernes del rango, por semana.
 async function generarReporteDetalleInsumos(req, res) {
     const { fecha } = req.query;
 
@@ -3905,18 +4342,43 @@ async function generarReporteDetalleInsumos(req, res) {
     let divisiones;
     let formato;
     let busqueda;
+    let categoria;
 
     try {
         divisiones = parsearDivisiones(req.query.division);
         formato = parsearFormato(req.query.formato);
         busqueda = parsearBusquedaAvanzada(req.query);
+        categoria = parsearCategoriaReporte(req.query.categoria);
     } catch (error) {
         return res.status(400).json({ error: error.message, success: false });
     }
 
+    const esVerdura = categoria.clave === TIPO_PEDIDO_VERDURA;
+    let semanasVerdura = null;
+
+    if (esVerdura) {
+        if (!busqueda.esRango && !esDiaEntregaVerdura(fecha)) {
+            return res.status(400).json({
+                error: 'Los pedidos de verduras solo se entregan jueves y viernes; elige una de esas fechas para el reporte.',
+                success: false
+            });
+        }
+
+        if (busqueda.esRango) {
+            semanasVerdura = fechasEntregaVerduraPorSemana(fecha, busqueda.fechaHasta);
+
+            if (semanasVerdura.length === 0) {
+                return res.status(400).json({
+                    error: 'El rango de fechas no incluye ningún jueves ni viernes, que son los días de entrega de verduras.',
+                    success: false
+                });
+            }
+        }
+    }
+
     try {
         const where = {
-            tipo_pedido: { [Op.in]: TIPOS_INSUMOS_Y_ACTIVO_FIJO },
+            tipo_pedido: { [Op.in]: categoria.tiposPedido },
             estado: await filtroEstadoReporteDetalle(req, 'PedidosInsumosView')
         };
         const include = aplicarBusquedaAvanzada(where, { fecha, ...busqueda });
@@ -3925,15 +4387,42 @@ async function generarReporteDetalleInsumos(req, res) {
             where.codigo_tienda = { [Op.in]: await obtenerCodigosTiendaPorDivision(divisiones) };
         }
 
-        const cabeceras = await PedidoPosCabeceraModel.findAll({
+        let cabeceras = await PedidoPosCabeceraModel.findAll({
             where,
             include,
             order: [['fecha_requerida', 'ASC'], ['nombre_ruta', 'ASC'], ['nombre_tienda', 'ASC']]
         });
 
+        // Verduras: los pedidos con fecha distinta a jueves/viernes no salen.
+        if (esVerdura) {
+            cabeceras = cabeceras.filter(c => esDiaEntregaVerdura(String(c.fecha_requerida).slice(0, 10)));
+        }
+
         const faltantes = busqueda.esRango || busqueda.productos
             ? null
-            : await calcularTiendasSinPedido({ esPollo: false, fecha, divisiones, muelles: null });
+            : await calcularTiendasSinPedido({ esPollo: false, fecha, divisiones, muelles: null, categoria });
+
+        // Rango de verduras (sin filtro de productos): tiendas sin pedido de
+        // cada jueves/viernes, agrupadas por semana.
+        let faltantesPorSemana = null;
+
+        if (semanasVerdura && !busqueda.productos) {
+            faltantesPorSemana = [];
+
+            for (const semana of semanasVerdura) {
+                const dias = [];
+
+                for (const fechaDia of semana.fechas) {
+                    dias.push({
+                        fecha: fechaDia,
+                        nombre_dia: NOMBRE_DIA_ENTREGA_VERDURA[fechaIsoAUtc(fechaDia).getUTCDay()],
+                        faltantes: await calcularTiendasSinPedido({ esPollo: false, fecha: fechaDia, divisiones, muelles: null, categoria })
+                    });
+                }
+
+                faltantesPorSemana.push({ ...semana, dias });
+            }
+        }
 
         return await responderReporteDetalleAvanzado(res, {
             tipo: 'INSUMOS',
@@ -3942,8 +4431,9 @@ async function generarReporteDetalleInsumos(req, res) {
             busqueda,
             cabeceras,
             faltantes,
-            descripcionFiltros: describirFiltrosReporte(divisiones, null),
-            nombreBase: `detalle_pedidos_insumos_${fecha}`
+            faltantesPorSemana,
+            descripcionFiltros: `Pedidos de ${categoria.titulo}   ·   ${describirFiltrosReporte(divisiones, null)}`,
+            nombreBase: `detalle_pedidos_${categoria.prefijo}_${fecha}`
         });
     } catch (error) {
         return res.status(500).json({
@@ -4064,12 +4554,22 @@ function generarReporteEnTransitoPollo(req, res) {
     });
 }
 
-// GET /pedido/generarReporteEnTransitoInsumos?division=1
+// GET /pedido/generarReporteEnTransitoInsumos?division=1&categoria=INSUMOS|VERDURA
+// categoria (opcional, por defecto INSUMOS): Insumos y Activo Fijo, o
+// Verduras — nunca juntos.
 function generarReporteEnTransitoInsumos(req, res) {
+    let categoria;
+
+    try {
+        categoria = parsearCategoriaReporte(req.query.categoria);
+    } catch (error) {
+        return res.status(400).json({ error: error.message, success: false });
+    }
+
     return generarReporteEnTransito(req, res, {
-        tiposPedido: TIPOS_INSUMOS_Y_ACTIVO_FIJO,
-        tituloTipo: 'Insumos y Activo Fijo',
-        prefijoArchivo: 'pedidos_insumos'
+        tiposPedido: categoria.tiposPedido,
+        tituloTipo: categoria.titulo,
+        prefijoArchivo: `pedidos_${categoria.prefijo}`
     });
 }
 
@@ -4132,7 +4632,7 @@ async function generarQrsRutaInsumos(req, res) {
         }
 
         const cabeceras = await PedidoPosCabeceraModel.findAll({
-            where: { tipo_pedido: { [Op.in]: TIPOS_INSUMOS_Y_ACTIVO_FIJO }, fecha_requerida: fecha, ruta_id },
+            where: { tipo_pedido: { [Op.in]: TIPOS_FLUJO_INSUMOS }, fecha_requerida: fecha, ruta_id },
             include: [{ model: PedidoPosDetalleModel, as: 'detalle' }],
             order: [['nombre_tienda', 'ASC']]
         });
@@ -4281,7 +4781,7 @@ async function firmarTicketInsumos(req, res) {
         }
 
         const cabecera = await PedidoPosCabeceraModel.findOne({
-            where: { tipo_pedido: { [Op.in]: TIPOS_INSUMOS_Y_ACTIVO_FIJO }, fecha_requerida: fecha, ruta_id, estado: 'EN_TRANSITO' }
+            where: { tipo_pedido: { [Op.in]: TIPOS_FLUJO_INSUMOS }, fecha_requerida: fecha, ruta_id, estado: 'EN_TRANSITO' }
         });
 
         if (!cabecera) {
@@ -4291,7 +4791,7 @@ async function firmarTicketInsumos(req, res) {
             });
         }
 
-        const lineas = await armarLineasTicket(TIPOS_INSUMOS_Y_ACTIVO_FIJO, ruta_id, fecha);
+        const lineas = await armarLineasTicket(TIPOS_FLUJO_INSUMOS, ruta_id, fecha);
         const ahora = new Date();
 
         const datosTicket = {
@@ -4335,6 +4835,7 @@ module.exports = {
     createPedido,
     crearPedidoActivoFijo,
     cambiarFechaRequeridaPedido,
+    cancelarPedido,
     buscarPedidosActivoFijo,
     validarYObtenerPedido,
     subirYProcesarArchivosPedidoPos,

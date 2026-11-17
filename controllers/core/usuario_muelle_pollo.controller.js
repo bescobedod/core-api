@@ -3,7 +3,7 @@ const UsersModel = require('../../models/pioapp/users.model');
 const UsuarioMuellePolloModel = require('../../models/core/tbl_usuario_muelle_pollo.model');
 
 // Rol de PioApp que opera los muelles de Pollo.
-const ROL_MUELLE_PIOAPP = [1, 5];
+const ROL_MUELLE_PIOAPP = [1, 5, 8];
 
 // Lista los usuarios ya asignados a un muelle (whs_code_origen).
 async function getUsuariosPorMuelle(req, res) {
@@ -94,9 +94,9 @@ async function buscarUsuarios(req, res) {
     }
 }
 
-// Asigna (o reemplaza) el muelle de Pollo de un usuario. Un usuario
-// solo tiene un muelle activo a la vez — findOrCreate + update sobre el
-// mismo id_usuario, igual que asignarClienteSap en piloto_cliente_sap.
+// Asigna un muelle de Pollo a un usuario. Un usuario puede tener varios
+// muelles activos a la vez (uno por registro); si ya tenía este muelle
+// (activo o desactivado), se reutiliza el mismo registro.
 async function asignarMuelle(req, res) {
     const { id_usuario, whs_code_origen, nombre_muelle } = req.body;
 
@@ -106,7 +106,7 @@ async function asignarMuelle(req, res) {
 
     try {
         const [asignacion] = await UsuarioMuellePolloModel.findOrCreate({
-            where: { id_usuario },
+            where: { id_usuario, whs_code_origen },
             defaults: { id_usuario, whs_code_origen, nombre_muelle: nombre_muelle || null, activo: true, creado_en: new Date() }
         });
 
@@ -122,14 +122,17 @@ async function asignarMuelle(req, res) {
     }
 }
 
-// Quita el muelle asignado a un usuario (se desactiva, no se borra).
+// Quita un muelle a un usuario (se desactiva, no se borra). Con
+// ?whs_code_origen= solo quita ese muelle y deja los demás; sin él, quita
+// todos (comportamiento anterior, cuando solo había uno por usuario).
 async function quitarMuelle(req, res) {
     const { id_usuario } = req.params;
+    const { whs_code_origen } = req.query;
 
     try {
         const [actualizados] = await UsuarioMuellePolloModel.update(
             { activo: false },
-            { where: { id_usuario, activo: true } }
+            { where: { id_usuario, activo: true, ...(whs_code_origen ? { whs_code_origen } : {}) } }
         );
 
         return res.json({ success: true, actualizado: actualizados > 0 });
