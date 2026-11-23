@@ -106,6 +106,7 @@ router.post('/pedidoArtesano/subirEvidencia', auth, pedidoArtesano.recibirFoto, 
 router.get('/pedidoArtesano/getEvidencia', auth, pedidoArtesano.getEvidencia);
 router.get('/pedidoArtesano/exportarPedidos', auth, pedidoArtesano.exportarPedidos);
 router.get('/pedidoArtesano/exportarPorCliente', auth, pedidoArtesano.exportarPorCliente);
+router.post('/pedidoArtesano/sincronizarPilotoRuta', auth, pedidoArtesano.sincronizarPilotoRuta);
 router.get('/pedidoArtesano/generarReporteDetalle', auth, pedidoArtesano.generarReporteDetalle);
 router.get('/pedidoArtesano/generarReporteEnTransito', auth, pedidoArtesano.generarReporteEnTransito);
 

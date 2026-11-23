@@ -23,6 +23,7 @@ const TiendaRutaPolloModel = require('../../models/core/tbl_tiendas_rutas_pollo.
 const TiendaRutaInsumosModel = require('../../models/core/tbl_tiendas_rutas_insumos.model');
 const CamionModel = require('../../models/core/tbl_camion.model');
 const DespachoRutaModel = require('../../models/core/tbl_despacho_ruta.model');
+const { bloquesClientesDetalle, bloquesClientesEnTransito, datosClientesResumenRuta, productosClientesReporte } = require('../../services/pedidoArtesanoEnReportes');
 
 PedidoPosCabeceraModel.hasMany(PedidoPosDetalleModel, { foreignKey: 'pedido_id', as: 'detalle' });
 PedidoPosDetalleModel.belongsTo(PedidoPosCabeceraModel, { foreignKey: 'pedido_id', as: 'cabecera' });
@@ -2476,7 +2477,10 @@ async function generarResumenRutaPollo(req, res) {
             attributes: ['id', 'codigo_tienda', 'nombre_tienda', 'estado']
         });
 
-        if (cabeceras.length === 0) {
+        // Pedidos de clientes externos de pollo artesano en la misma ruta: una columna por cliente.
+        const clientes = req.query.incluir_clientes === '1' ? await datosClientesResumenRuta(ruta_id, fecha) : null;
+
+        if (cabeceras.length === 0 && !(clientes && clientes.hayPedidos)) {
             return res.status(404).json({ error: 'No hay pedidos para esta ruta y fecha', success: false });
         }
 
@@ -2528,6 +2532,25 @@ async function generarResumenRutaPollo(req, res) {
             articulo.cantidadPorTienda.set(codigoTienda, actual + Number(d.cantidad_asignada));
         }
 
+        if (clientes) {
+            // Los clientes van después de las tiendas, cada uno con su columna.
+            tiendas.push(...clientes.columnas.map(c => ({ ...c, pedidoIds: [] })));
+
+            for (const c of clientes.cantidades) {
+                if (!articulosPorCodigo.has(c.codigo_producto)) {
+                    articulosPorCodigo.set(c.codigo_producto, {
+                        codigo_producto: c.codigo_producto,
+                        nombre_producto: c.nombre_producto,
+                        unidad_medida: c.unidad_medida,
+                        cantidadPorTienda: new Map()
+                    });
+                }
+
+                const articulo = articulosPorCodigo.get(c.codigo_producto);
+                articulo.cantidadPorTienda.set(c.clave, (articulo.cantidadPorTienda.get(c.clave) || 0) + c.cantidad);
+            }
+        }
+
         const articulos = [...articulosPorCodigo.values()]
             .sort((a, b) => (a.codigo_producto || '').localeCompare(b.codigo_producto || ''));
 
@@ -2538,7 +2561,8 @@ async function generarResumenRutaPollo(req, res) {
             });
         }
 
-        const yaEnviada = cabeceras.some(c => ['EN_TRANSITO', 'ENTREGADO', 'ENTREGADO_PARCIAL'].includes(c.estado));
+        const yaEnviada = cabeceras.some(c => ['EN_TRANSITO', 'ENTREGADO', 'ENTREGADO_PARCIAL'].includes(c.estado))
+            || !!(clientes && clientes.yaEnviada);
 
         const carga = calcularCarga(articulos.map(a => ({
             codigo_producto: a.codigo_producto,
@@ -2678,7 +2702,7 @@ function construirPdfResumenRuta(res, { nombreRuta, fecha, preliminar, carga = n
 // reporte de detalle sin QR (todas las rutas de una fecha).
 // ------------------------------------------------------------
 function construirBloquesPedido(cabeceras) {
-    return cabeceras.map(cabecera => {
+    const bloques = cabeceras.map(cabecera => {
         const p = cabecera.get({ plain: true });
 
         return {
@@ -2710,6 +2734,14 @@ function construirBloquesPedido(cabeceras) {
             }))
         };
     });
+
+    // Pollo: los pedidos de clientes externos (incluir_clientes=1) viajan en `bloquesExtra` y se muestran junto a las tiendas.
+    return cabeceras.bloquesExtra ? [...bloques, ...cabeceras.bloquesExtra] : bloques;
+}
+
+// Hay pedidos de clientes para el reporte aunque no haya ninguna cabecera de tienda.
+function hayBloquesExtra(cabeceras) {
+    return !!(cabeceras.bloquesExtra && cabeceras.bloquesExtra.length > 0);
 }
 
 // Agrupa bloques (ya armados por construirBloquesPedido) por ruta, para el
@@ -2978,7 +3010,7 @@ function bloqueTieneDocsSap(bloque) {
 
 function alturaEstimadaBloque(bloque, { mostrarDocsSap, lineasExtra = 0 }) {
     const docsSap = mostrarDocsSap && bloqueTieneDocsSap(bloque) ? 30 : 0;
-    return 40 + lineasExtra * 11 + docsSap + bloque.items.length * 14;
+    return 40 + (lineasExtra + (bloque.detalles ? bloque.detalles.length : 0)) * 11 + docsSap + bloque.items.length * 14;
 }
 
 // Encabezado de un pedido: tienda (+ tipo), estado a la derecha, número de
@@ -3005,7 +3037,7 @@ function dibujarEncabezadoBloque(doc, L, bloque, { mostrarEstado, mostrarDocsSap
     doc.font('Helvetica').fontSize(8).fillColor('#666666');
     doc.text(`Pedido: ${bloque.numero_pedido}`, L.startX, doc.y, { width: L.anchoUtil });
 
-    detalles.forEach((linea) => {
+    [...detalles, ...(bloque.detalles || [])].forEach((linea) => {
         doc.text(linea, L.startX, doc.y, { width: L.anchoUtil });
     });
 
@@ -3281,7 +3313,7 @@ function dibujarPdfEnTransito(res, { secciones, viajes = [], tituloTipo, nombreA
         if (indice > 0) doc.addPage();
 
         doc.font('Helvetica-Bold').fontSize(13).fillColor('#2183AE');
-        doc.text(`División ${seccion.division}  (${seccion.bloques.length} pedido${seccion.bloques.length !== 1 ? 's' : ''})`, L.startX);
+        doc.text(`${seccion.titulo || `División ${seccion.division}`}  (${seccion.bloques.length} pedido${seccion.bloques.length !== 1 ? 's' : ''})`, L.startX);
         doc.fillColor('#000000');
         doc.moveTo(L.startX, doc.y + 2).lineTo(L.startX + L.anchoUtil, doc.y + 2).strokeColor('#2183AE').stroke();
         doc.moveDown(0.6);
@@ -3590,7 +3622,7 @@ async function obtenerColumnasExtraExcel(cabeceras, tipo) {
 // Respuesta del reporte por RANGO de fechas (PDF o Excel): documento distinto
 // al de una sola fecha, agrupado por fecha y luego por ruta.
 async function responderReporteDetalleRango(res, { tipo, formato, fecha, fechaHasta, cabeceras, descripcionFiltros, nombreBase, conCarga = false }) {
-    if (cabeceras.length === 0) {
+    if (cabeceras.length === 0 && !hayBloquesExtra(cabeceras)) {
         return res.status(404).json({
             error: 'No hay pedidos para esos filtros en el rango de fechas',
             success: false
@@ -3632,7 +3664,7 @@ async function responderReporteDetalleRango(res, { tipo, formato, fecha, fechaHa
 // faltantes === null significa "sin sección de tiendas sin pedido" (filtro de
 // productos activo).
 async function responderReporteDetalle(res, { tipo, formato, fecha, cabeceras, faltantes, descripcionFiltros, nombreBase, conCarga = false }) {
-    if (cabeceras.length === 0 && (faltantes === null || faltantes.length === 0)) {
+    if (cabeceras.length === 0 && !hayBloquesExtra(cabeceras) && (faltantes === null || faltantes.length === 0)) {
         return res.status(404).json({
             error: 'No hay pedidos ni tiendas asignadas para esos filtros y esta fecha',
             success: false
@@ -3767,13 +3799,22 @@ async function getProductosReporte(req, res) {
 
     try {
         const enCache = cacheProductosReporte.get(tipo_pedido);
+        let productos;
 
         if (enCache && enCache.expira > Date.now()) {
-            return res.json({ success: true, productos: enCache.productos });
+            productos = enCache.productos;
+        } else {
+            productos = await consultarProductosReporte(tipo_pedido);
+            cacheProductosReporte.set(tipo_pedido, { productos, expira: Date.now() + TTL_PRODUCTOS_REPORTE_MS });
         }
 
-        const productos = await consultarProductosReporte(tipo_pedido);
-        cacheProductosReporte.set(tipo_pedido, { productos, expira: Date.now() + TTL_PRODUCTOS_REPORTE_MS });
+        // Pollo con clientes externos: se agregan los productos que ellos han pedido (sin tocar la lista guardada).
+        if (tipo_pedido === 'POLLO' && req.query.incluir_clientes === '1') {
+            const propios = new Set(productos.map(p => p.codigo_producto));
+            const deClientes = (await productosClientesReporte()).filter(p => !propios.has(p.codigo_producto));
+
+            productos = [...productos, ...deClientes].sort((a, b) => a.descripcion_producto.localeCompare(b.descripcion_producto));
+        }
 
         return res.json({ success: true, productos });
     } catch (error) {
@@ -3841,6 +3882,20 @@ async function generarReporteDetallePollo(req, res) {
             order: [['fecha_requerida', 'ASC'], ['nombre_ruta', 'ASC'], ['nombre_tienda', 'ASC']]
         });
 
+        // Pedidos de clientes externos de pollo artesano junto a los de tienda (los pide la vista de Pedidos de Pollo).
+        // Los clientes no tienen división: salen con ambas divisiones (o sin filtro de división).
+        const incluirClientes = req.query.incluir_clientes === '1' && (!divisiones || divisiones.length === DIVISIONES_VALIDAS.length);
+
+        if (incluirClientes) {
+            cabeceras.bloquesExtra = await bloquesClientesDetalle({
+                fecha,
+                esRango: busqueda.esRango,
+                fechaHasta: busqueda.fechaHasta,
+                productos: busqueda.productos,
+                muelles
+            });
+        }
+
         const faltantes = busqueda.esRango || busqueda.productos
             ? null
             : await calcularTiendasSinPedido({ esPollo: true, fecha, divisiones, muelles });
@@ -3852,7 +3907,7 @@ async function generarReporteDetallePollo(req, res) {
             busqueda,
             cabeceras,
             faltantes,
-            descripcionFiltros: describirFiltrosReporte(divisiones, muelles),
+            descripcionFiltros: describirFiltrosReporte(divisiones, muelles) + (incluirClientes ? '   ·   Incluye clientes externos' : ''),
             nombreBase: `detalle_pedidos_pollo_${fecha}`,
             conCarga: true
         });
@@ -3927,7 +3982,7 @@ async function generarReporteDetalleInsumos(req, res) {
 // separados por división. Si se manda `division` (una sola, p. ej. para un
 // usuario lectura_division) solo salen las tiendas de esa división; si no,
 // salen las divisiones 1 y 2, cada una en su sección y en ese orden.
-async function generarReporteEnTransito(req, res, { tiposPedido, tituloTipo, prefijoArchivo, conMuelle = false, conCarga = false }) {
+async function generarReporteEnTransito(req, res, { tiposPedido, tituloTipo, prefijoArchivo, conMuelle = false, conCarga = false, incluirClientes = false }) {
     let divisiones;
     let formato;
 
@@ -3954,7 +4009,10 @@ async function generarReporteEnTransito(req, res, { tiposPedido, tituloTipo, pre
             order: [['fecha_requerida', 'ASC'], ['nombre_ruta', 'ASC'], ['nombre_tienda', 'ASC']]
         });
 
-        if (cabeceras.length === 0) {
+        // Pollo: los clientes externos en tránsito van en su propia sección, después de las divisiones.
+        const bloquesClientes = incluirClientes && divisiones.length === DIVISIONES_VALIDAS.length ? await bloquesClientesEnTransito() : [];
+
+        if (cabeceras.length === 0 && bloquesClientes.length === 0) {
             return res.status(404).json({ error: 'No hay pedidos en tránsito', success: false });
         }
 
@@ -3963,7 +4021,7 @@ async function generarReporteEnTransito(req, res, { tiposPedido, tituloTipo, pre
         const muellePorRuta = new Map();
 
         if (conMuelle) {
-            const rutaIds = [...new Set(cabeceras.map(c => c.ruta_id).filter(Boolean))];
+            const rutaIds = [...new Set([...cabeceras.map(c => c.ruta_id), ...bloquesClientes.map(b => b.ruta_id)].filter(r => r && r !== 'sin_ruta'))];
             const rutas = await CatalogoRutaPolloModel.findAll({
                 where: { id: { [Op.in]: rutaIds } },
                 attributes: ['id', 'whs_code_origen'],
@@ -3993,6 +4051,17 @@ async function generarReporteEnTransito(req, res, { tiposPedido, tituloTipo, pre
             .filter(([, bloques]) => bloques.length > 0)
             .sort(([a], [b]) => a.localeCompare(b))
             .map(([division, bloques]) => ({ division, bloques }));
+
+        if (bloquesClientes.length > 0) {
+            if (conMuelle) {
+                bloquesClientes.forEach((bloque) => {
+                    const codigoMuelle = muellePorRuta.get(bloque.ruta_id);
+                    bloque.muelle = codigoMuelle ? `${MUELLES_POLLO[codigoMuelle] || codigoMuelle} (${codigoMuelle})` : 'Sin muelle';
+                });
+            }
+
+            secciones.push({ division: 'Clientes', titulo: 'Clientes externos', bloques: bloquesClientes });
+        }
 
         if (secciones.length === 0) {
             return res.status(404).json({ error: 'No hay pedidos en tránsito', success: false });
@@ -4029,7 +4098,8 @@ function generarReporteEnTransitoPollo(req, res) {
         tituloTipo: 'Pollo',
         prefijoArchivo: 'pedidos_pollo',
         conMuelle: true,
-        conCarga: true
+        conCarga: true,
+        incluirClientes: req.query.incluir_clientes === '1'
     });
 }
 

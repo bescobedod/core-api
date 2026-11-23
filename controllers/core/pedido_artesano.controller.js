@@ -162,7 +162,7 @@ async function detalleProductos(codigos) {
 function productosHabilitados() {
     return PedidoArtesanoProductoModel.findAll({
         where: { activo: true },
-        attributes: ['codigo_producto', 'orden', 'factor_caja', 'factor_libras'],
+        attributes: ['codigo_producto', 'orden', 'factor_caja', 'factor_libras', 'unidades_sap'],
         order: [['orden', 'ASC'], ['codigo_producto', 'ASC']]
     });
 }
@@ -482,7 +482,8 @@ async function getProductos(req, res) {
                 unidad_medida: detalles.get(fila.codigo_producto).unidad || 'UND',
                 orden: fila.orden,
                 factor_caja: fila.factor_caja === null ? null : Number(fila.factor_caja),
-                factor_libras: fila.factor_libras === null ? null : Number(fila.factor_libras)
+                factor_libras: fila.factor_libras === null ? null : Number(fila.factor_libras),
+                unidades_sap: Number(fila.unidades_sap) || 1
             }))
             .sort((a, b) => a.orden - b.orden || a.descripcion_producto.localeCompare(b.descripcion_producto));
 
@@ -1444,10 +1445,20 @@ async function exigirCandadoDeRuta(req, ruta_id, fecha) {
     }
 }
 
-function mapearPedidoRuta(p) {
+// unidades: Map codigo -> unidades de SAP por unidad del pedido (lasaña: 4); sirve para sumar con las tiendas en bolsas.
+function mapearPedidoRuta(p, unidades = new Map()) {
     const creado = new Date(p.creado_en);
+    const lineas = p.detalle || [];
+    // Validado sin stock: sigue creado, con todas sus líneas en cero (se rechaza o se reprograma).
+    const sinStock = p.estado === 'CREADO' && lineas.length > 0
+        && lineas.every(d => d.cantidad_autorizada !== null && d.cantidad_autorizada !== undefined && Number(d.cantidad_autorizada) === 0);
 
     return {
+        origen: 'CLIENTE',
+        sin_stock: sinStock,
+        cliente_nombre: p.cliente_nombre,
+        nombre_tienda_referencia: p.nombre_tienda_referencia || null,
+        telefono_contacto: p.telefono_contacto || null,
         pedido_id: p.id,
         codigo_tienda: p.codigo_tienda_referencia,
         nombre_tienda: p.cliente_nombre,
@@ -1471,6 +1482,7 @@ function mapearPedidoRuta(p) {
                 codigo_producto: d.codigo_producto,
                 descripcion_producto: d.descripcion_producto,
                 unidad_medida: d.unidad_medida,
+                unidades_sap: unidades.get(d.codigo_producto) || 1,
                 fecha_requerida: String(p.fecha_requerida),
                 cantidad_solicitada: String(d.cantidad),
                 cantidad_asignada: String(d.cantidad_autorizada ?? 0),
@@ -1490,21 +1502,23 @@ async function getPedidosRuta(req, res) {
         const { ruta_id, fecha_requerida } = req.query;
         validarRutaYFecha(ruta_id, fecha_requerida);
 
-        const [ruta, despacho, pedidos] = await Promise.all([
+        const [ruta, despacho, pedidos, catalogo] = await Promise.all([
             CatalogoRutaPolloModel.findByPk(ruta_id),
             DespachoRutaModel.findOne({ where: { ruta_id, fecha: fecha_requerida } }),
             PedidoArtesanoModel.findAll({
                 where: { ruta_id, fecha_requerida, estado: { [Op.in]: ESTADOS_EN_RUTA } },
                 include: [{ model: PedidoArtesanoDetalleModel, as: 'detalle' }],
                 order: [['creado_en', 'ASC']]
-            })
+            }),
+            PedidoArtesanoProductoModel.findAll({ attributes: ['codigo_producto', 'unidades_sap'] })
         ]);
+        const unidades = new Map(catalogo.map(c => [c.codigo_producto, Number(c.unidades_sap) || 1]));
 
         if (!ruta) throw new ErrorPedidoArtesano(404, 'La ruta no existe');
 
         if (pedidos.length === 0) return res.json({ success: true, tipo_pedido: 'POLLO_ARTESANO', fecha_requerida, rutas: [] });
 
-        const clientes = pedidos.map(p => mapearPedidoRuta(p.get({ plain: true })));
+        const clientes = pedidos.map(p => mapearPedidoRuta(p.get({ plain: true }), unidades));
         const estados = [...new Set(clientes.map(c => c.estado))];
         const conDocumento = clientes.find(c => c.sap_docnum);
 
@@ -1624,6 +1638,8 @@ async function getComparativoRuta(req, res) {
                 codigo_producto: codigo,
                 descripcion_producto: total.descripcion,
                 unidad_medida: total.unidad,
+                unidades_sap: unidades.get(codigo) || 1,
+                stock_bolsas: stock ? Number(stock.bolsas_completas) : 0,
                 cantidad_solicitada_total: total.cantidad,
                 stock_disponible: disponible,
                 encontrado_en_sap: !!stock,
@@ -1679,8 +1695,8 @@ async function guardarAsignacionRuta(req, res) {
                 const total = propias.reduce((suma, d) => suma + asignadas.get(String(d.id)), 0);
 
                 if (total <= 0) {
-                    // Sin stock para este pedido: queda creado, sin cantidades, para rechazarlo con su motivo.
-                    for (const d of propias) await d.update({ cantidad_autorizada: null }, { transaction: t });
+                    // Sin stock para este pedido: queda creado, con cantidades en cero, para rechazarlo con su motivo.
+                    for (const d of propias) await d.update({ cantidad_autorizada: 0 }, { transaction: t });
 
                     if (pedido.estado === 'VALIDADO') {
                         await cambiarEstado(pedido, ['VALIDADO'], 'CREADO', {}, usuario, 'Validación sin stock: vuelve a creado', t);
@@ -1724,7 +1740,8 @@ async function guardarAsignacionRuta(req, res) {
 }
 
 // POST /pedidoArtesano/enviarRuta { ruta_id, fecha }
-// Carga los pedidos VALIDADOS de la ruta con una transferencia de SAP, con el piloto asignado a la ruta, y libera el candado.
+// Carga los pedidos VALIDADOS de la ruta con una transferencia de SAP, con el piloto asignado a la ruta, y libera el candado
+// (salvo liberar_candado: false, cuando la ruta también lleva tiendas y estas se envían después).
 async function enviarRuta(req, res) {
     try {
         await exigirEscrituraPedidosPollo(req);
@@ -1755,7 +1772,10 @@ async function enviarRuta(req, res) {
             throw error;
         }
 
-        await BloqueoRutaPolloModel.update({ estado: 'LIBERADO', fecha_liberacion: new Date() }, { where: { ruta_id, fecha, estado: 'ACTIVO' } });
+        // Con tiendas en la misma ruta, el envío de las tiendas es el que libera el candado.
+        if (req.body.liberar_candado !== false) {
+            await BloqueoRutaPolloModel.update({ estado: 'LIBERADO', fecha_liberacion: new Date() }, { where: { ruta_id, fecha, estado: 'ACTIVO' } });
+        }
 
         const sinValidar = await PedidoArtesanoModel.count({ where: { ruta_id, fecha_requerida: fecha, estado: 'CREADO' } });
 
@@ -1811,6 +1831,55 @@ async function cambiarPiloto(req, res) {
         return res.json({ success: true, pedidos: actualizados.map(mapearPedido) });
     } catch (error) {
         return responderError(res, error, 'Error al cambiar el piloto');
+    }
+}
+
+// POST /pedidoArtesano/sincronizarPilotoRuta { ruta_id, fecha, solo_validar? }
+// Después de trasladar el envío de una ruta (nuevo piloto en el transporte de la ruta y fecha), copia ese piloto a los
+// pedidos de clientes que van en tránsito, para que le aparezcan al piloto nuevo en la PioApp.
+// Igual que con las tiendas, no se permite si algún cliente ya confirmó la entrega. Con solo_validar solo revisa.
+async function sincronizarPilotoRuta(req, res) {
+    try {
+        await exigirEscrituraPedidosPollo(req);
+
+        const { ruta_id, fecha } = req.body;
+        validarRutaYFecha(ruta_id, fecha);
+
+        const pedidos = await PedidoArtesanoModel.findAll({ where: { ruta_id, fecha_requerida: fecha, estado: { [Op.in]: ['EN_TRANSITO', 'ENTREGADO'] } } });
+
+        if (pedidos.some(p => p.estado === 'ENTREGADO')) {
+            throw new ErrorPedidoArtesano(409, 'Solo se puede trasladar el piloto mientras el envío está en tránsito: ya hay clientes con la entrega confirmada');
+        }
+
+        if (req.body.solo_validar === true || pedidos.length === 0) return res.json({ success: true, pedidos_actualizados: 0 });
+
+        const despacho = await DespachoRutaModel.findOne({ where: { ruta_id, fecha } });
+
+        if (!despacho || !despacho.piloto_id) throw new ErrorPedidoArtesano(400, 'La ruta no tiene piloto asignado');
+
+        const piloto = await resolverPiloto(despacho.piloto_id);
+        const usuario = await nombreCortoDelUsuario(req);
+        const t = await sequelizeInit.sequelize.transaction();
+
+        try {
+            for (const pedido of pedidos) {
+                if (Number(pedido.codigo_piloto) === piloto.codigo) continue;
+
+                const anterior = pedido.nombre_piloto || 'sin piloto';
+
+                await pedido.update({ codigo_piloto: piloto.codigo, nombre_piloto: piloto.nombre, actualizado_en: new Date() }, { transaction: t });
+                await registrarHistorial(pedido.id, 'EN_TRANSITO', 'EN_TRANSITO', usuario, `Piloto: ${anterior} → ${piloto.nombre}`, t);
+            }
+
+            await t.commit();
+        } catch (error) {
+            await t.rollback();
+            throw error;
+        }
+
+        return res.json({ success: true, pedidos_actualizados: pedidos.length });
+    } catch (error) {
+        return responderError(res, error, 'Error al sincronizar el piloto de los clientes');
     }
 }
 
@@ -2147,11 +2216,22 @@ async function generarReporteDetalle(req, res) {
         const estados = parsearLista(req.query.estados, e => ESTADOS.includes(e), `estados debe ser una lista de: ${ESTADOS.join(', ')}`);
         const rutas = parsearLista(req.query.rutas, r => REGEX_UUID.test(r), 'rutas inválidas');
         const productos = parsearLista(req.query.productos, c => /^[A-Za-z0-9_-]{1,50}$/.test(c), 'productos inválidos');
+        const muelles = parsearLista(req.query.muelles, m => /^[A-Za-z0-9-]{3,20}$/.test(m), 'muelles inválidos');
 
         const where = { fecha_requerida: esRango ? { [Op.between]: [fecha, fechaHasta] } : fecha };
 
         if (estados) where.estado = { [Op.in]: estados };
-        if (rutas) where.ruta_id = { [Op.in]: rutas };
+
+        // Muelle: las rutas que salen de ese muelle; junto con las rutas elegidas, quedan las que cumplan ambas.
+        let rutasPermitidas = rutas;
+
+        if (muelles) {
+            const deMuelles = (await CatalogoRutaPolloModel.findAll({ where: { whs_code_origen: { [Op.in]: muelles } }, attributes: ['id'], raw: true })).map(r => r.id);
+
+            rutasPermitidas = rutas ? rutas.filter(r => deMuelles.includes(r)) : deMuelles;
+        }
+
+        if (rutasPermitidas) where.ruta_id = { [Op.in]: rutasPermitidas };
 
         const pedidos = await PedidoArtesanoModel.findAll({
             where,
@@ -2239,5 +2319,6 @@ module.exports = {
     guardarAsignacionRuta,
     enviarRuta,
     generarReporteDetalle,
-    generarReporteEnTransito
+    generarReporteEnTransito,
+    sincronizarPilotoRuta
 };

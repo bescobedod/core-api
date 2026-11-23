@@ -295,8 +295,9 @@ function construirExcelEnTransito({ secciones, viajes = [], tituloTipo, conMuell
     const libro = nuevoLibro();
 
     secciones.forEach((seccion) => {
-        const hoja = libro.addWorksheet(`División ${seccion.division}`);
-        agregarTitulo(hoja, `Pedidos en Tránsito — ${tituloTipo} — División ${seccion.division}`, [
+        const nombreSeccion = seccion.titulo || `División ${seccion.division}`;
+        const hoja = libro.addWorksheet(nombreSeccion);
+        agregarTitulo(hoja, `Pedidos en Tránsito — ${tituloTipo} — ${nombreSeccion}`, [
             'Pedidos enviados a SAP que todavía no han sido entregados (todas las fechas)',
             `Total: ${seccion.bloques.length} pedido${seccion.bloques.length !== 1 ? 's' : ''}`
         ]);
