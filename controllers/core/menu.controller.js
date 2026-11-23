@@ -112,6 +112,54 @@ async function crearMenu(req, res) {
     }
 }
 
+// Edita los datos de un menú existente (nombre, icono, nombre_menu,
+// descripcion). Los cuatro son obligatorios, igual que al crear; los largos
+// máximos son los de config.tbl_menu. No toca visible ni tipo.
+const LARGO_MAXIMO_MENU = { nombre: 50, icono: 20, nombre_menu: 50, descripcion: 255 };
+
+async function actualizarMenu(req, res) {
+    const { id } = req.params;
+    const datos = {};
+
+    for (const [campo, maximo] of Object.entries(LARGO_MAXIMO_MENU)) {
+        const valor = typeof req.body[campo] === 'string' ? req.body[campo].trim() : '';
+
+        if (!valor) {
+            return res.status(400).json({
+                error: 'nombre, icono, nombre_menu y descripcion son requeridos',
+                success: false
+            });
+        }
+
+        if (valor.length > maximo) {
+            return res.status(400).json({
+                error: `${campo} no puede tener más de ${maximo} caracteres`,
+                success: false
+            });
+        }
+
+        datos[campo] = valor;
+    }
+
+    try {
+        const menu = await MenuModel.findByPk(id);
+
+        if (!menu) {
+            return res.status(404).json({ error: 'Menú no encontrado', success: false });
+        }
+
+        await menu.update(datos);
+
+        return res.json({ success: true, menu });
+    } catch (error) {
+        return res.status(500).json({
+            error: 'Error al actualizar el menú',
+            details: error.message,
+            success: false
+        });
+    }
+}
+
 // Muestra u oculta un menú (campo visible).
 async function actualizarVisibilidadMenu(req, res) {
     const { id } = req.params;
@@ -273,6 +321,7 @@ module.exports = {
     getPermiso,
     getAllMenusAdmin,
     crearMenu,
+    actualizarMenu,
     actualizarVisibilidadMenu,
     getRolesDeMenu,
     asignarRolAMenu,

@@ -1,5 +1,7 @@
-const { Model, DataTypes } = require('sequelize');
+const { Model, DataTypes, Op } = require('sequelize');
 const { sequelize } = require('../../configuration/db');
+
+const ESTADO_CANCELADO = 'CANCELADO';
 
 class PedidoPosCabeceraModel extends Model {}
 
@@ -47,7 +49,22 @@ PedidoPosCabeceraModel.init({
     sequelize: sequelize,
     tableName: 'tbl_pedidos_pos_cabecera',
     schema: 'logistica',
-    timestamps: false
+    timestamps: false,
+    // Los pedidos CANCELADOS no se borran (quedan para auditoría), pero no
+    // deben aparecer en ninguna vista, reporte, transferencia ni ticket. Este
+    // filtro se aplica a TODA consulta de la cabecera (findAll, findOne,
+    // count, update e includes desde el detalle o el historial).
+    // whereMergeStrategy 'and': el filtro se combina con el where de cada
+    // consulta en vez de reemplazarse — sin esto, un where propio sobre
+    // `estado` (p. ej. { [Op.ne]: 'PENDIENTE_ENRIQUECIMIENTO' }) borraría el
+    // filtro y los cancelados entrarían a las transferencias a SAP.
+    // Para leer un cancelado a propósito: PedidoPosCabeceraModel.unscoped().
+    defaultScope: {
+        where: { estado: { [Op.ne]: ESTADO_CANCELADO } }
+    },
+    whereMergeStrategy: 'and'
 })
+
+PedidoPosCabeceraModel.ESTADO_CANCELADO = ESTADO_CANCELADO;
 
 module.exports = PedidoPosCabeceraModel;

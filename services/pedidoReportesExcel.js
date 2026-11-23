@@ -72,6 +72,33 @@ function agregarTabla(hoja, columnas, filas) {
     }
 }
 
+// Columnas de diferencia (mismos nombres que en el PDF):
+// - No enviado = Pedido − Enviado (lo que la sede no puso en el camión).
+// - No recibido vs pedido = Pedido − Recibido (lo que a la tienda le faltó contra su pedido).
+// - No recibido vs enviado = Enviado − Recibido (lo que salió y la tienda no recibió).
+// Las dos últimas solo con entregas, igual que "Recibido".
+function columnasDiferencias(conEntregas) {
+    return [
+        { header: 'No enviado', key: 'diferencia', width: 14, centrada: true },
+        ...(conEntregas ? [
+            { header: 'No recibido vs pedido', key: 'no_recibido_vs_pedido', width: 22, centrada: true },
+            { header: 'No recibido vs enviado', key: 'no_recibido_vs_enviado', width: 22, centrada: true }
+        ] : [])
+    ];
+}
+
+// Si la tienda todavía no confirmó la línea (recibido null), las diferencias
+// contra lo recibido quedan vacías.
+function valoresDiferencias(pedido, enviado, recibido) {
+    const hayRecibido = recibido !== null && recibido !== undefined;
+
+    return {
+        diferencia: pedido - enviado,
+        no_recibido_vs_pedido: hayRecibido ? pedido - recibido : null,
+        no_recibido_vs_enviado: hayRecibido ? enviado - recibido : null
+    };
+}
+
 function columnasResumenGeneral(conEntregas) {
     return [
         { header: 'Código', key: 'codigo', width: 14 },
@@ -80,7 +107,7 @@ function columnasResumenGeneral(conEntregas) {
         { header: 'Pedido', key: 'pedido', width: 12, centrada: true },
         { header: 'Enviado', key: 'enviado', width: 12, centrada: true },
         ...(conEntregas ? [{ header: 'Recibido', key: 'recibido', width: 12, centrada: true }] : []),
-        { header: 'Diferencia', key: 'diferencia', width: 12, centrada: true }
+        ...columnasDiferencias(conEntregas)
     ];
 }
 
@@ -93,7 +120,7 @@ function filasResumenGeneral(resumenGeneral, codigosAntiguos = new Map()) {
         pedido: t.cantidad_solicitada,
         enviado: t.cantidad_asignada,
         recibido: t.cantidad_recibida,
-        diferencia: t.cantidad_solicitada - t.cantidad_asignada
+        ...valoresDiferencias(t.cantidad_solicitada, t.cantidad_asignada, t.cantidad_recibida)
     }));
 }
 
@@ -113,7 +140,7 @@ function columnasDetalle(conEntregas, conFecha) {
         { header: 'Pedido', key: 'pedido', width: 12, centrada: true },
         { header: 'Enviado', key: 'enviado', width: 12, centrada: true },
         ...(conEntregas ? [{ header: 'Recibido', key: 'recibido', width: 12, centrada: true }] : []),
-        { header: 'Diferencia', key: 'diferencia', width: 12, centrada: true },
+        ...columnasDiferencias(conEntregas),
         ...(conEntregas ? [
             { header: 'Delivery DocEntry', key: 'delivery_docentry', width: 18, centrada: true },
             { header: 'Delivery DocNum', key: 'delivery_docnum', width: 18, centrada: true },
@@ -147,7 +174,7 @@ function filasDetalle(rutasConBloques, etiquetaEstado, fecha, extras = {}) {
                     pedido: item.cantidad_solicitada,
                     enviado: item.cantidad_asignada,
                     recibido: item.cantidad_recibida,
-                    diferencia: item.cantidad_solicitada - item.cantidad_asignada,
+                    ...valoresDiferencias(item.cantidad_solicitada, item.cantidad_asignada, item.cantidad_recibida),
                     delivery_docentry: bloque.sap_delivery_docentry,
                     delivery_docnum: bloque.sap_delivery_docnum,
                     entry_docentry: bloque.sap_entry_docentry,
@@ -237,10 +264,12 @@ function construirExcelDetalle({
 
 // Excel del reporte por RANGO de fechas (búsqueda avanzada): documento
 // distinto al de una sola fecha. fechas: [{ fecha, rutasConBloques }]
-// ordenadas por fecha. No lleva hoja de tiendas sin pedido.
+// ordenadas por fecha. Solo el de verduras lleva hoja de tiendas sin pedido,
+// por semana y por jueves/viernes (faltantesPorSemana:
+// [{ semana, lunes, domingo, dias: [{ fecha, nombre_dia, faltantes }] }]).
 function construirExcelDetalleRango({
     fechaDesde, fechaHasta, descripcionFiltros, fechas, resumenGeneral, conEntregas, resumenEstados, etiquetaEstado,
-    conCarga = false, codigosEmpresa, codigosAntiguos
+    conCarga = false, codigosEmpresa, codigosAntiguos, faltantesPorSemana = null
 }) {
     const libro = nuevoLibro();
     const lineaRango = `Fechas de entrega: ${fechaTexto(fechaDesde)} al ${fechaTexto(fechaHasta)}`;
@@ -286,6 +315,47 @@ function construirExcelDetalleRango({
         ], filasCarga);
     }
 
+    if (!faltantesPorSemana) return libro;
+
+    // ---- Tiendas sin pedido por semana (verduras: jueves y viernes) ----
+    const hojaFaltantes = libro.addWorksheet('Tiendas sin pedido');
+    agregarTitulo(hojaFaltantes, 'Tiendas sin pedido por semana (jueves y viernes)', [lineaRango, descripcionFiltros]);
+
+    const filasFaltantes = [];
+    faltantesPorSemana.forEach((semana) => {
+        const etiquetaSemana = `Semana ${semana.semana} (${fechaTexto(semana.lunes)} al ${fechaTexto(semana.domingo)})`;
+
+        semana.dias.forEach((dia) => {
+            dia.faltantes.forEach((porDivision) => {
+                porDivision.rutas.forEach((ruta) => {
+                    ruta.tiendas.forEach((tienda) => {
+                        filasFaltantes.push({
+                            semana: etiquetaSemana,
+                            fecha: fechaExcel(dia.fecha),
+                            dia: dia.nombre_dia,
+                            division: `División ${porDivision.division}`,
+                            ruta: ruta.nombre_ruta,
+                            tienda
+                        });
+                    });
+                });
+            });
+        });
+    });
+
+    if (filasFaltantes.length === 0) {
+        hojaFaltantes.addRow(['Todas las tiendas asignadas hicieron pedido en todos los jueves y viernes del rango.']);
+    } else {
+        agregarTabla(hojaFaltantes, [
+            { header: 'Semana', key: 'semana', width: 34 },
+            { header: 'Fecha de entrega', key: 'fecha', width: 16, centrada: true, numFmt: 'dd/mm/yyyy' },
+            { header: 'Día', key: 'dia', width: 10 },
+            { header: 'División', key: 'division', width: 14 },
+            { header: 'Ruta', key: 'ruta', width: 26 },
+            { header: 'Tienda', key: 'tienda', width: 40 }
+        ], filasFaltantes);
+    }
+
     return libro;
 }
 
@@ -315,7 +385,7 @@ function construirExcelEnTransito({ secciones, viajes = [], tituloTipo, conMuell
             { header: 'Artículo', key: 'nombre', width: 44 },
             { header: 'Pedido', key: 'pedido', width: 12, centrada: true },
             { header: 'Enviado', key: 'enviado', width: 12, centrada: true },
-            { header: 'Diferencia', key: 'diferencia', width: 12, centrada: true }
+            ...columnasDiferencias(false)
         ];
 
         const filas = [];

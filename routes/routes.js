@@ -25,6 +25,7 @@ const notificacionContextos = require('../controllers/core/notificacion_contexto
 const pilotoClienteSap = require('../controllers/core/piloto_cliente_sap.controller.js');
 const roles = require('../controllers/core/rol.controller.js');
 const usuarioMuellePollo = require('../controllers/core/usuario_muelle_pollo.controller.js');
+const sedeTransporte = require('../controllers/core/sede_transporte.controller.js');
 const visitas = require('../controllers/core/visita.controller.js');
 const marcajes = require('../controllers/core/marcaje.controller.js');
 const pedidoEspecial = require('../controllers/core/pedido_especial.controller.js');
@@ -60,6 +61,7 @@ router.get('/menus/getAllMenus', auth, menus.getAllMenus);
 router.get('/menus/getPermiso', auth, menus.getPermiso);
 router.get('/menus/getAllMenusAdmin', auth, menus.getAllMenusAdmin);
 router.post('/menus/crearMenu', auth, menus.crearMenu);
+router.put('/menus/actualizarMenu/:id', auth, menus.actualizarMenu);
 router.put('/menus/actualizarVisibilidad/:id', auth, menus.actualizarVisibilidadMenu);
 router.get('/menus/getRolesDeMenu', auth, menus.getRolesDeMenu);
 router.post('/menus/asignarRolAMenu', auth, menus.asignarRolAMenu);
@@ -110,6 +112,14 @@ router.post('/pedidoArtesano/sincronizarPilotoRuta', auth, pedidoArtesano.sincro
 router.get('/pedidoArtesano/generarReporteDetalle', auth, pedidoArtesano.generarReporteDetalle);
 router.get('/pedidoArtesano/generarReporteEnTransito', auth, pedidoArtesano.generarReporteEnTransito);
 
+//SEDES DE PILOTOS Y CAMIONES (POLLO)
+router.get('/sedeTransporte/getAsignacionesSede', auth, sedeTransporte.getAsignacionesSede);
+router.get('/sedeTransporte/getMapaSedes', auth, sedeTransporte.getMapaSedes);
+router.post('/sedeTransporte/asignarPiloto', auth, sedeTransporte.asignarPiloto);
+router.post('/sedeTransporte/quitarPiloto', auth, sedeTransporte.quitarPiloto);
+router.post('/sedeTransporte/asignarCamion', auth, sedeTransporte.asignarCamion);
+router.post('/sedeTransporte/quitarCamion', auth, sedeTransporte.quitarCamion);
+
 //VISITAS A AVICOLAS
 router.get('/visita/getUsuarios', auth, visitas.getUsuariosConVisitas);
 router.get('/visita/buscarVisitas', auth, visitas.buscarVisitas);
@@ -137,6 +147,7 @@ router.post('/pedido/createPedido', auth, pedidos.createPedido)
 router.post('/pedido/subirArchivoPedidoPos', limitePedidosPos, upload.uploadPedidosPos.any(), pedidos.subirYProcesarArchivosPedidoPos)
 router.post('/pedido/crearPedidoActivoFijo', auth, pedidos.crearPedidoActivoFijo)
 router.post('/pedido/cambiarFechaRequerida', auth, pedidos.cambiarFechaRequeridaPedido)
+router.post('/pedido/cancelarPedido', auth, pedidos.cancelarPedido)
 router.get('/pedido/buscarPedidosActivoFijo', auth, pedidos.buscarPedidosActivoFijo)
 router.get('/pedido/getPedidosPos', auth, pedidos.getPedidosPos)
 router.get('/pedido/getPedidosPorDivision', auth, pedidos.getPedidosPorDivision)

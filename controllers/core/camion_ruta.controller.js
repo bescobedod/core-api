@@ -26,7 +26,9 @@ const CONTEXTO_NOTIFICACION_ENTREGA = {
     POLLO: 'ENTREGA_PRODUCTO_POLLO',
     INSUMOS: 'ENTREGA_PRODUCTO_INSUMOS'
 };
-const TIPOS_INSUMOS_Y_ACTIVO_FIJO = ['INSUMOS', 'ACTIVO_FIJO'];
+// Insumos, Activo Fijo y Verduras comparten bodega "01"; las verduras van
+// en sus propias rutas (13/14), así que filtrar por ruta_id no las mezcla.
+const TIPOS_FLUJO_INSUMOS = ['INSUMOS', 'ACTIVO_FIJO', 'VERDURA'];
 
 DespachoRutaModel.belongsTo(CatalogoRutaPolloModel, { foreignKey: 'ruta_id', as: 'rutaPollo' });
 DespachoRutaModel.belongsTo(CatalogoRutaInsumosModel, { foreignKey: 'ruta_id', as: 'rutaInsumos' });
@@ -138,7 +140,7 @@ async function obtenerCodigosCandidatos(tipo, rutaId, fecha) {
     const where = {
         ruta_id: rutaId,
         fecha_requerida: fecha,
-        tipo_pedido: tipo === 'POLLO' ? 'POLLO' : { [Op.in]: TIPOS_INSUMOS_Y_ACTIVO_FIJO }
+        tipo_pedido: tipo === 'POLLO' ? 'POLLO' : { [Op.in]: TIPOS_FLUJO_INSUMOS }
     };
 
     const cabeceras = await PedidoPosCabeceraModel.findAll({ where, attributes: ['id'] });
@@ -252,7 +254,7 @@ async function getDetalleTiendas(req, res) {
             where: {
                 ruta_id,
                 fecha_requerida: fechaConsulta,
-                tipo_pedido: tipo === 'POLLO' ? 'POLLO' : { [Op.in]: TIPOS_INSUMOS_Y_ACTIVO_FIJO }
+                tipo_pedido: tipo === 'POLLO' ? 'POLLO' : { [Op.in]: TIPOS_FLUJO_INSUMOS }
             },
             attributes: ['id', 'codigo_tienda', 'nombre_tienda', 'estado'],
             order: [['nombre_tienda', 'ASC']]

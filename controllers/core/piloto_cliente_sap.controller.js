@@ -5,9 +5,9 @@ const { buscarClientesPollo, buscarClientesInsumos } = require('../../integratio
 
 const ROL_PILOTO_PIOAPP = 1;
 
-// Busca usuarios de PioApp con id_rol = 1 (pilotos) por nombre (en
-// cualquiera de los 4 campos: primer/segundo nombre, primer/segundo
-// apellido) o por código de empleado — nunca lista todos de una vez.
+// Lista los usuarios de PioApp con id_rol = 1 (pilotos). Sin `query` trae
+// todos; con `query` filtra por nombre (en cualquiera de los 4 campos) o por
+// código de empleado, máximo 30.
 // Devuelve el CardCode de SAP ya asignado para ese tipo (POLLO -> AVIGUA,
 // INSUMOS -> CORPO), si lo tiene. PioApp y Core son bases distintas, así 
 // que el cruce se hace en JS, no con un include de Sequelize.
@@ -18,27 +18,33 @@ async function getPilotos(req, res) {
         return res.status(400).json({ error: "tipo debe ser 'POLLO' o 'INSUMOS'", success: false });
     }
 
-    if (!query || query.trim().length < 2) {
+    // query es opcional: sin él se devuelven TODOS los pilotos (la vista los
+    // lista completos y filtra en pantalla); con él, solo los que coinciden.
+    const texto = typeof query === 'string' ? query.trim() : '';
+
+    if (texto.length === 1) {
         return res.status(400).json({ error: 'query debe tener al menos 2 caracteres', success: false });
     }
 
     try {
-        const safeQuery = `%${query.trim()}%`;
+        const safeQuery = `%${texto}%`;
 
         const usuarios = await UsersModel.findAll({
             where: {
                 id_rol: ROL_PILOTO_PIOAPP,
-                [Op.or]: [
-                    { first_name: { [Op.iLike]: safeQuery } },
-                    { second_name: { [Op.iLike]: safeQuery } },
-                    { first_last_name: { [Op.iLike]: safeQuery } },
-                    { second_last_name: { [Op.iLike]: safeQuery } },
-                    { codigo_user: { [Op.iLike]: safeQuery } }
-                ]
+                ...(texto ? {
+                    [Op.or]: [
+                        { first_name: { [Op.iLike]: safeQuery } },
+                        { second_name: { [Op.iLike]: safeQuery } },
+                        { first_last_name: { [Op.iLike]: safeQuery } },
+                        { second_last_name: { [Op.iLike]: safeQuery } },
+                        { codigo_user: { [Op.iLike]: safeQuery } }
+                    ]
+                } : {})
             },
             attributes: ['id_users', 'codigo_user', 'first_name', 'second_name', 'first_last_name', 'second_last_name', 'email_office'],
-            order: [['first_name', 'ASC']],
-            limit: 30
+            order: [['first_name', 'ASC'], ['first_last_name', 'ASC']],
+            ...(texto ? { limit: 30 } : {})
         });
 
         const asignaciones = await PilotoClienteSapModel.findAll({
