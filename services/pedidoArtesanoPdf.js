@@ -1,7 +1,6 @@
 const fs = require('fs');
 const path = require('path');
 const PDFDocument = require('pdfkit');
-const QRCode = require('qrcode');
 
 // Constancia de envío de un pedido de pollo artesano: una página por pedido, en
 // media carta (5.5 x 8.5 in) como el envío que se imprime hoy en Nomina. Se firma
@@ -13,16 +12,6 @@ const MARGEN = 28;
 // Logo de Avígua. Si el archivo no está, el envío sale sin logo.
 const RUTA_LOGO = path.join(__dirname, '..', 'assets', 'logos', 'avigua.png');
 const TAMANO_LOGO = 50;
-
-// QR de la esquina inferior derecha: la PioApp lo escanea al entregar. Lleva el id y el número del pedido.
-const TAMANO_QR = 66;
-
-async function generarQr(pedido) {
-    const carga = JSON.stringify({ tipo: 'POLLO_ARTESANO', id_pedido: pedido.id, serie: pedido.numero_pedido });
-
-    // Corrección baja: menos módulos, más legible en tamaño pequeño.
-    return QRCode.toBuffer(carga, { margin: 0, errorCorrectionLevel: 'L', width: 330 });
-}
 
 function formatearFecha(fecha) {
     const [anio, mes, dia] = String(fecha).slice(0, 10).split('-');
@@ -63,10 +52,12 @@ function dibujarCuadroCobro(doc, pedido, yPie) {
     datos.push(['Código', pedido.codigo_empleado]);
     datos.push(['Nombre', pedido.cliente_nombre]);
     datos.push(['Pago', TEXTO_PAGO[pedido.condicion_pago] || pedido.condicion_pago]);
-    if (pedido.condicion_pago === 'DEPOSITO' && pedido.numero_boleta) datos.push(['Boleta', pedido.numero_boleta]);
+    const boletas = (pedido.depositos || []).map(d => d.numero_boleta).join(', ');
+
+    if (pedido.condicion_pago === 'DEPOSITO' && boletas) datos.push(['Boleta', boletas]);
 
     const altoTotal = datos.length * alto.fila + alto.encabezado + lineas.length * alto.linea + alto.total;
-    const y0 = yPie - altoTotal - 24; // deja aire sobre el pie y el QR
+    const y0 = yPie - altoTotal - 24; // deja aire sobre el pie
     const colEtiqueta = 62;
     const cols = [{ w: ancho - 172, align: 'left' }, { w: 58, align: 'right' }, { w: 48, align: 'center' }, { w: 66, align: 'right' }];
     let y = y0;
@@ -122,7 +113,7 @@ function dibujarCuadroCobro(doc, pedido, yPie) {
     doc.text(sinPrecio ? 'Sin precio' : formatearQuetzales(total), x + ancho - 74, y + 6, { width: 70, align: 'right', lineBreak: false });
 }
 
-function dibujarPedido(doc, pedido, numeroPagina, conCuadro, qr) {
+function dibujarPedido(doc, pedido, numeroPagina, conCuadro) {
     const ancho = ANCHO - MARGEN * 2;
     const tercio = ancho / 3;
     let y = MARGEN;
@@ -193,12 +184,8 @@ function dibujarPedido(doc, pedido, numeroPagina, conCuadro, qr) {
 
     doc.font('Helvetica-Bold').fontSize(10);
     doc.text('DEVOLUCION EN TIENDA', MARGEN, yPie, { width: ancho });
-    // El pie deja libre la esquina derecha para el QR.
-    const anchoPie = ancho - TAMANO_QR - 10;
-    doc.text('NOMBRE:______________________________', MARGEN, yPie + 16, { width: anchoPie });
-    doc.text('FIRMA QUIEN RECIBE: ________________', MARGEN, yPie + 32, { width: anchoPie });
-
-    doc.image(qr, ANCHO - MARGEN - TAMANO_QR, ALTO - MARGEN - TAMANO_QR, { width: TAMANO_QR, height: TAMANO_QR });
+    doc.text('NOMBRE:______________________________', MARGEN, yPie + 16, { width: ancho });
+    doc.text('FIRMA QUIEN RECIBE: ________________', MARGEN, yPie + 32, { width: ancho });
 
     doc.font('Helvetica').fontSize(8).text(`Página ${numeroPagina}`, MARGEN, ALTO - 16, { width: ancho, align: 'right' });
 }
@@ -207,8 +194,6 @@ function dibujarPedido(doc, pedido, numeroPagina, conCuadro, qr) {
 // conCuadro: agrega el cuadro de cobro a los pedidos de colaboradores (es el envío de Pollo Artesano;
 // Avícola lo imprime sin él).
 async function generarPdfEnvios(res, pedidos, nombreArchivo, { conCuadro = false } = {}) {
-    // Los QR se generan antes de escribir la respuesta.
-    const qrs = await Promise.all(pedidos.map(generarQr));
     const doc = new PDFDocument({ size: [ANCHO, ALTO], margin: MARGEN, autoFirstPage: false });
 
     res.setHeader('Content-Type', 'application/pdf');
@@ -220,7 +205,7 @@ async function generarPdfEnvios(res, pedidos, nombreArchivo, { conCuadro = false
         // El número de página y el pie van dentro del margen inferior: sin esto pdfkit
         // los toma por desborde y agrega una página en blanco después de cada pedido.
         doc.page.margins.bottom = 0;
-        dibujarPedido(doc, pedido, i + 1, conCuadro, qrs[i]);
+        dibujarPedido(doc, pedido, i + 1, conCuadro);
     });
 
     doc.end();

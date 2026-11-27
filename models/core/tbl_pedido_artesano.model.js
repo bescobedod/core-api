@@ -2,6 +2,7 @@ const { Model, DataTypes } = require('sequelize');
 const { sequelize } = require('../../configuration/db');
 const PedidoArtesanoDetalleModel = require('./tbl_pedido_artesano_detalle.model');
 const PedidoArtesanoHistorialModel = require('./tbl_pedido_artesano_historial.model');
+const PedidoArtesanoDepositoModel = require('./tbl_pedido_artesano_deposito.model');
 
 class PedidoArtesanoModel extends Model {}
 
@@ -26,7 +27,6 @@ PedidoArtesanoModel.init({
     direccion_entrega: { type: DataTypes.STRING(250), allowNull: true },
     telefono_contacto: { type: DataTypes.STRING(30), allowNull: true },
     condicion_pago: { type: DataTypes.STRING(10), allowNull: false }, // DEPOSITO | PLANILLA | PENDIENTE (aún no se paga)
-    numero_boleta: { type: DataTypes.STRING(50), allowNull: true },
     comentario: { type: DataTypes.TEXT, allowNull: true },
     estado: { type: DataTypes.STRING(30), allowNull: false, defaultValue: 'CREADO' },
     creado_por: { type: DataTypes.BIGINT, allowNull: false },
@@ -50,6 +50,8 @@ PedidoArtesanoModel.init({
     entregado_por_nombre: { type: DataTypes.STRING(150), allowNull: true },
     fecha_entrega: { type: DataTypes.DATE, allowNull: true },
     evidencia_entrega_key: { type: DataTypes.TEXT, allowNull: true },
+    // Firma del cliente (PNG en S3) que guarda la PioApp al entregar.
+    firma_entrega_key: { type: DataTypes.TEXT, allowNull: true },
     // Documentos de SAP: transferencia bodega -> camión (al cargar) y entrega (al entregar).
     sap_traslado_docentry: { type: DataTypes.INTEGER, allowNull: true },
     sap_traslado_docnum: { type: DataTypes.INTEGER, allowNull: true },
@@ -70,5 +72,7 @@ PedidoArtesanoDetalleModel.belongsTo(PedidoArtesanoModel, { foreignKey: 'pedido_
 
 PedidoArtesanoModel.hasMany(PedidoArtesanoHistorialModel, { foreignKey: 'pedido_id', as: 'historial' });
 PedidoArtesanoHistorialModel.belongsTo(PedidoArtesanoModel, { foreignKey: 'pedido_id', as: 'pedido' });
+
+PedidoArtesanoModel.hasMany(PedidoArtesanoDepositoModel, { foreignKey: 'pedido_id', as: 'depositos' });
 
 module.exports = PedidoArtesanoModel;

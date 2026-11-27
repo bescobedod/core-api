@@ -66,7 +66,7 @@ function armarViajes(pedidos, catalogo, despachos) {
             nit: p.cliente_nit || '',
             direccion: p.direccion_entrega || '',
             pago: TEXTO_PAGO[p.condicion_pago] || p.condicion_pago || '',
-            boleta: p.numero_boleta || '',
+            boleta: (p.depositos || []).map(d => d.numero_boleta).join(', '),
             sap_traslado: p.sap_traslado_docnum || null,
             sap_traslado_entry: p.sap_traslado_docentry || null,
             sap_entrega: p.sap_entrega_docnum || null,

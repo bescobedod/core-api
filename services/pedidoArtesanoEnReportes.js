@@ -33,6 +33,9 @@ async function despachosDe(pedidos) {
     return new Map(despachos.map(d => [`${d.ruta_id}|${String(d.fecha).slice(0, 10)}`, d.get({ plain: true })]));
 }
 
+// Los nombres de SAP vienen en mayúsculas; se muestran como los de las tiendas (primera letra de cada palabra en mayúscula).
+const formatoNombre = texto => String(texto || '').toLowerCase().replace(/(^|[\s(/-])(\p{L})/gu, (_, sep, letra) => sep + letra.toUpperCase());
+
 // Un bloque con la misma forma que construirBloquesPedido de los pedidos de tienda.
 // Las cantidades van en unidades de SAP (bolsas), igual que las tiendas, para que los totales se puedan sumar.
 function aBloque(p, unidades, despachos) {
@@ -70,7 +73,7 @@ function aBloque(p, unidades, despachos) {
 
                 return {
                     codigo_producto: d.codigo_producto,
-                    nombre_producto: d.descripcion_producto,
+                    nombre_producto: formatoNombre(d.descripcion_producto),
                     unidad_medida: d.unidad_medida || 'UND',
                     cantidad_solicitada: Number(d.cantidad) * factor(d.codigo_producto),
                     cantidad_asignada: salio && aut !== null ? aut * factor(d.codigo_producto) : 0,
@@ -133,7 +136,7 @@ async function datosClientesResumenRuta(rutaId, fecha) {
         const clave = `cliente:${p.cliente_id}`;
 
         if (!columnas.some(c => c.codigo_tienda === clave)) {
-            columnas.push({ codigo_tienda: clave, nombre_tienda: `${p.cliente_nombre} (Cliente)` });
+            columnas.push({ codigo_tienda: clave, nombre_tienda: p.cliente_nombre, es_cliente: true, referencia: p.nombre_tienda_referencia || null });
         }
 
         p.detalle.forEach((d) => {
@@ -144,7 +147,7 @@ async function datosClientesResumenRuta(rutaId, fecha) {
             cantidades.push({
                 clave,
                 codigo_producto: d.codigo_producto,
-                nombre_producto: d.descripcion_producto,
+                nombre_producto: formatoNombre(d.descripcion_producto),
                 unidad_medida: d.unidad_medida || 'UND',
                 cantidad: aut * (unidades.get(d.codigo_producto) || 1)
             });
@@ -178,9 +181,49 @@ async function productosClientesReporte() {
 
     return [...masReciente.values()].map(f => ({
         codigo_producto: f.codigo_producto,
-        descripcion_producto: f.descripcion_producto || f.codigo_producto,
+        descripcion_producto: formatoNombre(f.descripcion_producto) || f.codigo_producto,
         unidad_medida: f.unidad_medida || null
     }));
 }
 
-module.exports = { bloquesClientesDetalle, bloquesClientesEnTransito, datosClientesResumenRuta, productosClientesReporte };
+// Bloques de los clientes de una ruta y fecha (los que van a despacharse), para la hoja de entrega con firma.
+function bloquesClientesRuta(rutaId, fecha) {
+    return armarBloques({ ruta_id: rutaId, fecha_requerida: fecha, estado: { [Op.in]: ESTADOS_DESPACHABLES } }, null);
+}
+
+// Lo que los clientes suben al camión en una ruta y fecha (ya enviados), para el ticket de traslado: totales por artículo en
+// unidades de SAP y los documentos de la transferencia.
+async function datosClientesTicket(rutaId, fecha) {
+    const pedidos = await PedidoArtesanoModel.findAll({
+        where: { ruta_id: rutaId, fecha_requerida: fecha, estado: { [Op.in]: ['EN_TRANSITO', 'ENTREGADO'] } },
+        include: [{ model: PedidoArtesanoDetalleModel, as: 'detalle' }],
+        order: [['numero_pedido', 'ASC']]
+    });
+    const unidades = await unidadesPorProducto();
+    const porCodigo = new Map();
+
+    pedidos.forEach(p => (p.detalle || []).forEach((d) => {
+        const aut = Number(d.cantidad_autorizada);
+
+        if (!Number.isFinite(aut) || aut <= 0) return;
+
+        const linea = porCodigo.get(d.codigo_producto) || {
+            codigo_producto: d.codigo_producto,
+            descripcion_producto: formatoNombre(d.descripcion_producto),
+            unidad_medida: d.unidad_medida || 'UND',
+            cantidad: 0
+        };
+
+        linea.cantidad += aut * (unidades.get(d.codigo_producto) || 1);
+        porCodigo.set(d.codigo_producto, linea);
+    }));
+
+    return {
+        hayPedidos: pedidos.length > 0,
+        enTransito: pedidos.some(p => p.estado === 'EN_TRANSITO'),
+        lineas: [...porCodigo.values()],
+        docnums: [...new Set(pedidos.map(p => p.sap_traslado_docnum).filter(Boolean))]
+    };
+}
+
+module.exports = { datosClientesTicket, bloquesClientesRuta, bloquesClientesDetalle, bloquesClientesEnTransito, datosClientesResumenRuta, productosClientesReporte };

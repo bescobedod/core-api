@@ -83,14 +83,19 @@ router.post('/pedidoEspecial/marcarListo', auth, pedidoEspecial.marcarListo);
 
 //POLLO ARTESANO
 router.get('/pedidoArtesano/getProductos', auth, pedidoArtesano.getProductos);
-router.get('/pedidoArtesano/getUsuarios', auth, pedidoArtesano.getUsuarios);
+router.get('/pedidoArtesano/getClientesPedidos', auth, pedidoArtesano.getClientesPedidos);
+router.get('/pedidoArtesano/getPrecios', auth, pedidoArtesano.getPrecios);
 router.get('/pedidoArtesano/getPedidos', auth, pedidoArtesano.getPedidos);
 router.get('/pedidoArtesano/buscarClientes', auth, pedidoArtesano.buscarClientes);
 router.post('/pedidoArtesano/crearCliente', auth, pedidoArtesano.crearCliente);
 router.post('/pedidoArtesano/crearPedido', auth, pedidoArtesano.crearPedido);
 router.post('/pedidoArtesano/editarPedido', auth, pedidoArtesano.editarPedido);
 router.post('/pedidoArtesano/completarPago', auth, pedidoArtesano.completarPago);
+router.post('/pedidoArtesano/registrarDeposito', auth, pedidoArtesano.registrarDeposito);
+router.post('/pedidoArtesano/editarDeposito', auth, pedidoArtesano.editarDeposito);
+router.post('/pedidoArtesano/eliminarDeposito', auth, pedidoArtesano.eliminarDeposito);
 router.post('/pedidoArtesano/cancelar', auth, pedidoArtesano.cancelar);
+router.post('/pedidoArtesano/cambiarFechaRequerida', auth, pedidoArtesano.cambiarFechaRequerida);
 router.get('/pedidoArtesano/getPedidosRuta', auth, pedidoArtesano.getPedidosRuta);
 router.get('/pedidoArtesano/getResumenRutas', auth, pedidoArtesano.getResumenRutas);
 router.get('/pedidoArtesano/getComparativoRuta', auth, pedidoArtesano.getComparativoRuta);

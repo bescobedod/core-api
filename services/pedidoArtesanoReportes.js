@@ -1,4 +1,5 @@
 const ExcelJS = require('exceljs');
+const { PNG } = require('pngjs');
 const { acortarNombre } = require('./nombres.service');
 
 const MIME_XLSX = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
@@ -104,6 +105,10 @@ const COLUMNAS_PEDIDOS = [
     { header: 'Evidencia de entrega', key: 'evidencia', width: 12, centrada: true }
 ];
 
+function boletasDe(pedido) {
+    return (pedido.depositos || []).map(d => d.numero_boleta).join(', ');
+}
+
 // Una fila por línea de producto de cada pedido, con los datos del pedido repetidos.
 function construirHojaPedidos(libro, datos, catalogo) {
     const hoja = libro.addWorksheet('Pedidos');
@@ -135,7 +140,7 @@ function construirHojaPedidos(libro, datos, catalogo) {
                 direccion: p.direccion_entrega,
                 telefono: p.telefono_contacto || '',
                 pago: { DEPOSITO: 'Depósito', PLANILLA: 'Planilla', PENDIENTE: 'Pendiente' }[p.condicion_pago] || p.condicion_pago,
-                boleta: p.numero_boleta || '',
+                boleta: boletasDe(p),
                 comentario: p.comentario || '',
                 creado_por: acortarNombre(p.creado_por_nombre),
                 creado_en: formatearFechaHora(p.creado_en),
@@ -286,6 +291,11 @@ function textoObservaciones(pedido, codigoEmpleado) {
     return pedido.comentario ? `${base} ${pedido.comentario}` : base;
 }
 
+// Autorización, banco, fecha y cantidad de un depósito; en blanco si no hay.
+function columnasDeposito(d) {
+    return d ? [d.numero_boleta, d.banco || '', formatearFecha(d.fecha_deposito), Number(d.monto)] : ['', '', '', ''];
+}
+
 function textoSinEnvio(p) {
     const cancelado = p.estado === 'CANCELADO';
     const motivo = cancelado ? p.motivo_cancelacion : p.motivo_rechazo;
@@ -293,7 +303,79 @@ function textoSinEnvio(p) {
     return `Envío ${cancelado ? 'cancelado' : 'rechazado'}${motivo ? `: ${motivo}` : ''}`;
 }
 
-function construirHojaCliente(libro, nombreHoja, pedidos, codigoEmpleado, catalogo) {
+// El alto del encabezado va fijo para que la firma no se desplace en visores que lo recalculan.
+const ALTO_FILA_ENCABEZADO = 45;
+const ALTO_FILA_FIRMA = 48;
+const ANCHO_COLUMNA_FIRMA = 24;
+const CELDA_FIRMA_PX = { width: Math.round(ANCHO_COLUMNA_FIRMA * 7 + 5), height: Math.round(ALTO_FILA_FIRMA * 96 / 72) };
+const MAXIMO_FIRMA = { width: 150, height: 52 };
+const EMU_POR_PIXEL = 9525;
+
+// Deja solo el trazo: la PioApp guarda todo el recuadro de firma, con el dibujo en cualquier parte.
+function recortarFirma(png) {
+    const { width, height, data } = PNG.sync.read(png);
+    let x0 = width, y0 = height, x1 = -1, y1 = -1;
+
+    for (let y = 0; y < height; y += 1) {
+        for (let x = 0; x < width; x += 1) {
+            const i = (y * width + x) * 4;
+
+            // Trazo: pixel visible que no es blanco.
+            if (data[i + 3] > 20 && Math.min(data[i], data[i + 1], data[i + 2]) < 235) {
+                x0 = Math.min(x0, x);
+                y0 = Math.min(y0, y);
+                x1 = Math.max(x1, x);
+                y1 = Math.max(y1, y);
+            }
+        }
+    }
+
+    if (x1 < 0) return null;
+
+    const salida = new PNG({ width: x1 - x0 + 1, height: y1 - y0 + 1 });
+
+    for (let y = 0; y < salida.height; y += 1) {
+        const desde = ((y0 + y) * width + x0) * 4;
+
+        data.copy(salida.data, y * salida.width * 4, desde, desde + salida.width * 4);
+    }
+
+    return { buffer: PNG.sync.write(salida), width: salida.width, height: salida.height };
+}
+
+// Inserta la firma centrada en su celda y sin deformarla.
+function insertarFirma(libro, hoja, fila, columna, png) {
+    let firma;
+
+    try {
+        firma = recortarFirma(png);
+    } catch (error) {
+        console.error('[PedidoArtesano] La firma no es un PNG válido:', error.message);
+        return false;
+    }
+
+    if (!firma) return false;
+
+    const escala = Math.min(MAXIMO_FIRMA.width / firma.width, MAXIMO_FIRMA.height / firma.height);
+    const ext = { width: Math.round(firma.width * escala), height: Math.round(firma.height * escala) };
+    const imagen = libro.addImage({ buffer: firma.buffer, extension: 'png' });
+
+    fila.height = ALTO_FILA_FIRMA;
+    hoja.addImage(imagen, {
+        tl: {
+            nativeCol: columna - 1,
+            nativeColOff: Math.round((CELDA_FIRMA_PX.width - ext.width) / 2) * EMU_POR_PIXEL,
+            nativeRow: fila.number - 1,
+            nativeRowOff: Math.round((CELDA_FIRMA_PX.height - ext.height) / 2) * EMU_POR_PIXEL
+        },
+        ext,
+        editAs: 'oneCell'
+    });
+
+    return true;
+}
+
+function construirHojaCliente(libro, nombreHoja, pedidos, codigoEmpleado, catalogo, firmas) {
     const hoja = libro.addWorksheet(nombreHoja);
 
     // Productos que pidió el cliente, en el orden del catálogo; el nombre es el del pedido más reciente.
@@ -311,7 +393,7 @@ function construirHojaCliente(libro, nombreHoja, pedidos, codigoEmpleado, catalo
         'Observaciones', 'Fecha', 'No. Envio', 'Ruta',
         'Facturación', 'Autorización', 'Banco', 'Fecha de depósito', 'Cantidad depositada',
         ...codigos.map(c => `Total ${nombres.get(c)}`),
-        'Nombre', 'Firma', 'Obs'
+        'Firma Cliente', 'Obs de Rechazo'
     ];
 
     const filaEncabezado = hoja.addRow(encabezados);
@@ -320,15 +402,17 @@ function construirHojaCliente(libro, nombreHoja, pedidos, codigoEmpleado, catalo
     const colAutorizacion = colObservaciones + 5;
     const colUltimoDeposito = colObservaciones + 8;
     const colPrimerTotal = colUltimoDeposito + 1;
+    const colFirma = colPrimerTotal + codigos.length;
 
     filaEncabezado.font = { bold: true };
     filaEncabezado.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
+    filaEncabezado.height = ALTO_FILA_ENCABEZADO;
 
     for (let c = colFacturacion; c <= colUltimoDeposito; c += 1) {
         filaEncabezado.getCell(c).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: ARGB_DEPOSITO } };
     }
 
-    const anchos = [2.4, 20, ...codigos.map(() => 13), 45, 12, 16, 22, 28, 15, 10, 20, 22, ...codigos.map(() => 18), 18, 18, 34];
+    const anchos = [2.4, 20, ...codigos.map(() => 13), 45, 12, 16, 22, 28, 15, 10, 20, 22, ...codigos.map(() => 18), ANCHO_COLUMNA_FIRMA, 34];
 
     anchos.forEach((ancho, i) => { hoja.getColumn(i + 1).width = ancho; });
 
@@ -340,6 +424,8 @@ function construirHojaCliente(libro, nombreHoja, pedidos, codigoEmpleado, catalo
         const lineas = new Map((p.detalle || []).map(l => [l.codigo_producto, l]));
         const numeroFila = hoja.rowCount + 1;
         const facturacion = [p.cliente_nit, acortarNombre(p.cliente_nombre)].filter(Boolean).join(' - ');
+        // El primer depósito va en la fila del pedido y los demás en filas propias debajo.
+        const [primero, ...siguientes] = p.depositos || [];
 
         const valores = [
             '',
@@ -350,10 +436,7 @@ function construirHojaCliente(libro, nombreHoja, pedidos, codigoEmpleado, catalo
             p.numero_pedido,
             p.nombre_ruta,
             facturacion,
-            planilla ? 'N/A' : (p.condicion_pago === 'DEPOSITO' && p.numero_boleta ? p.numero_boleta : ''),
-            planilla ? 'N/A' : '',
-            planilla ? 'N/A' : '',
-            planilla ? 'N/A' : '',
+            ...(planilla ? ['N/A', 'N/A', 'N/A', 'N/A'] : columnasDeposito(primero)),
             ...codigos.map((c, i) => {
                 const linea = lineas.get(c);
 
@@ -366,23 +449,41 @@ function construirHojaCliente(libro, nombreHoja, pedidos, codigoEmpleado, catalo
                 return { formula: `${precio}*${columna}${numeroFila}`, result: redondear(precio * cantidadEnvio(linea)) };
             }),
             '',
-            '',
             rechazado ? textoSinEnvio(p) : ''
         ];
 
+        // Se recorren todas las columnas para que las filas de depósito también lleven bordes.
+        const darFormato = (filaHoja) => {
+            for (let col = 1; col <= encabezados.length; col += 1) {
+                const celda = filaHoja.getCell(col);
+                const esTexto = col === colObservaciones || col === 2 || col === encabezados.length;
+
+                celda.border = { top: BORDE_FINO, left: BORDE_FINO, bottom: BORDE_FINO, right: BORDE_FINO };
+                celda.alignment = { horizontal: esTexto ? 'left' : 'center', vertical: 'middle', wrapText: col === colObservaciones };
+
+                if (col >= 3 && col < colObservaciones) celda.numFmt = '0';
+                if (col === colUltimoDeposito || (col >= colPrimerTotal && col < colPrimerTotal + codigos.length)) celda.numFmt = FORMATO_MONEDA;
+
+                if (rechazado) celda.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: ARGB_RECHAZADO } };
+            }
+        };
+
         const fila = hoja.addRow(valores);
 
-        fila.eachCell({ includeEmpty: true }, (celda, col) => {
-            celda.border = { top: BORDE_FINO, left: BORDE_FINO, bottom: BORDE_FINO, right: BORDE_FINO };
+        darFormato(fila);
 
-            const esTexto = col === colObservaciones || col === 2 || col === valores.length;
+        // La firma solo existe en pedidos entregados desde la PioApp.
+        if (firmas.has(p.id)) {
+            const png = firmas.get(p.id);
 
-            celda.alignment = { horizontal: esTexto ? 'left' : 'center', vertical: 'middle', wrapText: col === colObservaciones };
+            if (!png || !insertarFirma(libro, hoja, fila, colFirma, png)) fila.getCell(colFirma).value = 'No se pudo cargar la firma';
+        }
 
-            if (col >= 3 && col < colObservaciones) celda.numFmt = '0';
-            if (col === colUltimoDeposito || (col >= colPrimerTotal && col < colPrimerTotal + codigos.length)) celda.numFmt = FORMATO_MONEDA;
+        siguientes.forEach((d) => {
+            const extra = hoja.addRow([]);
 
-            if (rechazado) celda.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: ARGB_RECHAZADO } };
+            columnasDeposito(d).forEach((valor, i) => { extra.getCell(colAutorizacion + i).value = valor; });
+            darFormato(extra);
         });
     });
 
@@ -391,14 +492,15 @@ function construirHojaCliente(libro, nombreHoja, pedidos, codigoEmpleado, catalo
     // Marca en rojo los números de autorización repetidos.
     if (ordenados.length > 0) {
         const letra = hoja.getColumn(colAutorizacion).letter;
-        const rango = `${letra}2:${letra}${ordenados.length + 1}`;
+        const ultimaFila = hoja.rowCount;
+        const rango = `${letra}2:${letra}${ultimaFila}`;
 
         hoja.addConditionalFormatting({
             ref: rango,
             rules: [{
                 type: 'expression',
                 priority: 1,
-                formulae: [`AND(LEN(${letra}2)>0,${letra}2<>"N/A",COUNTIF($${letra}$2:$${letra}$${ordenados.length + 1},${letra}2)>1)`],
+                formulae: [`AND(LEN(${letra}2)>0,${letra}2<>"N/A",COUNTIF($${letra}$2:$${letra}$${ultimaFila},${letra}2)>1)`],
                 style: {
                     fill: { type: 'pattern', pattern: 'solid', bgColor: { argb: 'FFFFC7CE' } },
                     font: { color: { argb: 'FF9C0006' } }
@@ -408,7 +510,7 @@ function construirHojaCliente(libro, nombreHoja, pedidos, codigoEmpleado, catalo
     }
 }
 
-// datos: { pedidos (con detalle), clientes (Map id -> codigo_empleado), productos (catálogo) }
+// datos: { pedidos (con detalle), clientes (Map id -> codigo_empleado), productos (catálogo), firmas (Map id -> PNG o null) }
 async function enviarExcelPorCliente(res, datos, nombreArchivo) {
     const catalogo = new Map(datos.productos.map(p => [p.codigo_producto, p]));
     const libro = new ExcelJS.Workbook();
@@ -424,7 +526,7 @@ async function enviarExcelPorCliente(res, datos, nombreArchivo) {
     [...porCliente.entries()]
         .sort((a, b) => String(a[1][0].cliente_nombre).localeCompare(String(b[1][0].cliente_nombre), 'es'))
         .forEach(([clienteId, pedidos]) => {
-            construirHojaCliente(libro, nombreDeHoja(pedidos[0].cliente_nombre, usados), pedidos, datos.clientes.get(clienteId), catalogo);
+            construirHojaCliente(libro, nombreDeHoja(pedidos[0].cliente_nombre, usados), pedidos, datos.clientes.get(clienteId), catalogo, datos.firmas || new Map());
         });
 
     res.setHeader('Content-Type', MIME_XLSX);

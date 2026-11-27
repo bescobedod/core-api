@@ -9,8 +9,11 @@ const PedidoArtesanoModel = require('../../models/core/tbl_pedido_artesano.model
 const PedidoArtesanoDetalleModel = require('../../models/core/tbl_pedido_artesano_detalle.model');
 const PedidoArtesanoHistorialModel = require('../../models/core/tbl_pedido_artesano_historial.model');
 const PedidoArtesanoProductoModel = require('../../models/core/tbl_pedido_artesano_producto.model');
+const PedidoArtesanoDepositoModel = require('../../models/core/tbl_pedido_artesano_deposito.model');
 const BloqueoRutaPolloModel = require('../../models/core/tbl_bloqueo_ruta_pollo.model');
 const DespachoRutaModel = require('../../models/core/tbl_despacho_ruta.model');
+const PedidoPosCabeceraModel = require('../../models/core/tbl_pedido_pos_cabecera.model');
+const PedidoPosDetalleModel = require('../../models/core/tbl_pedido_pos_detalle.model');
 const { consultarStockPollo, crearTransferenciaPollo, crearEntregaArtesano } = require('../../integrations/sap/sapClient');
 const { nivelPermisoDeMenu, nombreCortoDelUsuario } = require('../../services/permisosMenu.service');
 const { parsearPaginacion, armarPaginacion } = require('../../services/paginacion.service');
@@ -18,7 +21,7 @@ const crypto = require('crypto');
 const path = require('path');
 const { generarPdfEnvios } = require('../../services/pedidoArtesanoPdf');
 const { acortarNombre } = require('../../services/nombres.service');
-const { enviarExcelPedidosArtesano, enviarExcelPorCliente } = require('../../services/pedidoArtesanoReportes');
+const { enviarExcelPedidosArtesano, enviarExcelPorCliente, cantidadEnvio, redondear: redondearMonto } = require('../../services/pedidoArtesanoReportes');
 const { armarViajes, enviarReporteDetalle, enviarReporteEnTransito } = require('../../services/pedidoArtesanoReportesRuta');
 const { uploadBufferToS3, getPresignedUrl, deleteFromS3 } = require('../../integrations/aws/s3');
 const { upload } = require('../../middlewares/upload');
@@ -49,9 +52,15 @@ const TTL_PRODUCTOS_MS = 10 * 60 * 1000;
 
 const LIMITE_LISTADO = 1000;
 const MAX_COMENTARIO = 500;
+// Descarga de firmas para el Excel por cliente.
+const LOTE_FIRMAS = 8;
+const ESPERA_FIRMA_MS = 10000;
 const REGEX_FECHA = /^\d{4}-\d{2}-\d{2}$/;
 const REGEX_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const ZONA_HORARIA = 'America/Guatemala';
+const MAX_MONTO_DEPOSITO = 99999999.99;
+// Consulta aparte para que los depósitos no multipliquen las filas de las otras relaciones.
+const INCLUIR_DEPOSITOS = { model: PedidoArtesanoDepositoModel, as: 'depositos', separate: true, order: [['fecha_deposito', 'ASC'], ['creado_en', 'ASC']] };
 
 // Estados: CREADO, VALIDADO (stock asignado en Pedidos de Pollo), EN_TRANSITO, ENTREGADO, RECHAZADO (rastro) y CANCELADO (asistente).
 const ESTADOS = ['CREADO', 'VALIDADO', 'RECHAZADO', 'CANCELADO', 'EN_TRANSITO', 'ENTREGADO'];
@@ -188,6 +197,27 @@ function mapearHistorial(h) {
     };
 }
 
+// Total a cobrar (null si falta algún precio), depósitos y saldo; depositos null si no se consultaron.
+function resumenPago(p) {
+    const lineas = (p.detalle || []).map(l => ({ precio: l.precio_unitario, cantidad: cantidadEnvio(l) }));
+    const sinPrecio = l => l.precio === null || l.precio === undefined;
+    const total = lineas.some(l => l.cantidad > 0 && sinPrecio(l))
+        ? null
+        : redondearMonto(lineas.reduce((suma, l) => suma + (sinPrecio(l) ? 0 : redondearMonto(Number(l.precio) * l.cantidad)), 0));
+
+    const depositos = p.depositos
+        ? p.depositos.map(d => ({ id: d.id, numero_boleta: d.numero_boleta, banco: d.banco, fecha_deposito: d.fecha_deposito, monto: Number(d.monto) }))
+        : null;
+    const depositado = depositos ? redondearMonto(depositos.reduce((suma, d) => suma + d.monto, 0)) : null;
+
+    return {
+        total,
+        depositos,
+        depositado,
+        saldo: total === null || depositado === null ? null : redondearMonto(total - depositado)
+    };
+}
+
 function mapearPedido(pedido) {
     const p = pedido.get({ plain: true });
 
@@ -209,7 +239,7 @@ function mapearPedido(pedido) {
         direccion_entrega: p.direccion_entrega,
         telefono_contacto: p.telefono_contacto,
         condicion_pago: p.condicion_pago,
-        numero_boleta: p.numero_boleta,
+        ...resumenPago(p),
         comentario: p.comentario,
         motivo_rechazo: p.motivo_rechazo,
         rechazado_por: p.rechazado_por_nombre ? acortarNombre(p.rechazado_por_nombre) : null,
@@ -249,7 +279,8 @@ function cargarPedido(id, transaction) {
     return PedidoArtesanoModel.findByPk(id, {
         include: [
             { model: PedidoArtesanoDetalleModel, as: 'detalle' },
-            { model: PedidoArtesanoHistorialModel, as: 'historial' }
+            { model: PedidoArtesanoHistorialModel, as: 'historial' },
+            INCLUIR_DEPOSITOS
         ],
         transaction
     });
@@ -266,10 +297,45 @@ function registrarHistorial(pedidoId, estadoAnterior, estadoNuevo, usuario, come
     }, { transaction });
 }
 
+// Depósitos
+
+function validarDeposito(deposito) {
+    if (!deposito || typeof deposito !== 'object') throw new ErrorPedidoArtesano(400, 'Faltan los datos del depósito');
+
+    const numeroBoleta = textoObligatorio(deposito.numero_boleta, 50, 'El número de boleta');
+    const fecha = String(deposito.fecha_deposito || '');
+    const fechaValida = REGEX_FECHA.test(fecha) && !isNaN(Date.parse(fecha)) && new Date(fecha).toISOString().slice(0, 10) === fecha;
+
+    if (!fechaValida) throw new ErrorPedidoArtesano(400, 'La fecha del depósito es obligatoria');
+    if (fecha > fechaGuatemala(new Date())) throw new ErrorPedidoArtesano(400, 'La fecha del depósito no puede ser futura');
+
+    const monto = redondearMonto(Number(deposito.monto));
+
+    if (!Number.isFinite(monto) || monto <= 0 || monto > MAX_MONTO_DEPOSITO) {
+        throw new ErrorPedidoArtesano(400, 'La cantidad depositada debe ser mayor a 0');
+    }
+
+    return { numero_boleta: numeroBoleta, banco: textoOpcional(deposito.banco, 100, 'El banco'), fecha_deposito: fecha, monto };
+}
+
+function guardarDeposito(pedidoId, deposito, req, usuario, transaction) {
+    return PedidoArtesanoDepositoModel.create(
+        { ...deposito, pedido_id: pedidoId, creado_por: req.user.id_usuario, creado_por_nombre: usuario },
+        { transaction }
+    );
+}
+
+function describirDeposito(d) {
+    const [anio, mes, dia] = String(d.fecha_deposito).split('-');
+    const monto = Number(d.monto).toLocaleString('es-GT', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+    return `boleta ${d.numero_boleta}, Q${monto}, ${dia}/${mes}/${anio}${d.banco ? `, ${d.banco}` : ''}`;
+}
+
 // Datos del pedido: validación común de crear y modificar
 
-// Precio por cliente: el propio, o el de colaborador o tercero. Sin precio no se puede pedir.
-async function resolverPrecios(cliente, codigos) {
+// Precio por cliente: el propio y, si no tiene, el del producto como colaborador o tercero; null si no hay.
+async function preciosDeCliente(cliente, codigos) {
     const [productos, propios] = await Promise.all([
         PedidoArtesanoProductoModel.findAll({ where: { codigo_producto: { [Op.in]: codigos } } }),
         ClienteAvicolaPrecioModel.findAll({ where: { cliente_id: cliente.id, codigo_producto: { [Op.in]: codigos } } })
@@ -285,15 +351,24 @@ async function resolverPrecios(cliente, codigos) {
         const producto = porCodigo.get(codigo);
         const precio = producto ? (esColaborador ? producto.precio_colaborador : producto.precio_tercero) : null;
 
-        if (precio === null || precio === undefined) {
+        return [codigo, precio === null || precio === undefined ? null : Number(precio)];
+    }));
+}
+
+// Precios con los que se guarda el pedido. Sin precio no se puede pedir.
+async function resolverPrecios(cliente, codigos) {
+    const precios = await preciosDeCliente(cliente, codigos);
+
+    for (const [codigo, precio] of precios) {
+        if (precio === null) {
             throw new ErrorPedidoArtesano(
                 400,
-                esColaborador ? `El producto ${codigo} no se vende a colaboradores` : `El producto ${codigo} no tiene precio configurado`
+                cliente.codigo_empleado ? `El producto ${codigo} no se vende a colaboradores` : `El producto ${codigo} no tiene precio configurado`
             );
         }
+    }
 
-        return [codigo, Number(precio)];
-    }));
+    return precios;
 }
 
 // Valida el cuerpo y resuelve ruta, cliente y tienda de referencia.
@@ -311,12 +386,12 @@ async function validarDatosPedido(body) {
         throw new ErrorPedidoArtesano(400, "condicion_pago debe ser 'DEPOSITO', 'PLANILLA' o 'PENDIENTE'");
     }
 
-    // El depósito exige su boleta; con descuento de planilla o pago pendiente no aplica.
-    const numeroBoleta = body.condicion_pago === 'DEPOSITO' ? textoObligatorio(body.numero_boleta, 50, 'El número de boleta') : null;
     // La dirección es obligatoria salvo para los empleados (se valida al tener el cliente).
     const direccion = textoOpcional(body.direccion, 250, 'La dirección de entrega');
     const telefono = textoOpcional(body.telefono_contacto, 30, 'El teléfono de contacto');
     const comentario = textoOpcional(body.comentario, MAX_COMENTARIO, 'El comentario');
+    // undefined = no se envió el campo y se usa el NIT del cliente.
+    const nit = body.nit === undefined ? undefined : textoOpcional(body.nit, 20, 'El NIT');
 
 
     if (!Array.isArray(body.items) || body.items.length === 0) {
@@ -372,9 +447,9 @@ async function validarDatosPedido(body) {
     return {
         fechaRequerida: body.fecha_requerida,
         condicionPago: body.condicion_pago,
-        numeroBoleta,
         direccion,
         telefono,
+        nit: nit === undefined ? cliente.nit : nit,
         comentario,
         items: body.items,
         codigos,
@@ -398,11 +473,10 @@ function camposEncabezado(d) {
             : null,
         cliente_id: d.cliente.id,
         cliente_nombre: d.cliente.nombre,
-        cliente_nit: d.cliente.nit,
+        cliente_nit: d.nit,
         direccion_entrega: d.direccion,
         telefono_contacto: d.telefono,
         condicion_pago: d.condicionPago,
-        numero_boleta: d.numeroBoleta,
         comentario: d.comentario
     };
 }
@@ -419,12 +493,17 @@ function lineasPedido(pedidoId, d, detalles) {
     }));
 }
 
-// La dirección y el teléfono que se capturaron quedan guardados en el cliente.
-async function guardarDatosEntregaEnCliente(cliente, d, transaction) {
+// La dirección, el teléfono y el NIT que se capturaron quedan guardados en el cliente.
+// pedidoAnterior: al modificar, un NIT que no se tocó no pisa el que el cliente tenga ahora.
+async function guardarDatosEntregaEnCliente(cliente, d, transaction, pedidoAnterior = null) {
     const cambios = {};
 
     if (d.direccion && cliente.direccion !== d.direccion) cambios.direccion = d.direccion;
     if (d.telefono && cliente.telefono !== d.telefono) cambios.telefono = d.telefono;
+
+    const nitSinCambio = !!pedidoAnterior && pedidoAnterior.cliente_id === cliente.id && pedidoAnterior.cliente_nit === d.nit;
+
+    if (d.nit && cliente.nit !== d.nit && !nitSinCambio) cambios.nit = d.nit;
 
     if (Object.keys(cambios).length > 0) {
         await cliente.update({ ...cambios, actualizado_en: new Date() }, { transaction });
@@ -439,10 +518,10 @@ function resumenCambios(pedido, d, lineasAnteriores, lineasNuevas) {
         ['nombre_ruta', 'Ruta'],
         ['nombre_tienda_referencia', 'Tienda de referencia'],
         ['cliente_nombre', 'Cliente'],
+        ['cliente_nit', 'NIT'],
         ['direccion_entrega', 'Dirección de entrega'],
         ['telefono_contacto', 'Teléfono'],
         ['condicion_pago', 'Condición de pago'],
-        ['numero_boleta', 'Boleta'],
         ['comentario', 'Comentario']
     ];
 
@@ -493,47 +572,67 @@ async function getProductos(req, res) {
     }
 }
 
-// GET /pedidoArtesano/getUsuarios: usuarios que han creado pedidos, para el filtro.
-async function getUsuarios(req, res) {
+// GET /pedidoArtesano/getPrecios?cliente_id=: precio de cada producto para ese cliente, para el total del formulario.
+async function getPrecios(req, res) {
+    try {
+        await exigirLectura(req);
+
+        const { cliente_id } = req.query;
+
+        if (!cliente_id || !REGEX_UUID.test(cliente_id)) throw new ErrorPedidoArtesano(400, 'cliente_id inválido');
+
+        const cliente = await ClienteAvicolaModel.findByPk(cliente_id);
+
+        if (!cliente) throw new ErrorPedidoArtesano(404, 'El cliente no existe');
+
+        const precios = await preciosDeCliente(cliente, await codigosHabilitados());
+
+        return res.json({ success: true, precios: Object.fromEntries(precios) });
+    } catch (error) {
+        return responderError(res, error, 'Error al obtener los precios');
+    }
+}
+
+// GET /pedidoArtesano/getClientesPedidos: clientes que tienen pedidos, para el filtro.
+async function getClientesPedidos(req, res) {
     try {
         await exigirLectura(req);
 
         const filas = await PedidoArtesanoModel.findAll({
-            attributes: ['creado_por', 'creado_por_nombre', [fn('MAX', col('creado_en')), 'ultimo']],
-            group: ['creado_por', 'creado_por_nombre'],
+            attributes: ['cliente_id', 'cliente_nombre', 'cliente_nit', [fn('MAX', col('creado_en')), 'ultimo']],
+            group: ['cliente_id', 'cliente_nombre', 'cliente_nit'],
             raw: true
         });
 
-        const porUsuario = new Map();
+        const porCliente = new Map();
 
-        // Si un usuario aparece con más de un nombre se queda el más reciente.
+        // Si el nombre o NIT cambió entre pedidos se queda el más reciente.
         for (const f of filas) {
-            const id = String(f.creado_por);
-            const actual = porUsuario.get(id);
+            const actual = porCliente.get(f.cliente_id);
 
             if (!actual || new Date(f.ultimo) > new Date(actual.ultimo)) {
-                porUsuario.set(id, { id_usuario: id, nombre: f.creado_por_nombre, ultimo: f.ultimo });
+                porCliente.set(f.cliente_id, { id: f.cliente_id, nombre: f.cliente_nombre, nit: f.cliente_nit, ultimo: f.ultimo });
             }
         }
 
-        const usuarios = [...porUsuario.values()]
-            .map(({ id_usuario, nombre }) => ({ id_usuario, nombre }))
+        const clientes = [...porCliente.values()]
+            .map(({ id, nombre, nit }) => ({ id, nombre, nit }))
             .sort((a, b) => a.nombre.localeCompare(b.nombre));
 
-        return res.json({ success: true, usuarios });
+        return res.json({ success: true, clientes });
     } catch (error) {
-        return responderError(res, error, 'Error al obtener los usuarios');
+        return responderError(res, error, 'Error al obtener los clientes');
     }
 }
 
-// Filtros de la búsqueda de pedidos: usuario, estado(s), número y fechas de entrega requerida.
+// Filtros de la búsqueda de pedidos: cliente, estado(s), número y fechas de entrega requerida.
 function construirWhereBusqueda(query) {
-    const { id_usuario, fecha_desde, fecha_hasta, estado, numero, cliente } = query;
+    const { cliente_id, fecha_desde, fecha_hasta, estado, numero } = query;
     const where = {};
 
-    if (id_usuario) {
-        if (!/^\d+$/.test(id_usuario)) throw new ErrorPedidoArtesano(400, 'id_usuario inválido');
-        where.creado_por = id_usuario;
+    if (cliente_id) {
+        if (!REGEX_UUID.test(cliente_id)) throw new ErrorPedidoArtesano(400, 'cliente_id inválido');
+        where.cliente_id = cliente_id;
     }
 
     if ((fecha_desde && !REGEX_FECHA.test(fecha_desde)) || (fecha_hasta && !REGEX_FECHA.test(fecha_hasta))) {
@@ -564,15 +663,10 @@ function construirWhereBusqueda(query) {
 
     if (textoNumero) where.numero_pedido = { [Op.iLike]: `%${textoNumero}%` };
 
-    // Cliente: parte del nombre o del NIT.
-    const textoCliente = String(cliente || '').trim().replace(/[%_]/g, '');
-
-    if (textoCliente) where[Op.or] = [{ cliente_nombre: { [Op.iLike]: `%${textoCliente}%` } }, { cliente_nit: { [Op.iLike]: `%${textoCliente}%` } }];
-
     return where;
 }
 
-// GET /pedidoArtesano/getPedidos?id_usuario=&fecha_desde=&fecha_hasta=&estado=A,B&numero=&cliente=
+// GET /pedidoArtesano/getPedidos?cliente_id=&fecha_desde=&fecha_hasta=&estado=A,B&numero=
 async function getPedidos(req, res) {
     try {
         await exigirLectura(req);
@@ -589,9 +683,11 @@ async function getPedidos(req, res) {
             where,
             include: [
                 { model: PedidoArtesanoDetalleModel, as: 'detalle' },
-                { model: PedidoArtesanoHistorialModel, as: 'historial' }
+                { model: PedidoArtesanoHistorialModel, as: 'historial' },
+                INCLUIR_DEPOSITOS
             ],
-            order: [['fecha_requerida', 'DESC'], ['numero_pedido', 'DESC']],
+            // El último creado sale primero.
+            order: [['numero_pedido', 'DESC']],
             limit: pageSize,
             offset
         });
@@ -606,7 +702,7 @@ async function getPedidos(req, res) {
     }
 }
 
-function describirFiltrosBusqueda(query) {
+function describirFiltrosBusqueda(query, pedidos) {
     const partes = [];
 
     if (query.fecha_desde || query.fecha_hasta) {
@@ -615,8 +711,8 @@ function describirFiltrosBusqueda(query) {
 
     if (query.estado) partes.push(`Estado: ${String(query.estado).split(',').map(e => e.trim()).join(', ')}`);
     if (query.numero) partes.push(`Número: ${String(query.numero).trim()}`);
-    if (query.cliente) partes.push(`Cliente: ${String(query.cliente).trim()}`);
-    if (query.id_usuario) partes.push(`Usuario (id): ${query.id_usuario}`);
+    // Con filtro de cliente todos los pedidos son suyos.
+    if (query.cliente_id && pedidos.length > 0) partes.push(`Cliente: ${pedidos[0].cliente_nombre}`);
 
     return partes.length > 0 ? `Filtros — ${partes.join(' · ')}` : 'Sin filtros';
 }
@@ -635,7 +731,7 @@ async function exportarPedidos(req, res) {
         const [pedidos, productos] = await Promise.all([
             PedidoArtesanoModel.findAll({
                 where,
-                include: [{ model: PedidoArtesanoDetalleModel, as: 'detalle' }],
+                include: [{ model: PedidoArtesanoDetalleModel, as: 'detalle' }, INCLUIR_DEPOSITOS],
                 order: [['fecha_requerida', 'DESC'], ['numero_pedido', 'DESC']],
                 limit: LIMITE_EXPORTACION
             }),
@@ -649,7 +745,7 @@ async function exportarPedidos(req, res) {
             {
                 pedidos: pedidos.map(p => p.get({ plain: true })),
                 total,
-                descripcionFiltros: describirFiltrosBusqueda(req.query),
+                descripcionFiltros: describirFiltrosBusqueda(req.query, pedidos),
                 productos: productos.map(p => p.get({ plain: true }))
             },
             `pollo_artesano_${marcaDeTiempo}.xlsx`
@@ -659,6 +755,30 @@ async function exportarPedidos(req, res) {
 
         return responderError(res, error, 'Error al exportar los pedidos de pollo artesano');
     }
+}
+
+// Descarga las firmas de los clientes; la que falle queda en null y el reporte se genera igual.
+async function descargarFirmas(pedidos) {
+    const conFirma = pedidos.filter(p => p.firma_entrega_key);
+    const firmas = new Map();
+
+    for (let i = 0; i < conFirma.length; i += LOTE_FIRMAS) {
+        await Promise.all(conFirma.slice(i, i + LOTE_FIRMAS).map(async (p) => {
+            try {
+                const url = await getPresignedUrl({ bucket: process.env.AWS_BUCKET_NAME, key: p.firma_entrega_key, expiresInSec: 60 });
+                const respuesta = await fetch(url, { signal: AbortSignal.timeout(ESPERA_FIRMA_MS) });
+
+                if (!respuesta.ok) throw new Error(`HTTP ${respuesta.status}`);
+
+                firmas.set(p.id, Buffer.from(await respuesta.arrayBuffer()));
+            } catch (error) {
+                console.error(`[PedidoArtesano] No se pudo descargar la firma de ${p.numero_pedido}:`, error.message);
+                firmas.set(p.id, null);
+            }
+        }));
+    }
+
+    return firmas;
 }
 
 // GET /pedidoArtesano/exportarPorCliente?...mismos filtros que getPedidos
@@ -675,7 +795,7 @@ async function exportarPorCliente(req, res) {
         const [pedidos, productos] = await Promise.all([
             PedidoArtesanoModel.findAll({
                 where,
-                include: [{ model: PedidoArtesanoDetalleModel, as: 'detalle' }],
+                include: [{ model: PedidoArtesanoDetalleModel, as: 'detalle' }, INCLUIR_DEPOSITOS],
                 order: [['fecha_requerida', 'ASC'], ['numero_pedido', 'ASC']],
                 limit: LIMITE_EXPORTACION
             }),
@@ -685,11 +805,14 @@ async function exportarPorCliente(req, res) {
         const idsClientes = [...new Set(pedidos.map(p => p.cliente_id))];
         const clientes = await ClienteAvicolaModel.findAll({ where: { id: { [Op.in]: idsClientes } }, attributes: ['id', 'codigo_empleado'] });
         const marcaDeTiempo = new Date().toISOString().slice(0, 10);
+        const planos = pedidos.map(p => p.get({ plain: true }));
+        const firmas = await descargarFirmas(planos);
 
         return await enviarExcelPorCliente(
             res,
             {
-                pedidos: pedidos.map(p => p.get({ plain: true })),
+                pedidos: planos,
+                firmas,
                 clientes: new Map(clientes.map(c => [c.id, c.codigo_empleado])),
                 productos: productos.map(p => p.get({ plain: true }))
             },
@@ -754,12 +877,14 @@ async function crearCliente(req, res) {
 
 // POST /pedidoArtesano/crearPedido
 // { fecha_requerida, ruta_id, id_tienda_simphony_referencia?, cliente_id, direccion?,
-//   telefono_contacto?, condicion_pago, numero_boleta (si es depósito), comentario?, items: [{ codigo_producto, cantidad }] }
+//   telefono_contacto?, condicion_pago, deposito (si paga por depósito), comentario?, items: [{ codigo_producto, cantidad }] }
 async function crearPedido(req, res) {
     try {
         await exigirEscritura(req);
 
         const d = await validarDatosPedido(req.body);
+        const deposito = d.condicionPago === 'DEPOSITO' ? validarDeposito(req.body.deposito) : null;
+
         const [usuario, detalles] = await Promise.all([nombreCortoDelUsuario(req), detalleProductos(d.codigos)]);
         const t = await sequelizeInit.sequelize.transaction();
         let idPedido;
@@ -787,6 +912,11 @@ async function crearPedido(req, res) {
             await PedidoArtesanoDetalleModel.bulkCreate(lineasPedido(pedido.id, d, detalles), { transaction: t });
             await registrarHistorial(pedido.id, null, 'CREADO', usuario, 'Pedido creado', t);
 
+            if (deposito) {
+                await guardarDeposito(pedido.id, deposito, req, usuario, t);
+                await registrarHistorial(pedido.id, 'CREADO', 'CREADO', usuario, `Depósito registrado — ${describirDeposito(deposito)}`, t);
+            }
+
             await t.commit();
             idPedido = pedido.id;
         } catch (error) {
@@ -800,7 +930,7 @@ async function crearPedido(req, res) {
     }
 }
 
-// POST /pedidoArtesano/completarPago { id, condicion_pago, numero_boleta? }
+// POST /pedidoArtesano/completarPago { id, condicion_pago, deposito? }
 // Registra el pago de un pedido PENDIENTE sin tocar actualizado_en. Queda en el historial.
 async function completarPago(req, res) {
     try {
@@ -814,8 +944,8 @@ async function completarPago(req, res) {
         }
 
         const condicion = req.body.condicion_pago;
-        const numeroBoleta = condicion === 'DEPOSITO' ? textoObligatorio(req.body.numero_boleta, 50, 'El número de boleta') : null;
-        const usuario = await nombreDelUsuario(req);
+        const deposito = condicion === 'DEPOSITO' ? validarDeposito(req.body.deposito) : null;
+        const usuario = await nombreCortoDelUsuario(req);
         const t = await sequelizeInit.sequelize.transaction();
 
         try {
@@ -835,11 +965,11 @@ async function completarPago(req, res) {
                 }
             }
 
-            await pedido.update({ condicion_pago: condicion, numero_boleta: numeroBoleta }, { transaction: t });
+            await pedido.update({ condicion_pago: condicion }, { transaction: t });
 
-            const detalle = condicion === 'DEPOSITO'
-                ? `Depósito (boleta ${numeroBoleta})`
-                : 'Descuento de planilla';
+            if (deposito) await guardarDeposito(id, deposito, req, usuario, t);
+
+            const detalle = deposito ? `Depósito (${describirDeposito(deposito)})` : 'Descuento de planilla';
 
             await registrarHistorial(id, pedido.estado, pedido.estado, usuario, `Pago completado — ${detalle}`, t);
             await t.commit();
@@ -873,11 +1003,24 @@ async function editarPedido(req, res) {
             if (!pedido) throw new ErrorPedidoArtesano(404, 'El pedido no existe');
             if (pedido.estado !== 'CREADO') throw new ErrorPedidoArtesano(409, 'Solo se puede modificar un pedido que está en estado CREADO');
 
+            const depositos = await PedidoArtesanoDepositoModel.findAll({
+                where: { pedido_id: id },
+                order: INCLUIR_DEPOSITOS.order,
+                transaction: t
+            });
+
+            if (depositos.length > 0 && d.condicionPago !== 'DEPOSITO') {
+                throw new ErrorPedidoArtesano(409, 'Este pedido tiene depósitos registrados: quítalos antes de cambiar la condición de pago');
+            }
+
+            // El formulario solo pide el depósito cuando el pedido todavía no tiene ninguno.
+            const nuevoDeposito = d.condicionPago === 'DEPOSITO' && depositos.length === 0 ? validarDeposito(req.body.deposito) : null;
+
             const lineasAnteriores = await PedidoArtesanoDetalleModel.findAll({ where: { pedido_id: id }, transaction: t });
             const lineasNuevas = lineasPedido(id, d, detalles);
             const comentarioHistorial = resumenCambios(pedido, d, lineasAnteriores, lineasNuevas);
 
-            await guardarDatosEntregaEnCliente(d.cliente, d, t);
+            await guardarDatosEntregaEnCliente(d.cliente, d, t, pedido);
 
             const [actualizados] = await PedidoArtesanoModel.update(
                 { ...camposEncabezado(d), actualizado_en: new Date() },
@@ -890,6 +1033,11 @@ async function editarPedido(req, res) {
             await PedidoArtesanoDetalleModel.bulkCreate(lineasNuevas, { transaction: t });
             await registrarHistorial(id, 'CREADO', 'CREADO', usuario, comentarioHistorial, t);
 
+            if (nuevoDeposito) {
+                await guardarDeposito(id, nuevoDeposito, req, usuario, t);
+                await registrarHistorial(id, 'CREADO', 'CREADO', usuario, `Depósito registrado — ${describirDeposito(nuevoDeposito)}`, t);
+            }
+
             await t.commit();
         } catch (error) {
             await t.rollback();
@@ -899,6 +1047,125 @@ async function editarPedido(req, res) {
         return res.json({ success: true, pedido: mapearPedido(await cargarPedido(id)) });
     } catch (error) {
         return responderError(res, error, 'Error al modificar el pedido de pollo artesano');
+    }
+}
+
+// Bloquea el pedido y comprueba que admita cambios en sus depósitos.
+async function bloquearPedidoDeposito(id, transaction) {
+    const pedido = await PedidoArtesanoModel.findByPk(id, { transaction, lock: transaction.LOCK.UPDATE });
+
+    if (!pedido) throw new ErrorPedidoArtesano(404, 'El pedido no existe');
+    if (pedido.estado === 'RECHAZADO' || pedido.estado === 'CANCELADO') {
+        throw new ErrorPedidoArtesano(409, 'Un pedido rechazado o cancelado no admite cambios en sus depósitos');
+    }
+    if (pedido.condicion_pago !== 'DEPOSITO') throw new ErrorPedidoArtesano(409, 'El pedido no es de pago por depósito');
+
+    return pedido;
+}
+
+// POST /pedidoArtesano/registrarDeposito { id, deposito: { numero_boleta, fecha_deposito, monto, banco? } }
+// Agrega un depósito (por ejemplo, el faltante) sin tocar actualizado_en.
+async function registrarDeposito(req, res) {
+    try {
+        await exigirEscritura(req);
+
+        const { id } = req.body;
+        validarId(id);
+
+        const deposito = validarDeposito(req.body.deposito);
+        const usuario = await nombreCortoDelUsuario(req);
+        const t = await sequelizeInit.sequelize.transaction();
+
+        try {
+            const pedido = await bloquearPedidoDeposito(id, t);
+
+            await guardarDeposito(id, deposito, req, usuario, t);
+            await registrarHistorial(id, pedido.estado, pedido.estado, usuario, `Depósito registrado — ${describirDeposito(deposito)}`, t);
+            await t.commit();
+        } catch (error) {
+            await t.rollback();
+            throw error;
+        }
+
+        return res.json({ success: true, pedido: mapearPedido(await cargarPedido(id)) });
+    } catch (error) {
+        return responderError(res, error, 'Error al registrar el depósito');
+    }
+}
+
+// POST /pedidoArtesano/editarDeposito { id, id_deposito, deposito }: corrige un depósito y deja el antes y después.
+async function editarDeposito(req, res) {
+    try {
+        await exigirEscritura(req);
+
+        const { id, id_deposito } = req.body;
+        validarId(id);
+
+        if (!id_deposito || !REGEX_UUID.test(id_deposito)) throw new ErrorPedidoArtesano(400, 'id de depósito inválido');
+
+        const cambios = validarDeposito(req.body.deposito);
+        const usuario = await nombreCortoDelUsuario(req);
+        const t = await sequelizeInit.sequelize.transaction();
+
+        try {
+            const pedido = await bloquearPedidoDeposito(id, t);
+            const deposito = await PedidoArtesanoDepositoModel.findOne({ where: { id: id_deposito, pedido_id: id }, transaction: t });
+
+            if (!deposito) throw new ErrorPedidoArtesano(404, 'El depósito ya no existe');
+
+            const antes = describirDeposito(deposito);
+
+            await deposito.update(cambios, { transaction: t });
+
+            const despues = describirDeposito(cambios);
+
+            if (antes !== despues) {
+                await registrarHistorial(id, pedido.estado, pedido.estado, usuario, `Depósito modificado — ${antes} → ${despues}`, t);
+            }
+
+            await t.commit();
+        } catch (error) {
+            await t.rollback();
+            throw error;
+        }
+
+        return res.json({ success: true, pedido: mapearPedido(await cargarPedido(id)) });
+    } catch (error) {
+        return responderError(res, error, 'Error al modificar el depósito');
+    }
+}
+
+// POST /pedidoArtesano/eliminarDeposito { id, id_deposito }: para quitar un depósito que no corresponde.
+async function eliminarDeposito(req, res) {
+    try {
+        await exigirEscritura(req);
+
+        const { id, id_deposito } = req.body;
+        validarId(id);
+
+        if (!id_deposito || !REGEX_UUID.test(id_deposito)) throw new ErrorPedidoArtesano(400, 'id de depósito inválido');
+
+        const usuario = await nombreCortoDelUsuario(req);
+        const t = await sequelizeInit.sequelize.transaction();
+
+        try {
+            const pedido = await bloquearPedidoDeposito(id, t);
+            const deposito = await PedidoArtesanoDepositoModel.findOne({ where: { id: id_deposito, pedido_id: id }, transaction: t });
+
+            if (!deposito) throw new ErrorPedidoArtesano(404, 'El depósito ya no existe');
+
+            await deposito.destroy({ transaction: t });
+
+            await registrarHistorial(id, pedido.estado, pedido.estado, usuario, `Depósito quitado — ${describirDeposito(deposito)}`, t);
+            await t.commit();
+        } catch (error) {
+            await t.rollback();
+            throw error;
+        }
+
+        return res.json({ success: true, pedido: mapearPedido(await cargarPedido(id)) });
+    } catch (error) {
+        return responderError(res, error, 'Error al quitar el depósito');
     }
 }
 
@@ -922,6 +1189,89 @@ async function cambiarEstado(pedido, estadosPermitidos, estadoNuevo, campos, usu
     }
 
     await registrarHistorial(pedido.id, pedido.estado, estadoNuevo, usuario, comentario, transaction);
+}
+
+// POST /pedidoArtesano/cambiarFechaRequerida { id, fecha_requerida }
+// Cambia el día de entrega de un cliente, siempre en la misma ruta. Solo CREADO o VALIDADO; si estaba validado se quita lo
+// autorizado y vuelve a CREADO (hay que volver a validar). No toca SAP: todavía no hay documentos.
+async function cambiarFechaRequerida(req, res) {
+    try {
+        await exigirEscrituraPedidosPollo(req);
+
+        const { id } = req.body;
+        const nuevaFecha = String(req.body.fecha_requerida || '');
+        validarId(id);
+
+        if (!REGEX_FECHA.test(nuevaFecha) || isNaN(Date.parse(nuevaFecha))) throw new ErrorPedidoArtesano(400, 'fecha_requerida debe tener el formato YYYY-MM-DD');
+        if (nuevaFecha < fechaGuatemala(new Date())) throw new ErrorPedidoArtesano(400, 'La nueva fecha de entrega no puede ser anterior a hoy');
+
+        const usuario = await nombreCortoDelUsuario(req);
+        const t = await sequelizeInit.sequelize.transaction();
+        let respuesta;
+
+        try {
+            const pedido = await PedidoArtesanoModel.findByPk(id, { transaction: t, lock: t.LOCK.UPDATE });
+
+            if (!pedido) throw new ErrorPedidoArtesano(404, 'El pedido no existe');
+
+            const fechaAnterior = String(pedido.fecha_requerida);
+            const estadoAnterior = pedido.estado;
+
+            if (!['CREADO', 'VALIDADO'].includes(estadoAnterior)) {
+                throw new ErrorPedidoArtesano(409, `No se puede cambiar la fecha de un pedido en estado ${estadoAnterior}: ya fue enviado o cerrado`);
+            }
+
+            if (fechaAnterior === nuevaFecha) throw new ErrorPedidoArtesano(400, 'La nueva fecha es igual a la fecha actual del pedido');
+
+            if (pedido.ruta_id) {
+                const candadoAjeno = await BloqueoRutaPolloModel.findOne({
+                    where: { ruta_id: pedido.ruta_id, fecha: { [Op.in]: [fechaAnterior, nuevaFecha] }, estado: 'ACTIVO', id_usuario: { [Op.ne]: req.user.id_usuario } },
+                    transaction: t
+                });
+
+                if (candadoAjeno) {
+                    throw new ErrorPedidoArtesano(409, `La ruta ${pedido.nombre_ruta || ''} está en proceso por otro usuario para el ${String(candadoAjeno.fecha).split('-').reverse().join('/')}. Debe liberarla antes de cambiar la fecha.`);
+                }
+
+                const [clienteDespachado, tiendaDespachada] = await Promise.all([
+                    PedidoArtesanoModel.findOne({ where: { ruta_id: pedido.ruta_id, fecha_requerida: nuevaFecha, estado: { [Op.in]: ['EN_TRANSITO', 'ENTREGADO'] } }, attributes: ['id'], transaction: t }),
+                    PedidoPosCabeceraModel.findOne({ where: { ruta_id: pedido.ruta_id, fecha_requerida: nuevaFecha, tipo_pedido: 'POLLO', estado: { [Op.in]: ['EN_TRANSITO', 'ENTREGADO', 'ENTREGADO_PARCIAL'] } }, attributes: ['id'], transaction: t })
+                ]);
+
+                if (clienteDespachado || tiendaDespachada) {
+                    throw new ErrorPedidoArtesano(409, `La ruta ${pedido.nombre_ruta || ''} ya fue despachada para el ${nuevaFecha.split('-').reverse().join('/')}; elige otra fecha.`);
+                }
+            }
+
+            const eraValidado = estadoAnterior === 'VALIDADO';
+            const textoCambio = `Fecha de entrega cambiada de ${fechaAnterior.split('-').reverse().join('/')} a ${nuevaFecha.split('-').reverse().join('/')}`
+                + (eraValidado ? ' (se quitó lo autorizado: el pedido vuelve a Creado)' : '');
+
+            // El piloto asignado era del día anterior; se vuelve a asignar con el transporte de la fecha nueva.
+            await cambiarEstado(
+                pedido,
+                ['CREADO', 'VALIDADO'],
+                'CREADO',
+                { fecha_requerida: nuevaFecha, codigo_piloto: null, nombre_piloto: null },
+                usuario,
+                textoCambio,
+                t
+            );
+
+            // Lo autorizado era para el día anterior (también el "sin stock", que se reprograma justo así).
+            await PedidoArtesanoDetalleModel.update({ cantidad_autorizada: null }, { where: { pedido_id: id }, transaction: t });
+
+            await t.commit();
+            respuesta = { success: true, pedido_id: id, numero_pedido: pedido.numero_pedido, fecha_anterior: fechaAnterior, fecha_requerida: nuevaFecha, estado: 'CREADO', asignacion_reiniciada: eraValidado };
+        } catch (error) {
+            await t.rollback();
+            throw error;
+        }
+
+        return res.json(respuesta);
+    } catch (error) {
+        return responderError(res, error, 'Error al cambiar la fecha de entrega');
+    }
 }
 
 // POST /pedidoArtesano/cancelar { id, motivo }
@@ -1205,9 +1555,9 @@ const TASA_IVA = 0.12;
 
 const redondear = (valor, decimales = 6) => Number(Number(valor).toFixed(decimales));
 
-// Unidades de SAP por unidad del pedido: factor de SAP por unidades_sap del producto.
-// Si SAP no tiene el artículo se corta.
-async function factoresDeSap(codigos, whsCode) {
+// Unidades de SAP por unidad del pedido: factor de SAP por unidades_sap del producto (con soloSap, solo el de SAP, que es
+// el de los pedidos de tienda). Si SAP no tiene el artículo se corta.
+async function factoresDeSap(codigos, whsCode, soloSap = false) {
     let info;
 
     try {
@@ -1220,6 +1570,8 @@ async function factoresDeSap(codigos, whsCode) {
     const faltantes = codigos.filter(c => !porSap.has(c));
 
     if (faltantes.length > 0) throw new ErrorSapArtesano(`SAP no tiene el artículo ${faltantes.join(', ')}`);
+
+    if (soloSap) return porSap;
 
     const productos = await PedidoArtesanoProductoModel.findAll({ where: { codigo_producto: { [Op.in]: codigos } }, attributes: ['codigo_producto', 'unidades_sap'] });
     const unidades = new Map(productos.map(p => [p.codigo_producto, Number(p.unidades_sap) || 1]));
@@ -1257,9 +1609,31 @@ function errorDeLote(error, etiqueta) {
     return { status, mensaje: `${etiqueta}: ${detalle}` };
 }
 
+// Pedidos de tienda de la ruta que aún no han salido, con lo asignado por artículo (en su unidad de venta, bolsas).
+async function tiendasPorEnviar(ruta_id, fecha, t) {
+    const cabeceras = await PedidoPosCabeceraModel.findAll({
+        where: { tipo_pedido: 'POLLO', ruta_id, fecha_requerida: fecha, sap_docnum: null, estado: { [Op.in]: ['RECIBIDO', 'VALIDADO', 'ERROR_ENVIO_SAP'] } },
+        transaction: t,
+        lock: t.LOCK.UPDATE
+    });
+    const ids = cabeceras.map(c => c.id);
+    const totales = new Map();
+
+    if (ids.length === 0) return { cabeceras, ids, totales };
+
+    const lineas = await PedidoPosDetalleModel.findAll({ where: { pedido_id: { [Op.in]: ids }, cantidad_asignada: { [Op.gt]: 0 } }, transaction: t });
+
+    lineas.forEach((l) => totales.set(l.codigo_producto, (totales.get(l.codigo_producto) || 0) + Number(l.cantidad_asignada)));
+
+    if (totales.size === 0) throw new ErrorPedidoArtesano(400, 'No hay artículos con cantidad asignada para las tiendas. Primero calcula el stock y guarda la asignación.');
+
+    return { cabeceras, ids, totales };
+}
+
 // Carga los pedidos de una ruta con una sola transferencia de SAP.
-// Si SAP la rechaza, ningún pedido cambia.
-async function cargarGrupoRuta({ ids, ajustes, versiones, piloto, usuario, req }) {
+// Si SAP la rechaza, ningún pedido cambia. Con envioRuta { fecha } (vista de Pedidos de Pollo), la misma transferencia lleva
+// también los pedidos de tienda pendientes de la ruta y se libera el candado.
+async function cargarGrupoRuta({ ids, ajustes, versiones, piloto, usuario, req, envioRuta = null }) {
     const t = await sequelizeInit.sequelize.transaction();
 
     try {
@@ -1300,7 +1674,24 @@ async function cargarGrupoRuta({ ids, ajustes, versiones, piloto, usuario, req }
 
         const codigos = [...totales.keys()].filter(c => totales.get(c) > 0);
         const factores = await factoresDeSap(codigos, ruta.whs_code_origen);
-        const lineasSap = codigos.map(c => ({ codigo_producto: c, cantidad: redondear(totales.get(c) * factores.get(c)) }));
+        const cantidadesSap = new Map(codigos.map(c => [c, totales.get(c) * factores.get(c)]));
+        const tiendas = envioRuta ? await tiendasPorEnviar(ruta.id, envioRuta.fecha, t) : null;
+
+        if (tiendas && tiendas.totales.size > 0) {
+            const factoresTienda = await factoresDeSap([...tiendas.totales.keys()], ruta.whs_code_origen, true);
+
+            tiendas.totales.forEach((cantidad, c) => cantidadesSap.set(c, (cantidadesSap.get(c) || 0) + cantidad * factoresTienda.get(c)));
+        }
+
+        const lineasSap = [...cantidadesSap].map(([codigo_producto, cantidad]) => ({ codigo_producto, cantidad: redondear(cantidad) }));
+        // SAP recorta los comentarios largos: las tiendas van primero porque son las más importantes.
+        const numerosTienda = (tiendas ? tiendas.cabeceras : []).filter(c => c.numero_pedido)
+            .map(c => (c.codigo_tienda ? `${c.numero_pedido} (${c.codigo_tienda})` : c.numero_pedido));
+        const numerosCliente = pedidos.map(p => p.numero_pedido);
+        // En el envío de la ruta van solo los números de pedido; la carga desde el rastro conserva su encabezado.
+        const comentarios = envioRuta
+            ? [...numerosTienda, ...numerosCliente].join(', ')
+            : `Pollo Artesano ${ruta.nombre_ruta}: ${numerosCliente.join(', ')}`;
 
         let documento;
 
@@ -1309,7 +1700,7 @@ async function cargarGrupoRuta({ ids, ajustes, versiones, piloto, usuario, req }
                 fromWarehouse: ruta.whs_code_origen,
                 toWarehouse: ruta.whs_code_destino,
                 lineas: lineasSap,
-                comentarios: `Pollo Artesano ${ruta.nombre_ruta}: ${pedidos.map(p => p.numero_pedido).join(', ')}`
+                comentarios
             });
         } catch (error) {
             throw new ErrorSapArtesano(`SAP rechazó la transferencia: ${error.message}`);
@@ -1339,7 +1730,27 @@ async function cargarGrupoRuta({ ids, ajustes, versiones, piloto, usuario, req }
             );
         }
 
+        if (tiendas && tiendas.ids.length > 0) {
+            await PedidoPosCabeceraModel.update(
+                { estado: 'EN_TRANSITO', fecha_envio_sap: new Date(), sap_docentry: documento.DocEntry, sap_docnum: documento.DocNum, sap_error: null },
+                { where: { id: { [Op.in]: tiendas.ids } }, transaction: t }
+            );
+            await PedidoPosDetalleModel.update(
+                { estado_linea: 'DESPACHADA' },
+                { where: { pedido_id: { [Op.in]: tiendas.ids }, cantidad_asignada: { [Op.gt]: 0 } }, transaction: t }
+            );
+        }
+
+        if (envioRuta) {
+            await BloqueoRutaPolloModel.update(
+                { estado: 'LIBERADO', fecha_liberacion: new Date() },
+                { where: { ruta_id: ruta.id, fecha: envioRuta.fecha, estado: 'ACTIVO' }, transaction: t }
+            );
+        }
+
         await t.commit();
+
+        documento.tiendasEnviadas = tiendas ? tiendas.ids.length : 0;
 
         return documento;
     } catch (error) {
@@ -1740,8 +2151,8 @@ async function guardarAsignacionRuta(req, res) {
 }
 
 // POST /pedidoArtesano/enviarRuta { ruta_id, fecha }
-// Carga los pedidos VALIDADOS de la ruta con una transferencia de SAP, con el piloto asignado a la ruta, y libera el candado
-// (salvo liberar_candado: false, cuando la ruta también lleva tiendas y estas se envían después).
+// Envía la ruta con clientes: los pedidos VALIDADOS de clientes y los pedidos de tienda pendientes salen en una sola
+// transferencia de SAP, con el piloto asignado a la ruta, y se libera el candado. Si SAP la rechaza, nada cambia.
 async function enviarRuta(req, res) {
     try {
         await exigirEscrituraPedidosPollo(req);
@@ -1753,7 +2164,7 @@ async function enviarRuta(req, res) {
 
         const despacho = await DespachoRutaModel.findOne({ where: { ruta_id, fecha } });
 
-        if (!despacho || !despacho.piloto_id) throw new ErrorPedidoArtesano(400, 'Asigna piloto y camión a esta ruta antes de enviarla');
+        if (!despacho || !despacho.camion_id || !despacho.piloto_id) throw new ErrorPedidoArtesano(400, 'Asigna piloto y camión a esta ruta antes de enviarla');
 
         const piloto = await resolverPiloto(despacho.piloto_id);
         const usuario = await nombreCortoDelUsuario(req);
@@ -1765,21 +2176,23 @@ async function enviarRuta(req, res) {
         let documento;
 
         try {
-            documento = await cargarGrupoRuta({ ids, ajustes: {}, versiones: {}, piloto, usuario, req });
+            documento = await cargarGrupoRuta({ ids, ajustes: {}, versiones: {}, piloto, usuario, req, envioRuta: { fecha } });
         } catch (error) {
-            if (error instanceof ErrorSapArtesano) await guardarErrorSap(ids, error.detalle);
+            if (error instanceof ErrorSapArtesano) {
+                await guardarErrorSap(ids, error.detalle);
+                // En las tiendas solo queda el mensaje: siguen validadas para poder reintentar el envío completo.
+                await PedidoPosCabeceraModel.update(
+                    { sap_error: error.detalle },
+                    { where: { tipo_pedido: 'POLLO', ruta_id, fecha_requerida: fecha, sap_docnum: null, estado: 'VALIDADO' } }
+                ).catch(e => console.error('[PedidoArtesano] No se pudo guardar el error de SAP en las tiendas:', e.message));
+            }
 
             throw error;
         }
 
-        // Con tiendas en la misma ruta, el envío de las tiendas es el que libera el candado.
-        if (req.body.liberar_candado !== false) {
-            await BloqueoRutaPolloModel.update({ estado: 'LIBERADO', fecha_liberacion: new Date() }, { where: { ruta_id, fecha, estado: 'ACTIVO' } });
-        }
-
         const sinValidar = await PedidoArtesanoModel.count({ where: { ruta_id, fecha_requerida: fecha, estado: 'CREADO' } });
 
-        return res.json({ success: true, sap_docnum: documento.DocNum, pedidos_cargados: ids.length, pedidos_sin_validar: sinValidar });
+        return res.json({ success: true, sap_docnum: documento.DocNum, pedidos_cargados: ids.length, tiendas_enviadas: documento.tiendasEnviadas, pedidos_sin_validar: sinValidar });
     } catch (error) {
         return responderError(res, error, 'Error al enviar la ruta');
     }
@@ -2235,7 +2648,7 @@ async function generarReporteDetalle(req, res) {
 
         const pedidos = await PedidoArtesanoModel.findAll({
             where,
-            include: [{ model: PedidoArtesanoDetalleModel, as: 'detalle' }],
+            include: [{ model: PedidoArtesanoDetalleModel, as: 'detalle' }, INCLUIR_DEPOSITOS],
             order: [['fecha_requerida', 'ASC'], ['nombre_ruta', 'ASC'], ['numero_pedido', 'ASC']],
             limit: LIMITE_EXPORTACION
         });
@@ -2275,7 +2688,7 @@ async function generarReporteEnTransito(req, res) {
 
         const pedidos = await PedidoArtesanoModel.findAll({
             where: { estado: 'EN_TRANSITO' },
-            include: [{ model: PedidoArtesanoDetalleModel, as: 'detalle' }],
+            include: [{ model: PedidoArtesanoDetalleModel, as: 'detalle' }, INCLUIR_DEPOSITOS],
             order: [['fecha_requerida', 'ASC'], ['nombre_ruta', 'ASC'], ['numero_pedido', 'ASC']],
             limit: LIMITE_EXPORTACION
         });
@@ -2292,13 +2705,18 @@ async function generarReporteEnTransito(req, res) {
 
 module.exports = {
     getProductos,
-    getUsuarios,
+    getClientesPedidos,
+    getPrecios,
     getPedidos,
     buscarClientes,
     crearCliente,
     crearPedido,
     editarPedido,
+    cambiarFechaRequerida,
     completarPago,
+    registrarDeposito,
+    editarDeposito,
+    eliminarDeposito,
     getPendientes,
     getStock,
     rechazar,

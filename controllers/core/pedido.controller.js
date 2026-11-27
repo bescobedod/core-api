@@ -24,7 +24,7 @@ const TiendaRutaInsumosModel = require('../../models/core/tbl_tiendas_rutas_insu
 const ArticuloVerduraModel = require('../../models/core/tbl_articulos_verdura.model');
 const CamionModel = require('../../models/core/tbl_camion.model');
 const DespachoRutaModel = require('../../models/core/tbl_despacho_ruta.model');
-const { bloquesClientesDetalle, bloquesClientesEnTransito, datosClientesResumenRuta, productosClientesReporte } = require('../../services/pedidoArtesanoEnReportes');
+const { datosClientesTicket, bloquesClientesRuta, bloquesClientesDetalle, bloquesClientesEnTransito, datosClientesResumenRuta, productosClientesReporte } = require('../../services/pedidoArtesanoEnReportes');
 const { nivelPermisoDeMenu } = require('../../services/permisosMenu.service');
 
 PedidoPosCabeceraModel.hasMany(PedidoPosDetalleModel, { foreignKey: 'pedido_id', as: 'detalle' });
@@ -2457,6 +2457,20 @@ function formatearFechaHoraTicket(fecha) {
     return d.toLocaleString('es-GT', { dateStyle: 'short', timeStyle: 'short' });
 }
 
+// Suma al ticket de pollo lo que suben los clientes externos: mismo artículo en la misma línea, los demás al final.
+function sumarLineasClientes(lineasTiendas, lineasClientes) {
+    const porCodigo = new Map(lineasTiendas.map(l => [l.codigo_producto, { ...l }]));
+
+    for (const c of lineasClientes) {
+        const linea = porCodigo.get(c.codigo_producto);
+
+        if (linea) linea.cantidad += c.cantidad;
+        else porCodigo.set(c.codigo_producto, { ...c });
+    }
+
+    return [...porCodigo.values()];
+}
+
 // Estados en los que se puede VER el ticket ya generado (solo lectura).
 // Firmarlo sigue exigiendo EN_TRANSITO, eso se valida aparte en
 // firmarTicketPollo/firmarTicketInsumos.
@@ -2486,7 +2500,10 @@ async function generarTicketPollo(req, res) {
             where: { tipo_pedido: 'POLLO', fecha_requerida: fecha, ruta_id, estado: { [Op.in]: ESTADOS_TICKET_VISIBLE } }
         });
 
-        if (!cabecera) {
+        // Pedidos de clientes externos que salieron en la misma ruta; una ruta puede llevar solo clientes.
+        const clientes = await datosClientesTicket(ruta_id, fecha);
+
+        if (!cabecera && !clientes.hayPedidos) {
             return res.status(400).json({
                 error: 'Esta ruta no está en tránsito ni entregada para esta fecha, no se puede ver el ticket',
                 success: false
@@ -2511,12 +2528,20 @@ async function generarTicketPollo(req, res) {
             raw: true
         });
 
-        const lineas = lineasDetalle.map(l => ({
+        const lineas = sumarLineasClientes(lineasDetalle.map(l => ({
             codigo_producto: l.codigo_producto,
             descripcion_producto: l.descripcion_producto,
             unidad_medida: l.unidad_medida,
             cantidad: Number(l.cantidad_total)
-        }));
+        })), clientes.lineas);
+
+        const despacho = cabecera ? null : await DespachoRutaModel.findOne({ where: { ruta_id, fecha } });
+        const origen = cabecera || despacho || {};
+        const docTiendas = cabecera ? cabecera.sap_docnum : null;
+        // Con un solo envío las tiendas y los clientes comparten documento; solo se separan si salieron en documentos distintos.
+        const otrosDocs = clientes.docnums.filter(d => d !== docTiendas);
+        const documentos = !docTiendas ? clientes.docnums.join(', ') || null
+            : [docTiendas, otrosDocs.length > 0 ? `clientes: ${otrosDocs.join(', ')}` : null].filter(Boolean).join(' · ');
 
         const ticketExistente = await TicketTrasladoModel.findOne({
             where: { tipo_pedido: 'POLLO', ruta_id, fecha }
@@ -2530,19 +2555,19 @@ async function generarTicketPollo(req, res) {
             : null;
 
         construirPdfTicket(res, {
-            nombreRuta: cabecera.nombre_ruta,
+            nombreRuta: ruta.nombre_ruta,
             tipoPedido: 'POLLO',
             fecha,
             whsOrigen: ruta.whs_code_origen,
             whsDestino: ruta.whs_code_destino,
-            camionPlaca: cabecera.camion_placa,
-            pilotoNombre: cabecera.piloto_nombre,
-            sapDocnum: cabecera.sap_docnum,
+            camionPlaca: origen.camion_placa,
+            pilotoNombre: origen.piloto_nombre,
+            sapDocnum: documentos,
             carga: calcularCarga(lineas),
             lineas,
             firmaAdmin,
             firmaPiloto,
-            nombreArchivo: `ticket_pollo_${cabecera.nombre_ruta}_${fecha}.pdf`
+            nombreArchivo: `ticket_pollo_${ruta.nombre_ruta}_${fecha}.pdf`
         });
     } catch (error) {
         return res.status(500).json({
@@ -2901,11 +2926,18 @@ function construirPdfResumenRuta(res, { nombreRuta, fecha, preliminar, carga = n
     const anchoFijo = anchoCodigo + anchoNombre + anchoUnidad;
     const MAX_TIENDAS_POR_PAGINA = 12;
 
+    // Las tiendas van primero y los clientes externos aparte, en sus propias páginas con un rótulo.
     const grupos = [];
-    for (let i = 0; i < tiendas.length; i += MAX_TIENDAS_POR_PAGINA) {
-        grupos.push(tiendas.slice(i, i + MAX_TIENDAS_POR_PAGINA));
+    const soloTiendas = tiendas.filter(t => !t.es_cliente);
+    const soloClientes = tiendas.filter(t => t.es_cliente);
+    for (let i = 0; i < soloTiendas.length; i += MAX_TIENDAS_POR_PAGINA) {
+        grupos.push(soloTiendas.slice(i, i + MAX_TIENDAS_POR_PAGINA));
+    }
+    for (let i = 0; i < soloClientes.length; i += MAX_TIENDAS_POR_PAGINA) {
+        grupos.push(soloClientes.slice(i, i + MAX_TIENDAS_POR_PAGINA));
     }
     if (grupos.length === 0) grupos.push([]);
+    const textoColumna = t => (t.es_cliente && t.referencia ? `${t.nombre_tienda}\n(Ref: ${t.referencia})` : t.nombre_tienda);
 
     const anchoDisponibleTiendas = doc.page.width - doc.page.margins.left - doc.page.margins.right - anchoFijo - anchoTotal;
     const startX = doc.page.margins.left;
@@ -2916,6 +2948,13 @@ function construirPdfResumenRuta(res, { nombreRuta, fecha, preliminar, carga = n
             .text(`Fecha Entrega: ${fecha}    Ruta: ${nombreRuta || '—'}${carga && carga.canastas > 0 ? `    ${describirCarga(carga)}` : ''}`, { align: 'center' });
         doc.fillColor('#000000');
         doc.moveDown(0.6);
+
+        if (grupoTiendas.some(t => t.es_cliente)) {
+            doc.fontSize(9).font('Helvetica-Bold').fillColor('#6D28D9')
+                .text('PEDIDOS DE CLIENTES EXTERNOS (se adjunta tienda de referencia)', { align: 'center' });
+            doc.fillColor('#000000');
+            doc.moveDown(0.4);
+        }
 
         const anchoTienda = grupoTiendas.length > 0 ? anchoDisponibleTiendas / grupoTiendas.length : anchoDisponibleTiendas;
         const colCodigo = startX;
@@ -2930,13 +2969,13 @@ function construirPdfResumenRuta(res, { nombreRuta, fecha, preliminar, carga = n
         doc.text('Nombre', colNombre, yEncabezado, { width: anchoNombre });
         doc.text('Unidad', colUnidad, yEncabezado, { width: anchoUnidad });
         grupoTiendas.forEach((t, i) => {
-            doc.text(t.nombre_tienda, colsTiendas[i], yEncabezado, { width: anchoTienda, align: 'center' });
+            doc.text(textoColumna(t), colsTiendas[i], yEncabezado, { width: anchoTienda, align: 'center' });
         });
         doc.text('Total', colTotal, yEncabezado, { width: anchoTotal, align: 'center' });
 
         const alturaEncabezado = Math.max(
             10,
-            ...grupoTiendas.map(t => doc.heightOfString(t.nombre_tienda, { width: anchoTienda }))
+            ...grupoTiendas.map(t => doc.heightOfString(textoColumna(t), { width: anchoTienda }))
         );
         doc.y = yEncabezado + alturaEncabezado + 4;
         doc.moveTo(startX, doc.y).lineTo(colTotal + anchoTotal, doc.y).strokeColor('#999999').stroke();
@@ -3061,11 +3100,37 @@ async function construirBloquesQr(cabeceras) {
     const bloques = construirBloquesPedido(cabeceras);
 
     for (const bloque of bloques) {
+        // Los clientes externos no se recepcionan con QR: salen en la hoja con su línea de firma, sin código.
+        if (bloque.es_cliente) continue;
+
         const qrPayload = JSON.stringify({ id_pedido: bloque.id_pedido, serie: bloque.numero_pedido, nombre_tienda: bloque.nombre_tienda });
         bloque.qrBuffer = await QRCode.toBuffer(qrPayload, { margin: 1, width: 160 });
     }
 
     return bloques;
+}
+
+// Cada cliente externo va justo debajo del pedido de su tienda de referencia (por código de tienda). Si no tiene tienda de
+// referencia, o esa tienda no tiene pedido ese día, queda al final.
+function clientesBajoSuTienda(bloques) {
+    const tiendas = bloques.filter(b => !b.es_cliente);
+    const clientes = bloques.filter(b => b.es_cliente);
+    const sueltos = [];
+    const porTienda = new Map();
+
+    for (const cliente of clientes) {
+        const tienda = cliente.codigo_tienda ? tiendas.find(t => t.codigo_tienda === cliente.codigo_tienda) : null;
+
+        if (!tienda) {
+            sueltos.push(cliente);
+            continue;
+        }
+
+        if (!porTienda.has(tienda)) porTienda.set(tienda, []);
+        porTienda.get(tienda).push(cliente);
+    }
+
+    return [...tiendas.flatMap(t => [t, ...(porTienda.get(t) || [])]), ...sueltos];
 }
 
 // Dibuja el PDF de generarQrsRutaPollo/generarQrsRutaInsumos: carta vertical,
@@ -3109,6 +3174,10 @@ function dibujarPdfQrsRuta(res, { nombreRuta, fecha, bloques, carga = null, nomb
         doc.text(bloque.label ? `${bloque.nombre_tienda} — ${bloque.label}` : bloque.nombre_tienda, startX);
         doc.font('Helvetica').fontSize(8).fillColor('#666666');
         doc.text(`Pedido: ${bloque.numero_pedido}`, startX);
+        // Clientes externos: tienda de referencia y dirección, para que el piloto sepa dónde entregar.
+        if (bloque.es_cliente && bloque.detalles && bloque.detalles.length > 0) {
+            doc.text(bloque.detalles.join('   ·   '), startX, doc.y, { width: anchoUtil });
+        }
         doc.fillColor('#000000');
         doc.moveDown(0.3);
 
@@ -3145,17 +3214,19 @@ function dibujarPdfQrsRuta(res, { nombreRuta, fecha, bloques, carga = null, nomb
 
         doc.moveDown(0.5);
         const yQr = doc.y;
-        doc.image(bloque.qrBuffer, startX, yQr, { width: QR_SIZE, height: QR_SIZE });
+
+        // Los clientes no llevan QR: la línea de firma ocupa todo el ancho, en el mismo lugar.
+        if (bloque.qrBuffer) doc.image(bloque.qrBuffer, startX, yQr, { width: QR_SIZE, height: QR_SIZE });
 
         // Línea de firma junto al QR, para que quede como comprobante físico
         // de que la tienda recibió el pedido.
-        const xFirma = startX + QR_SIZE + 25;
-        const anchoFirma = anchoUtil - QR_SIZE - 25;
+        const xFirma = bloque.qrBuffer ? startX + QR_SIZE + 25 : startX;
+        const anchoFirma = bloque.qrBuffer ? anchoUtil - QR_SIZE - 25 : anchoUtil;
         const yLineaFirma = yQr + QR_SIZE - 22;
 
         doc.moveTo(xFirma, yLineaFirma).lineTo(xFirma + anchoFirma, yLineaFirma).strokeColor('#000000').stroke();
         doc.font('Helvetica').fontSize(8).fillColor('#000000');
-        doc.text('Firma de Recepción de Tienda', xFirma, yLineaFirma + 4, { width: anchoFirma });
+        doc.text(bloque.es_cliente ? 'Firma de Recepción del Cliente' : 'Firma de Recepción de Tienda', xFirma, yLineaFirma + 4, { width: anchoFirma });
 
         doc.y = yQr + QR_SIZE + 15;
     });
@@ -4664,11 +4735,14 @@ async function generarQrsRutaPollo(req, res) {
             order: [['nombre_tienda', 'ASC']]
         });
 
-        if (cabeceras.length === 0) {
+        // Pedidos de clientes externos (pollo artesano) de la misma ruta: van después de las tiendas, sin QR.
+        if (req.query.incluir_clientes === '1') cabeceras.bloquesExtra = await bloquesClientesRuta(ruta_id, fecha);
+
+        if (cabeceras.length === 0 && !hayBloquesExtra(cabeceras)) {
             return res.status(404).json({ error: 'No hay pedidos para esta ruta y fecha', success: false });
         }
 
-        const bloques = await construirBloquesQr(cabeceras);
+        const bloques = clientesBajoSuTienda(await construirBloquesQr(cabeceras));
 
         dibujarPdfQrsRuta(res, {
             nombreRuta: ruta.nombre_ruta,
@@ -4786,24 +4860,28 @@ async function firmarTicketPollo(req, res) {
             where: { tipo_pedido: 'POLLO', fecha_requerida: fecha, ruta_id, estado: 'EN_TRANSITO' }
         });
 
-        if (!cabecera) {
+        const clientes = await datosClientesTicket(ruta_id, fecha);
+
+        if (!cabecera && !clientes.enTransito) {
             return res.status(400).json({
                 error: 'Esta ruta no está en tránsito para esta fecha, no se puede firmar el ticket',
                 success: false
             });
         }
 
-        const lineas = await armarLineasTicket('POLLO', ruta_id, fecha);
+        // Las líneas que firma el piloto incluyen la carga de los clientes.
+        const lineas = sumarLineasClientes(await armarLineasTicket('POLLO', ruta_id, fecha), clientes.lineas);
         const ahora = new Date();
+        const origen = cabecera || (await DespachoRutaModel.findOne({ where: { ruta_id, fecha } })) || {};
 
         const datosTicket = {
-            nombre_ruta: cabecera.nombre_ruta,
+            nombre_ruta: ruta.nombre_ruta,
             whs_origen: ruta.whs_code_origen,
             whs_destino: ruta.whs_code_destino,
-            camion_placa: cabecera.camion_placa,
-            piloto_id: cabecera.piloto_id,
-            piloto_nombre: cabecera.piloto_nombre,
-            sap_docnum: cabecera.sap_docnum,
+            camion_placa: origen.camion_placa,
+            piloto_id: origen.piloto_id,
+            piloto_nombre: origen.piloto_nombre,
+            sap_docnum: cabecera ? cabecera.sap_docnum : (clientes.docnums[0] || null),
             lineas,
             estado: 'PENDIENTE_FIRMA_PILOTO',
             firmado_admin_por: id_usuario,

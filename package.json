@@ -23,6 +23,7 @@
     "jsonwebtoken": "^9.0.2",
     "multer": "^2.2.0",
     "pdfkit": "^0.19.1",
+    "pngjs": "^5.0.0",
     "pg": "^8.16.3",
     "qrcode": "^1.5.4",
     "sequelize": "^6.37.7",
